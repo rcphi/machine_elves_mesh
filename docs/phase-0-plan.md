@@ -1,6 +1,7 @@
 # Phase 0 — Mesh Spike
 
 **Status:** Planning. No code yet.
+**Language:** Rust — Wasmtime is Rust-native and provides the fuel metering §11.4 requires, libp2p's Rust implementation covers §11.6's overlay and gossip, and it produces a single static binary volunteers can run without setup.
 **Started:** 2026-08-20
 **Design document:** `../machine_elves/docs/superpowers/specs/2026-07-31-machine-elves-design.md` — §11 (compute mesh), §9 (persistence and degradation), §19 (MVP scope). This repo implements only what §19.5 calls Phase 0.
 
@@ -24,23 +25,39 @@ Neither rig can answer the other's question. Run both.
 
 | | Local container rig | Volunteer rig |
 |---|---|---|
-| **Nodes** | Many, on one host | 3 home machines + VPSs |
+| **Nodes** | Many, on one host | 3 home machines. No rented infrastructure. |
 | **Tests** | Scheduling, checkpointing, migration on dropout, job correctness, load behavior, topology logic | NAT traversal, real latency, asymmetric upstream, router timeouts, genuine disconnection |
 | **Cannot test** | Anything about real networks — containers on one host all reach each other trivially | Scale, or any behavior needing more than a handful of nodes |
 
 **The volunteer rig is the one that decides go/no-go.** The local rig is where the work actually gets built and debugged.
 
-## What the available nodes can and cannot represent
+## No rented infrastructure. This is a measurement decision, not only a principle.
 
-**The three home machines are the real subjects.** They carry the failure modes that matter: carrier-grade NAT, asymmetric upstream bandwidth, consumer routers dropping idle connections, real geographic latency.
+**Phase 0 runs on player machines only.** No VPS, no rented relay, no hosted rendezvous.
 
-Three is a small sample, but the relevant failures are **categorical rather than statistical** — if a connection sits behind carrier-grade NAT, that shows up immediately and unmistakably. Three connections establish *whether* the problem class exists. They cannot estimate how common it is across a real player population, and no claim of that kind should be made from them.
+The obvious argument is the design one: §12.1's reveal cannot survive a permanent dependency on servers anyone rents, §15 already rejects Tailscale as a service for exactly this reason, and infrastructure introduced as a convenience becomes load-bearing without anyone deciding that it should.
 
-**The VPSs are not test subjects.** A rented server has a public address, no NAT, and symmetric bandwidth — it is exactly the case that was never in doubt. Including VPS-to-VPS results in a traversal success rate would produce a flattering and meaningless number.
+**The stronger argument is that a rented node would corrupt the measurement itself.** A public-address node in the mesh makes hole-punching succeed more often, gives relaying somewhere to land, and provides a rendezvous point for peers coordinating a connection. Phase 0 would then report that the architecture works, when what works is the architecture *plus a server* — which is precisely the finding the spike exists to prevent anyone from making.
 
-**What the VPSs are for is relaying.** §11.6 adopts DERP-style relays that forward end-to-end encrypted packets and cannot read them, which is what makes relay duty safe to distribute. A VPS is a legitimate stand-in for *a player with a public address and spare upstream* — which §11.6 counts as the fifth contribution lever.
+**The three home machines are the whole rig**, and they carry the failure modes that matter: carrier-grade NAT, asymmetric upstream bandwidth, consumer routers dropping idle connections, real geographic latency.
 
-**The standing caveat:** rented infrastructure is acceptable in a spike and is not acceptable in the product. §12.1's reveal cannot survive a permanent dependency on servers anyone rents, and §15 already rejects Tailscale as a service for exactly this reason. Any VPS here is a stand-in for a citizen, and the moment it becomes load-bearing the design has drifted.
+Three is a small sample, but the relevant failures are **categorical rather than statistical** — a connection behind carrier-grade NAT shows up immediately and unmistakably. Three connections establish *whether* the problem class exists. They cannot estimate how common it is across a real player population, and no claim of that kind may be made from them.
+
+### The consequence to accept up front
+
+**Relay duty has to fall on a volunteer**, because there is nobody else. §11.6 already intends this — relays forward end-to-end encrypted packets and cannot read them, which is what makes distributing relay duty across citizens safe, and a player with a public address and spare upstream is the fifth contribution lever.
+
+But relaying only works if the relaying node is itself reachable. **If none of the three volunteers can accept an inbound connection, the mesh cannot form at all.**
+
+**That outcome is the finding, not a failed experiment.** It would mean the architecture as specified does not work on ordinary domestic connections without infrastructure — which is exactly what Phase 0 is for, arrived at in days rather than a year. Reaching for a VPS at that moment would convert a real answer into a comfortable one.
+
+### One dependency that cannot be removed, and how the design already handles it
+
+Discovering what your own public address looks like requires *someone else* to observe it and tell you. That is a third party by definition, and the probe below uses public STUN servers to do it.
+
+**The probe is a diagnostic tool and is allowed to. The product is not.** §11.6's answer already exists: an invite carries live peer addresses, so once a client has any peer at all, that peer reports what address it observes — peer-observed addressing replaces STUN entirely. §9.5 flagged this same honesty risk for bootstrap and resolved it the same way.
+
+The residual is coordination: two machines both behind NAT generally need something to tell them when to transmit simultaneously. With no third party, that role falls to whichever volunteer is directly reachable, or to exchanging invite blobs by hand — pasting a string into a chat window, which is what §11.6's invite is anyway.
 
 ## Step 0 — characterize the volunteers' connections first
 
@@ -69,6 +86,6 @@ Carried from §19.5, unchanged:
 
 ## Open decisions
 
-- **Implementation language.** Not yet chosen.
+- **The rendezvous fallback**, if no volunteer turns out to be directly reachable. Manual invite exchange covers address distribution but not simultaneous-transmission timing.
 - **The threshold for an acceptable stall**, in milliseconds, written down before step 5.
 - **How many volunteers** the go/no-go can honestly rest on, given three is enough to detect a problem class but not to estimate its frequency.
