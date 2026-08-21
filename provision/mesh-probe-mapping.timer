@@ -1,0 +1,12 @@
+[Unit]
+Description=Measure how long this router remembers an idle connection
+Documentation=file:/usr/local/share/mesh-probe/README.md
+
+[Timer]
+OnBootSec=5min
+OnUnitActiveSec=25min
+RandomizedDelaySec=10min
+Persistent=true
+
+[Install]
+WantedBy=timers.target

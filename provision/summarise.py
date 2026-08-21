@@ -29,6 +29,90 @@ def load(path):
     return records
 
 
+def report_mapping(records):
+    """How long each router remembers an idle connection.
+
+    A connection nobody has spoken over for long enough is silently forgotten
+    by the router, and the mesh must send keepalives more often than that. The
+    interval it can use is set by the *worst* router among the players, so the
+    number that matters is the minimum across machines, not the average.
+    """
+    print("Mapping lifetime")
+    print("----------------")
+
+    by_label = collections.defaultdict(lambda: collections.defaultdict(collections.Counter))
+    for record in records:
+        label = record.get("label", "unlabelled")
+        idle = record.get("idle_seconds")
+        outcome = record.get("outcome", "inconclusive")
+        if isinstance(idle, int):
+            by_label[label][idle][outcome] += 1
+
+    safe_per_machine = {}
+
+    for label, rungs in sorted(by_label.items()):
+        print(f"\n{label}")
+        # The largest interval such that this and every shorter interval always
+        # survived. Anything beyond it is not established as safe.
+        safe = 0
+        first_loss = None
+        for idle in sorted(rungs):
+            counts = rungs[idle]
+            survived = counts.get("survived", 0)
+            expired = counts.get("expired", 0)
+            unclear = counts.get("inconclusive", 0)
+            trials = survived + expired
+
+            detail = f"  {idle:>4}s   survived {survived}/{trials or 0}"
+            if unclear:
+                detail += f"   ({unclear} inconclusive)"
+            if trials and survived and expired:
+                detail += "   VARIABLE — this router is not consistent"
+            print(detail)
+
+            if trials == 0:
+                continue
+            if expired:
+                # The first interval that ever failed bounds the timeout from
+                # above; nothing longer can be called safe.
+                if first_loss is None:
+                    first_loss = idle
+            elif first_loss is None:
+                # Still in the run of intervals that have always survived.
+                safe = idle
+
+        if first_loss is None and safe:
+            print(f"  → survived every tested interval up to {safe}s; "
+                  f"the timeout is longer than anything measured")
+        elif first_loss is not None:
+            print(f"  → the router forgets somewhere between {safe}s and {first_loss}s")
+        else:
+            print("  → not enough completed trials to say anything")
+
+        if safe:
+            safe_per_machine[label] = safe
+
+    print()
+    if not safe_per_machine:
+        print("  No usable keepalive interval yet. Let the boxes run longer.")
+        return
+
+    worst_label = min(safe_per_machine, key=safe_per_machine.get)
+    worst = safe_per_machine[worst_label]
+    recommended = max(15, worst // 2)
+    print(f"  Shortest confirmed-safe idle across machines: {worst}s ({worst_label})")
+    print(f"  → keepalive interval for the mesh: {recommended}s")
+    print()
+    print("  Halved because the measured value is the point at which the mapping was")
+    print("  still alive, not the point at which it dies, and a keepalive that only")
+    print("  just makes it is one dropped packet away from not making it.")
+    print()
+    print("  This is set by the worst router among the players, not the average one:")
+    print("  a peer whose mapping expires is unreachable no matter how patient the")
+    print("  others are.")
+    print()
+
+
 def main():
     if len(sys.argv) != 2:
         print(__doc__)
@@ -39,11 +123,16 @@ def main():
         print("no records")
         return 1
 
+    connectivity = [r for r in records if r.get("test", "connectivity") == "connectivity"]
+    mapping = [r for r in records if r.get("test") == "mapping-lifetime"]
+
     by_label = collections.defaultdict(list)
-    for record in records:
+    for record in connectivity:
         by_label[record.get("label", "unlabelled")].append(record)
 
-    print(f"{len(records)} records from {len(by_label)} machines\n")
+    print(f"{len(records)} records from "
+          f"{len(set(r.get('label') for r in records))} machines "
+          f"({len(connectivity)} connectivity, {len(mapping)} mapping)\n")
 
     relay_capable = []
     hole_punchable = []
@@ -75,6 +164,9 @@ def main():
         if v4 in REACHABLE or v6 in REACHABLE or v4 == "nat-endpoint-independent":
             hole_punchable.append(label)
         print()
+
+    if mapping:
+        report_mapping(mapping)
 
     print("Verdict")
     print("-------")

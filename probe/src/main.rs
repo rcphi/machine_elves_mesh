@@ -14,6 +14,7 @@ use std::env;
 use std::hash::{BuildHasher, Hasher};
 use std::io::{self, ErrorKind};
 use std::net::{IpAddr, Ipv4Addr, Ipv6Addr, SocketAddr, ToSocketAddrs, UdpSocket};
+use std::thread;
 use std::time::{Duration, SystemTime};
 
 const MAGIC_COOKIE: u32 = 0x2112_A442;
@@ -23,6 +24,15 @@ const ATTR_MAPPED_ADDRESS: u16 = 0x0001;
 const ATTR_XOR_MAPPED_ADDRESS: u16 = 0x0020;
 const TIMEOUT: Duration = Duration::from_secs(3);
 const ATTEMPTS: usize = 3;
+
+/// Idle intervals, in seconds, for the mapping-lifetime test.
+///
+/// One rung is measured per run and the answer accumulates statistically
+/// across days, rather than being binary-searched inside a single run. An
+/// unattended box has abundant wall-clock time and no tolerance for a fragile
+/// multi-step procedure: a run that fails here costs one data point instead of
+/// the whole measurement.
+const IDLE_LADDER: &[u64] = &[15, 30, 45, 60, 90, 120, 180, 240, 300, 420, 600];
 
 /// STUN servers on deliberately distinct operators. Mapping behaviour can only
 /// be classified by comparing what two *different* server IPs observe, so this
@@ -37,12 +47,22 @@ const STUN_SERVERS: &[&str] = &[
 fn main() {
     let mut json = false;
     let mut label = String::from("unlabelled");
+    let mut mapping_lifetime = false;
+    let mut idle: Option<u64> = None;
     let mut args = env::args().skip(1);
 
     while let Some(arg) = args.next() {
         match arg.as_str() {
             "--json" => json = true,
             "--label" => label = args.next().unwrap_or_else(|| "unlabelled".to_string()),
+            "--mapping-lifetime" => mapping_lifetime = true,
+            "--idle" => {
+                idle = args.next().and_then(|v| v.parse().ok());
+                if idle.is_none() {
+                    eprintln!("--idle needs a number of seconds");
+                    std::process::exit(2);
+                }
+            }
             "--help" | "-h" => {
                 print_usage();
                 return;
@@ -53,6 +73,17 @@ fn main() {
                 std::process::exit(2);
             }
         }
+    }
+
+    if mapping_lifetime {
+        let seconds = idle.unwrap_or_else(pick_idle_interval);
+        let test = probe_mapping_lifetime(seconds, !json);
+        if json {
+            println!("{}", mapping_json(&label, &test));
+        } else {
+            report_mapping(&test);
+        }
+        return;
     }
 
     if !json {
@@ -79,6 +110,10 @@ fn print_usage() {
     println!();
     println!("  --json           emit one machine-readable record instead of prose");
     println!("  --label <name>   identify this machine in the record");
+    println!("  --mapping-lifetime");
+    println!("                   measure whether this router still remembers an idle");
+    println!("                   connection after a while. Takes as long as it waits.");
+    println!("  --idle <seconds> force one idle interval instead of choosing at random");
     println!("  --help           show this");
 }
 
@@ -557,6 +592,186 @@ fn is_global_unicast_v6(ip: Ipv6Addr) -> bool {
     (first & 0xE000) == 0x2000
 }
 
+// -------------------------------------------------------- mapping lifetime
+
+/// What became of a mapping after a period of silence.
+#[derive(PartialEq, Debug)]
+enum Outcome {
+    /// The router still remembered. The mesh can idle this long safely.
+    Survived,
+    /// The router forgot. A connection idle this long would have died silently.
+    Expired,
+    /// Something else changed underneath the test, so it proves nothing.
+    Inconclusive(&'static str),
+}
+
+impl Outcome {
+    fn tag(&self) -> &'static str {
+        match self {
+            Outcome::Survived => "survived",
+            Outcome::Expired => "expired",
+            Outcome::Inconclusive(_) => "inconclusive",
+        }
+    }
+}
+
+struct MappingTest {
+    idle_seconds: u64,
+    server: String,
+    first: Option<SocketAddr>,
+    second: Option<SocketAddr>,
+    outcome: Outcome,
+}
+
+/// Measures whether a home router still remembers an idle connection.
+///
+/// A router rewrites outgoing packets to its own address and remembers the
+/// pairing so replies can be delivered. That memory expires, and when it does a
+/// peer-to-peer connection dies silently — packets simply stop arriving. The
+/// mesh must therefore send periodic keepalives, and this measures how often.
+///
+/// The method: learn the external port, say nothing at all for `idle_seconds`,
+/// then ask the same server again through the same socket. An unchanged port
+/// means the mapping survived.
+fn probe_mapping_lifetime(idle_seconds: u64, verbose: bool) -> MappingTest {
+    let unusable = |why: &'static str, server: String| MappingTest {
+        idle_seconds,
+        server,
+        first: None,
+        second: None,
+        outcome: Outcome::Inconclusive(why),
+    };
+
+    let socket = match UdpSocket::bind(Family::V4.wildcard()) {
+        Ok(s) => s,
+        Err(_) => return unusable("cannot open a socket", "-".to_string()),
+    };
+    let _ = socket.set_read_timeout(Some(TIMEOUT));
+
+    // Both observations must come from the same server. Under
+    // address-dependent mapping a different server sees a different port
+    // anyway, so comparing across servers would report expiry every time.
+    let mut chosen = None;
+    for candidate in STUN_SERVERS {
+        if let Some(addr) = resolve(candidate, Family::V4) {
+            if let Ok(mapped) = stun_binding(&socket, addr) {
+                chosen = Some((candidate.to_string(), addr, mapped));
+                break;
+            }
+        }
+    }
+
+    let (server, addr, first) = match chosen {
+        Some(found) => found,
+        None => return unusable("no STUN server answered", "-".to_string()),
+    };
+
+    if verbose {
+        println!("Seen as {} via {}.", first, server);
+        println!("Staying silent for {} seconds…", idle_seconds);
+    }
+
+    thread::sleep(Duration::from_secs(idle_seconds));
+
+    let second = match stun_binding(&socket, addr) {
+        Ok(mapped) => mapped,
+        Err(_) => {
+            let mut test = unusable("no reply to the second query", server);
+            test.first = Some(first);
+            return test;
+        }
+    };
+
+    // A changed public address means the ISP moved us, which would look
+    // identical to an expired mapping while proving nothing about the router.
+    let outcome = if first.ip() != second.ip() {
+        Outcome::Inconclusive("public address changed mid-test")
+    } else if first.port() == second.port() {
+        Outcome::Survived
+    } else {
+        Outcome::Expired
+    };
+
+    MappingTest {
+        idle_seconds,
+        server,
+        first: Some(first),
+        second: Some(second),
+        outcome,
+    }
+}
+
+/// Picks one rung of the ladder at random.
+///
+/// Stateless deliberately: the service runs under a read-only filesystem, and
+/// coverage comes from repetition across days rather than from bookkeeping.
+fn pick_idle_interval() -> u64 {
+    let mut hasher = RandomState::new().build_hasher();
+    hasher.write_u64(
+        SystemTime::now()
+            .duration_since(SystemTime::UNIX_EPOCH)
+            .map(|d| d.as_nanos() as u64)
+            .unwrap_or(0),
+    );
+    IDLE_LADDER[(hasher.finish() % IDLE_LADDER.len() as u64) as usize]
+}
+
+fn report_mapping(test: &MappingTest) {
+    println!();
+    match &test.outcome {
+        Outcome::Survived => println!(
+            "After {}s of silence the router still remembered this connection.",
+            test.idle_seconds
+        ),
+        Outcome::Expired => println!(
+            "After {}s of silence the router had forgotten this connection.\n\
+             A peer-to-peer connection left idle that long would have died without warning.",
+            test.idle_seconds
+        ),
+        Outcome::Inconclusive(why) => {
+            println!("Inconclusive after {}s: {}.", test.idle_seconds, why)
+        }
+    }
+    if let (Some(first), Some(second)) = (test.first, test.second) {
+        println!("  before: {}\n  after:  {}", first, second);
+    }
+    println!();
+    println!(
+        "PROBE-MAPPING v0.1 | idle={}s | outcome={}",
+        test.idle_seconds,
+        test.outcome.tag()
+    );
+}
+
+fn mapping_json(label: &str, test: &MappingTest) -> String {
+    let now = SystemTime::now()
+        .duration_since(SystemTime::UNIX_EPOCH)
+        .map(|d| d.as_secs())
+        .unwrap_or(0);
+    let addr = |a: Option<SocketAddr>| match a {
+        Some(a) => json_string(&a.to_string()),
+        None => "null".to_string(),
+    };
+    let note = match &test.outcome {
+        Outcome::Inconclusive(why) => json_string(why),
+        _ => "null".to_string(),
+    };
+
+    format!(
+        "{{\"schema\":1,\"ts_unix\":{},\"ts_utc\":{},\"label\":{},\"test\":\"mapping-lifetime\",\
+         \"idle_seconds\":{},\"server\":{},\"first\":{},\"second\":{},\"outcome\":{},\"note\":{}}}",
+        now,
+        json_string(&format_utc(now)),
+        json_string(label),
+        test.idle_seconds,
+        json_string(&test.server),
+        addr(test.first),
+        addr(test.second),
+        json_string(test.outcome.tag()),
+        note
+    )
+}
+
 // ------------------------------------------------------------ machine output
 
 /// One record per run, appended to a log by the systemd timer. Hand-rolled
@@ -574,6 +789,7 @@ fn report_json(label: &str, v4: &FamilyResult, v6: &FamilyResult) -> String {
     out.push_str(&format!("\"schema\":1,\"ts_unix\":{},", now));
     out.push_str(&format!("\"ts_utc\":\"{}\",", format_utc(now)));
     out.push_str(&format!("\"label\":{},", json_string(label)));
+    out.push_str("\"test\":\"connectivity\",");
     out.push_str(&format!("\"ipv4\":{},", family_json(v4, &v4_verdict)));
     out.push_str(&format!("\"ipv6\":{},", family_json(v6, &v6_verdict)));
     out.push_str(&format!(
@@ -662,6 +878,66 @@ fn format_utc(epoch: u64) -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn ladder_is_ascending_and_plausible() {
+        assert!(IDLE_LADDER.windows(2).all(|w| w[0] < w[1]));
+        // RFC 4787 asks routers to hold UDP mappings at least 120s; the ladder
+        // must bracket that rather than stopping short of it.
+        assert!(IDLE_LADDER.first().copied().unwrap() < 120);
+        assert!(IDLE_LADDER.last().copied().unwrap() > 120);
+    }
+
+    #[test]
+    fn picks_only_rungs_from_the_ladder() {
+        for _ in 0..200 {
+            assert!(IDLE_LADDER.contains(&pick_idle_interval()));
+        }
+    }
+
+    #[test]
+    fn mapping_record_is_parseable_and_tagged() {
+        let test = MappingTest {
+            idle_seconds: 120,
+            server: "stun.example.net:3478".to_string(),
+            first: Some("203.0.113.7:45485".parse().unwrap()),
+            second: Some("203.0.113.7:45485".parse().unwrap()),
+            outcome: Outcome::Survived,
+        };
+        let record = mapping_json("vol-2", &test);
+        assert!(record.starts_with('{') && record.ends_with('}'));
+        assert!(record.contains(r#""test":"mapping-lifetime""#));
+        assert!(record.contains(r#""outcome":"survived""#));
+        assert!(record.contains(r#""idle_seconds":120"#));
+        assert!(record.contains(r#""note":null"#));
+    }
+
+    #[test]
+    fn inconclusive_records_carry_their_reason() {
+        let test = MappingTest {
+            idle_seconds: 60,
+            server: "-".to_string(),
+            first: None,
+            second: None,
+            outcome: Outcome::Inconclusive("public address changed mid-test"),
+        };
+        let record = mapping_json("vol-2", &test);
+        assert!(record.contains(r#""outcome":"inconclusive""#));
+        assert!(record.contains(r#""note":"public address changed mid-test""#));
+        assert!(record.contains(r#""first":null"#));
+    }
+
+    #[test]
+    fn connectivity_records_are_tagged_too() {
+        let empty = |family| FamilyResult {
+            family,
+            local: None,
+            observations: Vec::new(),
+            errors: Vec::new(),
+        };
+        let record = report_json("vol-1", &empty(Family::V4), &empty(Family::V6));
+        assert!(record.contains(r#""test":"connectivity""#));
+    }
 
     #[test]
     fn formats_known_epochs_as_utc() {

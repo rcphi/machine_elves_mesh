@@ -1,0 +1,42 @@
+[Unit]
+Description=Machine Elves mapping-lifetime test (one idle interval)
+Documentation=file:/usr/local/share/mesh-probe/README.md
+After=network-online.target
+Wants=network-online.target
+
+[Service]
+Type=oneshot
+User=meshprobe
+Group=meshprobe
+EnvironmentFile=/etc/mesh-probe/config
+ExecStart=/usr/local/bin/mesh-probe --mapping-lifetime --json --label ${LABEL}
+
+# The test spends nearly all its time deliberately sending nothing, so it runs
+# for as long as the idle interval it drew. The ceiling is the longest rung of
+# the ladder plus room for the two queries around it.
+TimeoutStartSec=900
+
+StandardOutput=append:/var/log/mesh-probe/results.jsonl
+StandardError=journal
+
+NoNewPrivileges=true
+PrivateTmp=true
+PrivateDevices=true
+ProtectSystem=strict
+ProtectHome=true
+ReadWritePaths=/var/log/mesh-probe
+ProtectKernelTunables=true
+ProtectKernelModules=true
+ProtectKernelLogs=true
+ProtectControlGroups=true
+ProtectClock=true
+ProtectHostname=true
+RestrictAddressFamilies=AF_INET AF_INET6 AF_UNIX AF_NETLINK
+RestrictNamespaces=true
+RestrictRealtime=true
+RestrictSUIDSGID=true
+LockPersonality=true
+MemoryDenyWriteExecute=true
+SystemCallArchitectures=native
+SystemCallFilter=@system-service
+CapabilityBoundingSet=

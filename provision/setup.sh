@@ -74,11 +74,14 @@ printf 'LABEL=%s\n' "$LABEL" > /etc/mesh-probe/config
 chmod 0644 /etc/mesh-probe/config
 
 say "Installing the timer"
-install -m 0644 "$REPO_ROOT/provision/mesh-probe.service" /etc/systemd/system/mesh-probe.service
-install -m 0644 "$REPO_ROOT/provision/mesh-probe.timer" /etc/systemd/system/mesh-probe.timer
+for unit in mesh-probe.service mesh-probe.timer \
+            mesh-probe-mapping.service mesh-probe-mapping.timer; do
+    install -m 0644 "$REPO_ROOT/provision/$unit" "/etc/systemd/system/$unit"
+done
 install -m 0644 "$REPO_ROOT/provision/logrotate.mesh-probe" /etc/logrotate.d/mesh-probe
 systemctl daemon-reload
 systemctl enable --now mesh-probe.timer
+systemctl enable --now mesh-probe-mapping.timer
 
 # ------------------------------------------------------- keep the box awake
 
@@ -169,8 +172,9 @@ Done.
   label         $LABEL
   binary        /usr/local/bin/mesh-probe
   results       /var/log/mesh-probe/results.jsonl
-  schedule      every 30 minutes (plus up to 5 minutes of jitter)
-  next run      $(systemctl show mesh-probe.timer -p NextElapseUSecRealtime --value 2>/dev/null || echo unknown)
+  connectivity  every 30 minutes (plus up to 5 minutes of jitter)
+  mapping test  every 25 minutes (plus up to 10 minutes of jitter), one idle
+                interval per run, accumulating across days
 
 Collect results from your own machine with:
 

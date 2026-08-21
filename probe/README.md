@@ -58,14 +58,61 @@ criterion in `../docs/phase-0-plan.md` has been met on day one. That is a
 genuine finding rather than a failure, and it arrives for the cost of one
 afternoon instead of one year.
 
+## Mapping lifetime
+
+```
+cargo run --release -- --mapping-lifetime
+```
+
+A separate measurement answering a separate question: **how long does this
+router remember a connection nobody is using?**
+
+When a machine sends a packet out, the router rewrites it to its own address
+and remembers the pairing so replies can find their way back. That memory
+expires. When it does, a peer-to-peer connection dies **silently** — the other
+side's packets arrive at a port the router no longer recognises and are
+discarded, with no error and no notification.
+
+The mesh therefore has to send keepalives: small meaningless packets whose only
+job is to remind the router that a connection still exists. The interval is a
+real tradeoff — too long and connections die, too short and every peer pair in
+the mesh is waking machines and burning battery for nothing.
+
+**The method:** learn the external port, send absolutely nothing for a set
+interval, then ask the same server again through the same socket. An unchanged
+port means the mapping survived.
+
+Two details that make the answer trustworthy:
+
+- **The same STUN server is used for both queries.** Under address-dependent
+  mapping a different server sees a different port anyway, so comparing across
+  servers would report expiry every single time.
+- **A changed public address is reported as inconclusive rather than expired.**
+  If the ISP moves the connection mid-test, the port changes for a reason that
+  says nothing about the router.
+
+**One rung of a ladder is measured per run**, and the answer accumulates across
+days rather than being binary-searched inside a single run. An unattended box
+has abundant wall-clock time and no tolerance for a fragile multi-step
+procedure — a run that fails costs one data point rather than the measurement.
+The ladder brackets 120 seconds deliberately, since that is the minimum the
+relevant standard (RFC 4787) asks routers to provide, and real ones range from
+about 30 seconds to many minutes.
+
+`summarise.py` aggregates the rungs into a bracket — "forgets somewhere between
+60s and 90s" — and recommends a keepalive interval at half the shortest
+confirmed-safe value, **taken across machines rather than averaged.** A peer
+whose mapping has expired is unreachable no matter how patient the others are,
+so the mesh is governed by the worst router among the players.
+
 ## What it deliberately does not test
 
 - **Firewall filtering.** A machine may hold a global IPv6 address and still
   refuse inbound packets. Determining that needs a cooperating peer, which is
   Phase 0 proper.
-- **Sustained behaviour.** Consumer routers drop idle mappings after a timeout
-  that this probe is too short to observe.
 - **Throughput or latency under load.**
+- **Whether a peer can actually be reached.** Everything here is inferred from
+  what a third party observes, never from a successful peer connection.
 
 ## Known limits
 
