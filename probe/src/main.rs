@@ -10,6 +10,7 @@
 //! runtime is the whole point.
 
 use std::collections::hash_map::RandomState;
+use std::env;
 use std::hash::{BuildHasher, Hasher};
 use std::io::{self, ErrorKind};
 use std::net::{IpAddr, Ipv4Addr, Ipv6Addr, SocketAddr, ToSocketAddrs, UdpSocket};
@@ -34,17 +35,51 @@ const STUN_SERVERS: &[&str] = &[
 ];
 
 fn main() {
-    println!("Machine Elves — connection probe v0.1");
-    println!("=====================================");
-    println!();
-    println!("Measuring what this connection can do. Takes under a minute.");
-    println!("Nothing is uploaded; the report is printed here for you to send back.");
-    println!();
+    let mut json = false;
+    let mut label = String::from("unlabelled");
+    let mut args = env::args().skip(1);
 
-    let v4 = probe_family(Family::V4);
-    let v6 = probe_family(Family::V6);
+    while let Some(arg) = args.next() {
+        match arg.as_str() {
+            "--json" => json = true,
+            "--label" => label = args.next().unwrap_or_else(|| "unlabelled".to_string()),
+            "--help" | "-h" => {
+                print_usage();
+                return;
+            }
+            other => {
+                eprintln!("unknown argument: {}", other);
+                print_usage();
+                std::process::exit(2);
+            }
+        }
+    }
 
-    report(&v4, &v6);
+    if !json {
+        println!("Machine Elves — connection probe v0.1");
+        println!("=====================================");
+        println!();
+        println!("Measuring what this connection can do. Takes under a minute.");
+        println!("Nothing is uploaded; the report is printed here for you to send back.");
+        println!();
+    }
+
+    let v4 = probe_family(Family::V4, !json);
+    let v6 = probe_family(Family::V6, !json);
+
+    if json {
+        println!("{}", report_json(&label, &v4, &v6));
+    } else {
+        report(&v4, &v6);
+    }
+}
+
+fn print_usage() {
+    println!("mesh-probe — reports what this internet connection can and cannot do");
+    println!();
+    println!("  --json           emit one machine-readable record instead of prose");
+    println!("  --label <name>   identify this machine in the record");
+    println!("  --help           show this");
 }
 
 #[derive(Clone, Copy, PartialEq, Debug)]
@@ -95,7 +130,7 @@ struct FamilyResult {
 /// local port is translated to the same external port when talking to
 /// different destinations, so reusing one socket is what makes the comparison
 /// meaningful. A fresh socket per server would measure nothing.
-fn probe_family(family: Family) -> FamilyResult {
+fn probe_family(family: Family, verbose: bool) -> FamilyResult {
     let mut result = FamilyResult {
         family,
         local: None,
@@ -114,7 +149,9 @@ fn probe_family(family: Family) -> FamilyResult {
     };
     let _ = socket.set_read_timeout(Some(TIMEOUT));
 
-    println!("Checking {}…", family.label());
+    if verbose {
+        println!("Checking {}…", family.label());
+    }
 
     for server in STUN_SERVERS {
         let addr = match resolve(server, family) {
@@ -128,7 +165,9 @@ fn probe_family(family: Family) -> FamilyResult {
 
         match stun_binding(&socket, addr) {
             Ok(mapped) => {
-                println!("  {:<28} sees us as {}", server, mapped);
+                if verbose {
+                    println!("  {:<28} sees us as {}", server, mapped);
+                }
                 result.observations.push(Observation {
                     server: (*server).to_string(),
                     server_ip: addr.ip(),
@@ -140,12 +179,16 @@ fn probe_family(family: Family) -> FamilyResult {
                     ErrorKind::WouldBlock | ErrorKind::TimedOut => "no reply".to_string(),
                     _ => e.to_string(),
                 };
-                println!("  {:<28} {}", server, why);
+                if verbose {
+                    println!("  {:<28} {}", server, why);
+                }
                 result.errors.push(format!("{}: {}", server, why));
             }
         }
     }
-    println!();
+    if verbose {
+        println!();
+    }
     result
 }
 
@@ -514,9 +557,140 @@ fn is_global_unicast_v6(ip: Ipv6Addr) -> bool {
     (first & 0xE000) == 0x2000
 }
 
+// ------------------------------------------------------------ machine output
+
+/// One record per run, appended to a log by the systemd timer. Hand-rolled
+/// because the no-dependencies rule applies here too, and the shape is small
+/// and fixed.
+fn report_json(label: &str, v4: &FamilyResult, v6: &FamilyResult) -> String {
+    let v4_verdict = describe_v4(v4);
+    let v6_verdict = describe_v6(v6);
+    let now = SystemTime::now()
+        .duration_since(SystemTime::UNIX_EPOCH)
+        .map(|d| d.as_secs())
+        .unwrap_or(0);
+
+    let mut out = String::from("{");
+    out.push_str(&format!("\"schema\":1,\"ts_unix\":{},", now));
+    out.push_str(&format!("\"ts_utc\":\"{}\",", format_utc(now)));
+    out.push_str(&format!("\"label\":{},", json_string(label)));
+    out.push_str(&format!("\"ipv4\":{},", family_json(v4, &v4_verdict)));
+    out.push_str(&format!("\"ipv6\":{},", family_json(v6, &v6_verdict)));
+    out.push_str(&format!(
+        "\"relay_capable\":{}",
+        v4_verdict.reachable || v6_verdict.reachable
+    ));
+    out.push('}');
+    out
+}
+
+fn family_json(result: &FamilyResult, verdict: &Verdict) -> String {
+    let observers: Vec<String> = result
+        .observations
+        .iter()
+        .map(|o| {
+            format!(
+                "{{\"server\":{},\"mapped\":{}}}",
+                json_string(&o.server),
+                json_string(&o.mapped.to_string())
+            )
+        })
+        .collect();
+    let errors: Vec<String> = result.errors.iter().map(|e| json_string(e)).collect();
+
+    format!(
+        "{{\"tag\":{},\"local\":{},\"observers\":[{}],\"errors\":[{}]}}",
+        json_string(&verdict.tag),
+        match result.local {
+            Some(ip) => json_string(&ip.to_string()),
+            None => "null".to_string(),
+        },
+        observers.join(","),
+        errors.join(",")
+    )
+}
+
+fn json_string(raw: &str) -> String {
+    let mut out = String::with_capacity(raw.len() + 2);
+    out.push('"');
+    for ch in raw.chars() {
+        match ch {
+            '"' => out.push_str("\\\""),
+            '\\' => out.push_str("\\\\"),
+            '\n' => out.push_str("\\n"),
+            '\r' => out.push_str("\\r"),
+            '\t' => out.push_str("\\t"),
+            c if (c as u32) < 0x20 => out.push_str(&format!("\\u{:04x}", c as u32)),
+            c => out.push(c),
+        }
+    }
+    out.push('"');
+    out
+}
+
+/// Epoch seconds to an ISO-8601 UTC timestamp.
+///
+/// Logs get read by a person deciding whether a box is healthy, and epoch
+/// seconds are not readable. This is Howard Hinnant's `civil_from_days`, which
+/// is exact and needs no calendar table.
+fn format_utc(epoch: u64) -> String {
+    let days = (epoch / 86_400) as i64;
+    let secs_of_day = epoch % 86_400;
+
+    let z = days + 719_468;
+    let era = z.div_euclid(146_097);
+    let doe = z.rem_euclid(146_097);
+    let yoe = (doe - doe / 1460 + doe / 36_524 - doe / 146_096) / 365;
+    let y = yoe + era * 400;
+    let doy = doe - (365 * yoe + yoe / 4 - yoe / 100);
+    let mp = (5 * doy + 2) / 153;
+    let d = doy - (153 * mp + 2) / 5 + 1;
+    let m = if mp < 10 { mp + 3 } else { mp - 9 };
+    let y = if m <= 2 { y + 1 } else { y };
+
+    format!(
+        "{:04}-{:02}-{:02}T{:02}:{:02}:{:02}Z",
+        y,
+        m,
+        d,
+        secs_of_day / 3600,
+        (secs_of_day % 3600) / 60,
+        secs_of_day % 60
+    )
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn formats_known_epochs_as_utc() {
+        assert_eq!(format_utc(0), "1970-01-01T00:00:00Z");
+        assert_eq!(format_utc(1_000_000_000), "2001-09-09T01:46:40Z");
+        // A leap day, which the naive arithmetic gets wrong.
+        assert_eq!(format_utc(1_709_164_800), "2024-02-29T00:00:00Z");
+    }
+
+    #[test]
+    fn escapes_json_strings() {
+        assert_eq!(json_string(r#"a"b\c"#), r#""a\"b\\c""#);
+        assert_eq!(json_string("line\nbreak"), r#""line\nbreak""#);
+    }
+
+    #[test]
+    fn emits_parseable_record_when_everything_failed() {
+        let empty = |family| FamilyResult {
+            family,
+            local: None,
+            observations: Vec::new(),
+            errors: vec!["no reply".to_string()],
+        };
+        let record = report_json("vol-1", &empty(Family::V4), &empty(Family::V6));
+        assert!(record.starts_with('{') && record.ends_with('}'));
+        assert!(record.contains(r#""label":"vol-1""#));
+        assert!(record.contains(r#""relay_capable":false"#));
+        assert!(record.contains(r#""tag":"unreachable""#));
+    }
 
     #[test]
     fn decodes_xor_mapped_ipv4() {

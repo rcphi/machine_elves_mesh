@@ -1,0 +1,18 @@
+[Unit]
+Description=Measure this connection periodically
+Documentation=file:/usr/local/share/mesh-probe/README.md
+
+[Timer]
+OnBootSec=2min
+OnUnitActiveSec=30min
+
+# Without this every box measures at the same instant, which correlates the
+# results and points three machines at the same STUN servers simultaneously.
+RandomizedDelaySec=5min
+
+# Catch up after downtime rather than silently skipping. A box that was
+# unplugged for a day should say so by leaving a gap, not by pretending.
+Persistent=true
+
+[Install]
+WantedBy=timers.target

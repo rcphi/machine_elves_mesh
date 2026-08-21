@@ -1,0 +1,40 @@
+[Unit]
+Description=Machine Elves connection probe (one measurement)
+Documentation=file:/usr/local/share/mesh-probe/README.md
+After=network-online.target
+Wants=network-online.target
+
+[Service]
+Type=oneshot
+User=meshprobe
+Group=meshprobe
+EnvironmentFile=/etc/mesh-probe/config
+ExecStart=/usr/local/bin/mesh-probe --json --label ${LABEL}
+
+# One JSON record appended per run. Line-oriented so a partial write from a
+# power cut costs one measurement rather than the file.
+StandardOutput=append:/var/log/mesh-probe/results.jsonl
+StandardError=journal
+
+# The probe needs UDP out and nothing else whatsoever.
+NoNewPrivileges=true
+PrivateTmp=true
+PrivateDevices=true
+ProtectSystem=strict
+ProtectHome=true
+ReadWritePaths=/var/log/mesh-probe
+ProtectKernelTunables=true
+ProtectKernelModules=true
+ProtectKernelLogs=true
+ProtectControlGroups=true
+ProtectClock=true
+ProtectHostname=true
+RestrictAddressFamilies=AF_INET AF_INET6 AF_UNIX AF_NETLINK
+RestrictNamespaces=true
+RestrictRealtime=true
+RestrictSUIDSGID=true
+LockPersonality=true
+MemoryDenyWriteExecute=true
+SystemCallArchitectures=native
+SystemCallFilter=@system-service
+CapabilityBoundingSet=

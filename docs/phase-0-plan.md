@@ -131,13 +131,30 @@ The box sits on someone else's home network. **Firewall it away from their LAN**
 
 Volunteers should be told plainly what the machine does, that it can be remotely accessed by the operator, and that unplugging it at any time is fine and breaks nothing.
 
-### A note on the distribution
+### Ubuntu Server, and what that costs
 
-Ubuntu Desktop carries background services — update checks, telemetry, indexing — that add noise to a networking measurement and compete for the CPU that jobs are supposed to be metered against. **Ubuntu Server is the better fit for a box nobody logs into**, unless a graphical session is wanted for later phases.
+**The boxes run Ubuntu Server.** Desktop carries update checks, telemetry, and indexing that add noise to a network measurement and compete for the CPU that job metering is supposed to govern. Nobody logs into these machines, so the graphical stack buys nothing.
+
+**The cost is representativeness, and it must not be forgotten later.** Real players will run Windows, macOS, or a desktop Linux, on machines they are also using for other things — machines that sleep when the lid closes, that lose wifi when someone microwaves lunch, that share bandwidth with a video call. A dedicated always-on server on a wired connection is the *best* case in every one of those dimensions.
+
+**Phase 0 therefore measures the network, not the player's machine.** Its results are an upper bound on how well the real thing will behave. Desktop-OS behaviour, contention with other applications, and sleep/wake cycles are deferred to a phase where there is a game to run on them, and any conclusion drawn here should be stated as "at best."
+
+## Provisioning
+
+Implemented in `../provision/`. The design goal is **zero interaction**: the box boots, measures every thirty minutes, logs locally, and continues without anyone touching it. Remote access is for when something breaks.
+
+Three configuration choices exist to protect the measurement rather than the machine, and should not be tidied away later:
+
+- **Jitter on the timer**, so three boxes do not measure at the same instant and correlate their results.
+- **No automatic reboot** for updates, because an unannounced reboot mid-measurement is indistinguishable from a node genuinely disappearing — the exact thing being measured.
+- **Suspend masked**, for the same reason: a box asleep at 3am produces results identical to a network outage.
+
+Household isolation (`--isolate-lan`) is opt-in, verifies internet reachability after applying its rules, and rolls itself back automatically on failure. A firewall rule that strands a box inside someone else's home is not remotely recoverable.
 
 ## What gets built, in order
 
-1. **Connection probe** (above). Ship to volunteers, collect results.
+1. **Connection probe** (above) — *done*. Ship to volunteers, collect results.
+1a. **Mapping lifetime** — how long a consumer router holds an idle mapping open before dropping it. Determines the keepalive interval the mesh will need, and is cheap to measure once boxes are deployed.
 2. **Local container rig** — N nodes, forming an overlay, gossiping membership.
 3. **Job execution** — a sandboxed WASM job with fuel metering, so a job cannot consume unbounded CPU (§11.4).
 4. **Checkpoint and migrate** — a running job's state captured periodically, and resumed elsewhere when its host vanishes (§11.3, §9.4).

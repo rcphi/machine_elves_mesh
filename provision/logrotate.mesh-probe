@@ -1,0 +1,10 @@
+/var/log/mesh-probe/results.jsonl {
+    weekly
+    rotate 12
+    compress
+    delaycompress
+    missingok
+    notifempty
+    copytruncate
+    su meshprobe meshprobe
+}
