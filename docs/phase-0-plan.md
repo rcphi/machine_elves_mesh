@@ -154,7 +154,7 @@ Household isolation (`--isolate-lan`) is opt-in, verifies internet reachability 
 ## What gets built, in order
 
 1. **Connection probe** (above) — *done*. Ship to volunteers, collect results.
-1a. **Mapping lifetime** — how long a consumer router holds an idle mapping open before dropping it. Determines the keepalive interval the mesh will need, and is cheap to measure once boxes are deployed.
+1a. **Mapping lifetime** — *done*. How long a consumer router holds an idle mapping open before dropping it, measured one interval per run and aggregated across days. Determines the keepalive interval the mesh will need, which is set by the **worst** router among the players rather than the average one.
 2. **Local container rig** — N nodes, forming an overlay, gossiping membership.
 3. **Job execution** — a sandboxed WASM job with fuel metering, so a job cannot consume unbounded CPU (§11.4).
 4. **Checkpoint and migrate** — a running job's state captured periodically, and resumed elsewhere when its host vanishes (§11.3, §9.4).

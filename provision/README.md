@@ -23,7 +23,7 @@ What it does:
 | | |
 |---|---|
 | **Installs** | `mesh-probe` to `/usr/local/bin`, building it if no release binary exists |
-| **Runs it** | every 30 minutes via a systemd timer, with up to 5 minutes of jitter |
+| **Runs it** | connectivity every 30 minutes, mapping-lifetime every 25, both jittered |
 | **Logs to** | `/var/log/mesh-probe/results.jsonl`, one JSON record per line, rotated weekly |
 | **Isolates it** | unprivileged service account, no capabilities, read-only filesystem except its log |
 | **Keeps it awake** | suspend, hibernate, and hybrid-sleep masked |
@@ -47,6 +47,20 @@ exactly the failure Phase 0 is trying to observe.
 
 **Suspend masked**, for the same reason: a box that sleeps at 3am produces
 results identical to a network outage.
+
+## Two measurements, two timers
+
+**Connectivity** classifies the connection and finishes in under a minute.
+
+**Mapping lifetime** measures how long the router remembers an idle connection,
+and spends nearly all of its time deliberately sending nothing — a single run
+lasts as long as the interval it drew, up to ten minutes. It therefore has its
+own unit with a longer start timeout, and draws one interval per run so the
+answer accumulates over days.
+
+This is the measurement that most rewards shipping the boxes early: it costs an
+hour to build and produces nothing but time, which a box in someone's house has
+in abundance and a development machine does not.
 
 ## Isolating the box from the household
 
