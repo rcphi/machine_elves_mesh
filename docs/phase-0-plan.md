@@ -69,12 +69,71 @@ Finding that out cheaply is worth more than any amount of careful implementation
 
 ## Stop criteria
 
-Carried from §19.5, unchanged:
+Carried from §19.5:
 
 - Direct connections between home machines fail often enough that relaying becomes the common case rather than the fallback, **and** relay burden proves impractical to distribute across players.
 - A machine dropping out produces a stall long enough that a player would read it as broken software rather than as the world breathing.
 
-**Write down the threshold for "long enough" before measuring it.** A number chosen after seeing results is not a criterion.
+## Timing thresholds — fixed 2026-08-21, before measurement
+
+These are recorded in advance deliberately. A number chosen after seeing results is not a criterion, it is a rationalisation.
+
+**There are two thresholds, and conflating them is the usual mistake.**
+
+| | Threshold | What it governs |
+|---|---|---|
+| **Detection** | 2–3 s of silence | How long a node may go quiet before it is presumed gone. This is the dip tolerance — set too low, the mesh thrashes, migrating work every time a wifi link stutters. |
+| **Resume** | **500 ms** | How long the visible gap may last once a takeover begins. This is the player-facing number. |
+
+**500 ms is too slow for gameplay input and that is fine**, because this is not the input path. It is the recovery path for an unannounced disappearance, which should be rare. Anything a player does continuously — moving, interacting — runs locally and is never waiting on a remote node.
+
+### Two consequences of choosing 500 ms
+
+**1. It forces warm standbys, which is the right architecture anyway.** A transatlantic round trip is roughly 100–150 ms, so a takeover needing two or three exchanges plus a state transfer has already spent the budget. **500 ms is unachievable if the replacement node must fetch state after the failure, and comfortable if it already holds it.** §9.1's continuous replication is therefore not merely a durability feature — it is what makes the resume budget reachable at all.
+
+**2. Detection and resume need not be added together.** The naive reading is that an unannounced loss costs 3 s of detection plus 500 ms of resume. It does not have to, because a standby that already holds recent state can **begin continuing from the last checkpoint immediately, while the original is still merely suspected of being gone.** If the original turns out to be alive, the speculative work is discarded. Briefly running two copies is cheap; a visible stall is not. This is the same tail-latency technique described by Dean and Barroso in *The Tail at Scale* (2013).
+
+**Speculation is only valid where §9.3 says it is.** Deterministic simulation with no side effects may be run twice and one copy discarded. Anything committing to a ledger, an ownership record, or a governance record must have exactly one writer, and there correctness outranks latency — it may take longer than 500 ms, it may never be wrong, and the player is shown an honest waiting state rather than an invented one.
+
+### A single global number is the wrong shape
+
+§9.6 already tiers subsystems by criticality, and recovery should use the same tiers:
+
+| Criticality | Acceptable gap |
+|---|---|
+| **Cosmetic** | Seconds. Nobody notices, and §12.2 already makes stalled ambience an honest signal. |
+| **Supporting / Essential** | 500 ms, met by speculative resume from a warm standby. |
+| **Core** (ledgers, ownership, governance) | Correctness first. Slower is acceptable; wrong is not. |
+
+### What to actually measure
+
+**Record the distribution, not the average.** A median of 90 ms with a 99th percentile of 8 s feels broken to every player who hits the tail, and reports as excellent in a summary statistic. Phase 0 reports p50, p95, and p99 for takeover gaps, and the stop criterion is evaluated against **p95**.
+
+## Volunteer machines and remote management
+
+Volunteers are not technically inclined. Machines are prepared centrally — Ubuntu 26.04, Rust and dependencies preinstalled — and shipped ready to plug in.
+
+**Design for zero interaction first, remote access as the fallback.** The box should boot, start its service, run its measurements, log locally, and report results without anyone touching it. Remote access exists for when something breaks, not as the normal path. Every requirement to talk a friend through a terminal is a measurement that does not happen.
+
+### The contamination rule
+
+Remote management of machines behind NAT is *the same problem Phase 0 exists to answer*, so the management path must be provably separate from the measured path.
+
+- **The mesh must never route over the management overlay.** Bind mesh sockets explicitly; never let a fallback route succeed silently. Otherwise the experiment reports that peer-to-peer works when what works is the management tool.
+- **The management overlay may never serve as rendezvous** for mesh peers.
+- **Prefer measurement windows with management traffic quiescent**, since a keepalive-heavy overlay holds NAT mappings open that would otherwise expire — which is itself one of the behaviours being measured.
+
+**A management jump host is not the rented infrastructure that was ruled out.** The no-VPS decision is about the architecture under test, not about operations tooling. Something outside the measured path is a different category — but it must be genuinely outside it, which is what the rule above enforces.
+
+### On the volunteer's household
+
+The box sits on someone else's home network. **Firewall it away from their LAN**, permitting only outbound internet and the mesh ports. This is partly courtesy and partly correctness: a friend's other devices are not part of the experiment, and their household should not have to think about what the box can see.
+
+Volunteers should be told plainly what the machine does, that it can be remotely accessed by the operator, and that unplugging it at any time is fine and breaks nothing.
+
+### A note on the distribution
+
+Ubuntu Desktop carries background services — update checks, telemetry, indexing — that add noise to a networking measurement and compete for the CPU that jobs are supposed to be metered against. **Ubuntu Server is the better fit for a box nobody logs into**, unless a graphical session is wanted for later phases.
 
 ## What gets built, in order
 
