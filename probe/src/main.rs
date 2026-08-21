@@ -1,0 +1,595 @@
+//! Machine Elves — Phase 0 connection probe.
+//!
+//! Reports what one home internet connection can and cannot do, so that
+//! `docs/phase-0-plan.md`'s go/no-go can be answered before any mesh code
+//! is written. Sends nothing anywhere except STUN binding requests to
+//! public servers, and prints the result locally for the operator to share.
+//!
+//! Deliberately depends on nothing outside the standard library: volunteers
+//! run this on whatever machine they own, and a single static binary with no
+//! runtime is the whole point.
+
+use std::collections::hash_map::RandomState;
+use std::hash::{BuildHasher, Hasher};
+use std::io::{self, ErrorKind};
+use std::net::{IpAddr, Ipv4Addr, Ipv6Addr, SocketAddr, ToSocketAddrs, UdpSocket};
+use std::time::{Duration, SystemTime};
+
+const MAGIC_COOKIE: u32 = 0x2112_A442;
+const BINDING_REQUEST: u16 = 0x0001;
+const BINDING_SUCCESS: u16 = 0x0101;
+const ATTR_MAPPED_ADDRESS: u16 = 0x0001;
+const ATTR_XOR_MAPPED_ADDRESS: u16 = 0x0020;
+const TIMEOUT: Duration = Duration::from_secs(3);
+const ATTEMPTS: usize = 3;
+
+/// STUN servers on deliberately distinct operators. Mapping behaviour can only
+/// be classified by comparing what two *different* server IPs observe, so this
+/// list must never collapse to one provider.
+const STUN_SERVERS: &[&str] = &[
+    "stun.l.google.com:19302",
+    "stun.cloudflare.com:3478",
+    "stun.nextcloud.com:443",
+    "stun.sipgate.net:3478",
+];
+
+fn main() {
+    println!("Machine Elves — connection probe v0.1");
+    println!("=====================================");
+    println!();
+    println!("Measuring what this connection can do. Takes under a minute.");
+    println!("Nothing is uploaded; the report is printed here for you to send back.");
+    println!();
+
+    let v4 = probe_family(Family::V4);
+    let v6 = probe_family(Family::V6);
+
+    report(&v4, &v6);
+}
+
+#[derive(Clone, Copy, PartialEq, Debug)]
+enum Family {
+    V4,
+    V6,
+}
+
+impl Family {
+    fn label(self) -> &'static str {
+        match self {
+            Family::V4 => "IPv4",
+            Family::V6 => "IPv6",
+        }
+    }
+
+    fn wildcard(self) -> SocketAddr {
+        match self {
+            Family::V4 => SocketAddr::from((Ipv4Addr::UNSPECIFIED, 0)),
+            Family::V6 => SocketAddr::from((Ipv6Addr::UNSPECIFIED, 0)),
+        }
+    }
+
+    fn matches(self, addr: &SocketAddr) -> bool {
+        matches!(
+            (self, addr),
+            (Family::V4, SocketAddr::V4(_)) | (Family::V6, SocketAddr::V6(_))
+        )
+    }
+}
+
+struct Observation {
+    server: String,
+    server_ip: IpAddr,
+    mapped: SocketAddr,
+}
+
+struct FamilyResult {
+    family: Family,
+    local: Option<IpAddr>,
+    observations: Vec<Observation>,
+    errors: Vec<String>,
+}
+
+/// Runs every STUN query for one address family through a *single* socket.
+///
+/// This is not incidental. Mapping behaviour is defined as whether the same
+/// local port is translated to the same external port when talking to
+/// different destinations, so reusing one socket is what makes the comparison
+/// meaningful. A fresh socket per server would measure nothing.
+fn probe_family(family: Family) -> FamilyResult {
+    let mut result = FamilyResult {
+        family,
+        local: None,
+        observations: Vec::new(),
+        errors: Vec::new(),
+    };
+
+    let socket = match UdpSocket::bind(family.wildcard()) {
+        Ok(s) => s,
+        Err(e) => {
+            result
+                .errors
+                .push(format!("cannot open a {} socket: {}", family.label(), e));
+            return result;
+        }
+    };
+    let _ = socket.set_read_timeout(Some(TIMEOUT));
+
+    println!("Checking {}…", family.label());
+
+    for server in STUN_SERVERS {
+        let addr = match resolve(server, family) {
+            Some(a) => a,
+            None => continue,
+        };
+
+        if result.local.is_none() {
+            result.local = outbound_address(family, addr);
+        }
+
+        match stun_binding(&socket, addr) {
+            Ok(mapped) => {
+                println!("  {:<28} sees us as {}", server, mapped);
+                result.observations.push(Observation {
+                    server: (*server).to_string(),
+                    server_ip: addr.ip(),
+                    mapped,
+                });
+            }
+            Err(e) => {
+                let why = match e.kind() {
+                    ErrorKind::WouldBlock | ErrorKind::TimedOut => "no reply".to_string(),
+                    _ => e.to_string(),
+                };
+                println!("  {:<28} {}", server, why);
+                result.errors.push(format!("{}: {}", server, why));
+            }
+        }
+    }
+    println!();
+    result
+}
+
+fn resolve(server: &str, family: Family) -> Option<SocketAddr> {
+    server
+        .to_socket_addrs()
+        .ok()?
+        .find(|addr| family.matches(addr))
+}
+
+/// The address this machine would use to reach the outside world.
+///
+/// Connecting a UDP socket sends no packets — it only fixes the route — so
+/// this reads the kernel's own choice of source address without touching the
+/// network. Enumerating interfaces directly would need a platform-specific
+/// dependency, which the no-dependencies rule rules out.
+fn outbound_address(family: Family, via: SocketAddr) -> Option<IpAddr> {
+    let socket = UdpSocket::bind(family.wildcard()).ok()?;
+    socket.connect(via).ok()?;
+    socket.local_addr().ok().map(|a| a.ip())
+}
+
+fn stun_binding(socket: &UdpSocket, server: SocketAddr) -> io::Result<SocketAddr> {
+    let mut last = io::Error::new(ErrorKind::TimedOut, "no reply");
+
+    for _ in 0..ATTEMPTS {
+        let transaction = random_transaction_id();
+        let request = build_binding_request(&transaction);
+        socket.send_to(&request, server)?;
+
+        let mut buf = [0u8; 1500];
+        match socket.recv_from(&mut buf) {
+            Ok((len, from)) => {
+                // A late reply to an earlier query can arrive on this shared
+                // socket; the transaction ID is what makes them distinguishable.
+                if from.ip() != server.ip() {
+                    continue;
+                }
+                match parse_binding_response(&buf[..len], &transaction) {
+                    Some(mapped) => return Ok(mapped),
+                    None => {
+                        last = io::Error::new(ErrorKind::InvalidData, "unrecognised reply");
+                    }
+                }
+            }
+            Err(e) => last = e,
+        }
+    }
+    Err(last)
+}
+
+fn build_binding_request(transaction: &[u8; 12]) -> Vec<u8> {
+    let mut msg = Vec::with_capacity(20);
+    msg.extend_from_slice(&BINDING_REQUEST.to_be_bytes());
+    msg.extend_from_slice(&0u16.to_be_bytes()); // no attributes
+    msg.extend_from_slice(&MAGIC_COOKIE.to_be_bytes());
+    msg.extend_from_slice(transaction);
+    msg
+}
+
+fn parse_binding_response(buf: &[u8], transaction: &[u8; 12]) -> Option<SocketAddr> {
+    if buf.len() < 20 {
+        return None;
+    }
+    if u16::from_be_bytes([buf[0], buf[1]]) != BINDING_SUCCESS {
+        return None;
+    }
+    if u32::from_be_bytes([buf[4], buf[5], buf[6], buf[7]]) != MAGIC_COOKIE {
+        return None;
+    }
+    if &buf[8..20] != transaction {
+        return None;
+    }
+
+    let declared = u16::from_be_bytes([buf[2], buf[3]]) as usize;
+    let end = (20 + declared).min(buf.len());
+    let mut cursor = 20;
+    let mut fallback = None;
+
+    while cursor + 4 <= end {
+        let attr_type = u16::from_be_bytes([buf[cursor], buf[cursor + 1]]);
+        let attr_len = u16::from_be_bytes([buf[cursor + 2], buf[cursor + 3]]) as usize;
+        let value_start = cursor + 4;
+        let value_end = value_start + attr_len;
+        if value_end > end {
+            break;
+        }
+        let value = &buf[value_start..value_end];
+
+        match attr_type {
+            ATTR_XOR_MAPPED_ADDRESS => {
+                if let Some(addr) = decode_address(value, true, transaction) {
+                    return Some(addr);
+                }
+            }
+            ATTR_MAPPED_ADDRESS => {
+                // Obsolete but still emitted by some servers. Kept only as a
+                // fallback so an older server does not read as a failure.
+                if fallback.is_none() {
+                    fallback = decode_address(value, false, transaction);
+                }
+            }
+            _ => {}
+        }
+
+        // Attribute values are padded to a four-byte boundary.
+        cursor = value_end + ((4 - (attr_len % 4)) % 4);
+    }
+    fallback
+}
+
+fn decode_address(value: &[u8], xored: bool, transaction: &[u8; 12]) -> Option<SocketAddr> {
+    if value.len() < 4 {
+        return None;
+    }
+    let family = value[1];
+    let mut port = u16::from_be_bytes([value[2], value[3]]);
+    if xored {
+        port ^= (MAGIC_COOKIE >> 16) as u16;
+    }
+
+    match family {
+        0x01 => {
+            let raw = value.get(4..8)?;
+            let mut octets = [0u8; 4];
+            octets.copy_from_slice(raw);
+            if xored {
+                for (i, byte) in MAGIC_COOKIE.to_be_bytes().iter().enumerate() {
+                    octets[i] ^= byte;
+                }
+            }
+            Some(SocketAddr::from((Ipv4Addr::from(octets), port)))
+        }
+        0x02 => {
+            let raw = value.get(4..20)?;
+            let mut octets = [0u8; 16];
+            octets.copy_from_slice(raw);
+            if xored {
+                let mut key = [0u8; 16];
+                key[..4].copy_from_slice(&MAGIC_COOKIE.to_be_bytes());
+                key[4..].copy_from_slice(transaction);
+                for i in 0..16 {
+                    octets[i] ^= key[i];
+                }
+            }
+            Some(SocketAddr::from((Ipv6Addr::from(octets), port)))
+        }
+        _ => None,
+    }
+}
+
+/// Transaction IDs only need to be unpredictable enough to match a reply to
+/// its request. `RandomState` is seeded randomly per process, which is
+/// sufficient here and avoids a dependency for a diagnostic tool.
+fn random_transaction_id() -> [u8; 12] {
+    let mut id = [0u8; 12];
+    let state = RandomState::new();
+    let nanos = SystemTime::now()
+        .duration_since(SystemTime::UNIX_EPOCH)
+        .map(|d| d.as_nanos() as u64)
+        .unwrap_or(0);
+
+    for (chunk, salt) in id.chunks_mut(4).zip(0u64..) {
+        let mut hasher = state.build_hasher();
+        hasher.write_u64(nanos);
+        hasher.write_u64(salt);
+        let bytes = hasher.finish().to_be_bytes();
+        chunk.copy_from_slice(&bytes[..chunk.len()]);
+    }
+    id
+}
+
+// ---------------------------------------------------------------- reporting
+
+fn report(v4: &FamilyResult, v6: &FamilyResult) {
+    let v4_verdict = describe_v4(v4);
+    let v6_verdict = describe_v6(v6);
+
+    println!("What this means");
+    println!("---------------");
+    for line in &v4_verdict.notes {
+        println!("  {}", line);
+    }
+    for line in &v6_verdict.notes {
+        println!("  {}", line);
+    }
+
+    println!();
+    println!("Please send back the line below.");
+    println!();
+    println!(
+        "PROBE v0.1 | ipv4={} | ipv6={} | relay-capable={}",
+        v4_verdict.tag,
+        v6_verdict.tag,
+        if v4_verdict.reachable || v6_verdict.reachable {
+            "yes"
+        } else {
+            "no"
+        }
+    );
+}
+
+struct Verdict {
+    tag: String,
+    notes: Vec<String>,
+    reachable: bool,
+}
+
+fn describe_v4(result: &FamilyResult) -> Verdict {
+    debug_assert!(result.family == Family::V4);
+    let mut notes = Vec::new();
+
+    if result.observations.is_empty() {
+        notes.push(
+            "IPv4: no STUN server could be reached. Either this connection blocks outbound UDP, \
+             or it has no IPv4 route at all."
+                .to_string(),
+        );
+        return Verdict {
+            tag: "unreachable".to_string(),
+            notes,
+            reachable: false,
+        };
+    }
+
+    let mapped = result.observations[0].mapped;
+    let local = result.local;
+
+    // Distinct observers are what make the comparison meaningful.
+    let mut distinct_servers: Vec<IpAddr> = result.observations.iter().map(|o| o.server_ip).collect();
+    distinct_servers.sort();
+    distinct_servers.dedup();
+
+    let ports: Vec<u16> = result.observations.iter().map(|o| o.mapped.port()).collect();
+    let consistent = ports.windows(2).all(|w| w[0] == w[1]);
+
+    let no_nat = local == Some(mapped.ip());
+    let cgnat = matches!(mapped.ip(), IpAddr::V4(ip) if is_shared_address_space(ip));
+    let double_nat = matches!(mapped.ip(), IpAddr::V4(ip) if ip.is_private());
+
+    if let Some(local_ip) = local {
+        notes.push(format!("IPv4: this machine's own address is {}", local_ip));
+    }
+    notes.push(format!("IPv4: the internet sees this machine as {}", mapped));
+
+    let tag;
+    let reachable;
+
+    if no_nat {
+        tag = "public".to_string();
+        reachable = true;
+        notes.push(
+            "IPv4: this connection has a public address and no translation in the way. It can \
+             accept incoming connections and could carry relay duty for others."
+                .to_string(),
+        );
+    } else if cgnat {
+        tag = "cgnat".to_string();
+        reachable = false;
+        notes.push(
+            "IPv4: CARRIER-GRADE NAT confirmed — the address the internet sees is itself inside \
+             the ISP's shared range. Incoming connections are impossible on IPv4, and direct \
+             connections to other such machines will usually fail."
+                .to_string(),
+        );
+    } else if double_nat {
+        tag = "double-nat".to_string();
+        reachable = false;
+        notes.push(
+            "IPv4: the address the internet sees is itself private, meaning at least two layers \
+             of translation. Treat this the same as carrier-grade NAT."
+                .to_string(),
+        );
+    } else if distinct_servers.len() < 2 {
+        tag = "nat-unclassified".to_string();
+        reachable = false;
+        notes.push(
+            "IPv4: behind translation, but only one STUN operator answered, so the mapping \
+             behaviour could not be classified. Re-run when the network is quieter."
+                .to_string(),
+        );
+    } else if consistent {
+        tag = "nat-endpoint-independent".to_string();
+        reachable = false;
+        notes.push(
+            "IPv4: behind translation, but the same external port is used no matter who is being \
+             contacted. This is the good case — hole punching should work against other peers."
+                .to_string(),
+        );
+    } else {
+        tag = "nat-address-dependent".to_string();
+        reachable = false;
+        let seen: Vec<String> = result
+            .observations
+            .iter()
+            .map(|o| format!("{} -> :{}", o.server, o.mapped.port()))
+            .collect();
+        notes.push(format!(
+            "IPv4: behind translation that assigns a different external port per destination \
+             ({}). This is the hard case — hole punching is unreliable and a relay will usually \
+             be needed.",
+            seen.join(", ")
+        ));
+    }
+
+    Verdict {
+        tag,
+        notes,
+        reachable,
+    }
+}
+
+fn describe_v6(result: &FamilyResult) -> Verdict {
+    debug_assert!(result.family == Family::V6);
+    let mut notes = Vec::new();
+
+    let global = result
+        .observations
+        .iter()
+        .find(|o| matches!(o.mapped.ip(), IpAddr::V6(ip) if is_global_unicast_v6(ip)));
+
+    match global {
+        Some(observation) => {
+            notes.push(format!(
+                "IPv6: working, with the global address {}",
+                observation.mapped.ip()
+            ));
+            notes.push(
+                "IPv6: this is the outcome that makes the whole NAT question moot. Two peers \
+                 that both have working IPv6 can address each other directly, with no traversal \
+                 and no relay — subject to the firewall permitting it, which this probe does not \
+                 test."
+                    .to_string(),
+            );
+            Verdict {
+                tag: "global".to_string(),
+                notes,
+                reachable: true,
+            }
+        }
+        None => {
+            notes.push(
+                "IPv6: not available on this connection. Every peer connection must therefore \
+                 survive IPv4 translation."
+                    .to_string(),
+            );
+            Verdict {
+                tag: "none".to_string(),
+                notes,
+                reachable: false,
+            }
+        }
+    }
+}
+
+/// RFC 6598 shared address space — the range ISPs use for carrier-grade NAT.
+/// Seeing it as one's *public* address is unambiguous proof of it.
+fn is_shared_address_space(ip: Ipv4Addr) -> bool {
+    let [a, b, ..] = ip.octets();
+    a == 100 && (64..=127).contains(&b)
+}
+
+fn is_global_unicast_v6(ip: Ipv6Addr) -> bool {
+    let first = ip.segments()[0];
+    // 2000::/3, excluding link-local fe80::/10 and unique-local fc00::/7.
+    (first & 0xE000) == 0x2000
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn decodes_xor_mapped_ipv4() {
+        let transaction = [0u8; 12];
+        // 192.0.2.1:32853 encoded per RFC 5389 §15.2.
+        let port = 32853u16 ^ (MAGIC_COOKIE >> 16) as u16;
+        let mut octets = Ipv4Addr::new(192, 0, 2, 1).octets();
+        for (i, byte) in MAGIC_COOKIE.to_be_bytes().iter().enumerate() {
+            octets[i] ^= byte;
+        }
+        let mut value = vec![0x00, 0x01];
+        value.extend_from_slice(&port.to_be_bytes());
+        value.extend_from_slice(&octets);
+
+        let decoded = decode_address(&value, true, &transaction).expect("decodes");
+        assert_eq!(decoded, SocketAddr::from((Ipv4Addr::new(192, 0, 2, 1), 32853)));
+    }
+
+    #[test]
+    fn rejects_response_with_wrong_transaction_id() {
+        let ours = [1u8; 12];
+        let theirs = [2u8; 12];
+        let mut msg = Vec::new();
+        msg.extend_from_slice(&BINDING_SUCCESS.to_be_bytes());
+        msg.extend_from_slice(&0u16.to_be_bytes());
+        msg.extend_from_slice(&MAGIC_COOKIE.to_be_bytes());
+        msg.extend_from_slice(&theirs);
+        assert!(parse_binding_response(&msg, &ours).is_none());
+    }
+
+    #[test]
+    fn identifies_carrier_grade_nat_range() {
+        assert!(is_shared_address_space(Ipv4Addr::new(100, 64, 0, 1)));
+        assert!(is_shared_address_space(Ipv4Addr::new(100, 127, 255, 255)));
+        assert!(!is_shared_address_space(Ipv4Addr::new(100, 63, 255, 255)));
+        assert!(!is_shared_address_space(Ipv4Addr::new(100, 128, 0, 0)));
+    }
+
+    #[test]
+    fn identifies_global_ipv6_only() {
+        assert!(is_global_unicast_v6("2001:db8::1".parse().unwrap()));
+        assert!(!is_global_unicast_v6("fe80::1".parse().unwrap()));
+        assert!(!is_global_unicast_v6("fd00::1".parse().unwrap()));
+    }
+
+    #[test]
+    fn skips_unknown_attributes_to_find_the_mapped_address() {
+        let transaction = [7u8; 12];
+        let mut attrs = Vec::new();
+        // An unknown attribute with a 3-byte value, forcing one byte of padding.
+        attrs.extend_from_slice(&0x9999u16.to_be_bytes());
+        attrs.extend_from_slice(&3u16.to_be_bytes());
+        attrs.extend_from_slice(&[0xAA, 0xBB, 0xCC, 0x00]);
+
+        let port = 1234u16 ^ (MAGIC_COOKIE >> 16) as u16;
+        let mut octets = Ipv4Addr::new(203, 0, 113, 5).octets();
+        for (i, byte) in MAGIC_COOKIE.to_be_bytes().iter().enumerate() {
+            octets[i] ^= byte;
+        }
+        attrs.extend_from_slice(&ATTR_XOR_MAPPED_ADDRESS.to_be_bytes());
+        attrs.extend_from_slice(&8u16.to_be_bytes());
+        attrs.extend_from_slice(&[0x00, 0x01]);
+        attrs.extend_from_slice(&port.to_be_bytes());
+        attrs.extend_from_slice(&octets);
+
+        let mut msg = Vec::new();
+        msg.extend_from_slice(&BINDING_SUCCESS.to_be_bytes());
+        msg.extend_from_slice(&(attrs.len() as u16).to_be_bytes());
+        msg.extend_from_slice(&MAGIC_COOKIE.to_be_bytes());
+        msg.extend_from_slice(&transaction);
+        msg.extend_from_slice(&attrs);
+
+        let decoded = parse_binding_response(&msg, &transaction).expect("finds address");
+        assert_eq!(decoded.port(), 1234);
+    }
+}

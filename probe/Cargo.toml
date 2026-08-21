@@ -1,0 +1,12 @@
+[package]
+name = "mesh-probe"
+version = "0.1.0"
+edition = "2021"
+description = "Reports what a home internet connection can and cannot do, for Machine Elves Phase 0."
+
+[dependencies]
+
+[profile.release]
+opt-level = "z"
+lto = true
+strip = true
