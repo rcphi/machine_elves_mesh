@@ -18,6 +18,7 @@
 use std::path::Path;
 
 use anyhow::{anyhow, bail, Context, Result};
+use sha2::{Digest, Sha256};
 use wasmtime::{Config, Engine, Instance, Module, Store, StoreLimitsBuilder};
 
 /// wasmtime carries its own `anyhow`, which is a different type from ours even
@@ -55,6 +56,7 @@ pub struct Job {
     module: Module,
     fuel: u64,
     memory: usize,
+    id: [u8; 32],
 }
 
 #[derive(Debug, PartialEq)]
@@ -79,6 +81,14 @@ impl Job {
         let mut config = Config::new();
         config.consume_fuel(true);
         let engine = Engine::new(&config).map_err(wasm_err)?;
+        // A job is identified by its code and nothing else. Two nodes holding
+        // the same bytes agree on which job it is without being told, and
+        // without anyone maintaining a registry of names — which matters
+        // because the identity is what produced things are derived from.
+        let bytes = std::fs::read(path.as_ref())
+            .with_context(|| format!("reading {}", path.as_ref().display()))?;
+        let id: [u8; 32] = Sha256::digest(&bytes).into();
+
         let module = Module::from_file(&engine, path.as_ref())
             .map_err(wasm_err)
             .with_context(|| format!("loading {}", path.as_ref().display()))?;
@@ -106,7 +116,17 @@ impl Job {
             module,
             fuel,
             memory,
+            id,
         })
+    }
+
+    /// The hash of this job's code.
+    pub fn id(&self) -> &[u8; 32] {
+        &self.id
+    }
+
+    pub fn short_id(&self) -> String {
+        self.id[..6].iter().map(|b| format!("{b:02x}")).collect()
     }
 
     /// Runs one tick.

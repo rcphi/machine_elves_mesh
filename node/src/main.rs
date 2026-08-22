@@ -8,6 +8,7 @@
 //! trustworthy first, because everything else is built on knowing who is here.
 
 mod job;
+mod ledger;
 
 use std::collections::HashMap;
 use std::time::{Duration, Instant, SystemTime};
@@ -180,6 +181,8 @@ struct Config {
 /// A job the whole mesh holds, and the bookkeeping for who is running it.
 struct Work {
     job: job::Job,
+    /// Everything this node knows to exist. Not a count — see `ledger`.
+    ledger: ledger::Ledger,
     /// The node currently advancing it. Every node agrees on this by watching
     /// checkpoints arrive, so nobody has to be told.
     owner: Option<PeerId>,
@@ -434,6 +437,7 @@ async fn run(config: Config) -> Result<()> {
                  &[("path", path), ("owner", if config.own { "true" } else { "false" })]);
             Some(Work {
                 job,
+                ledger: ledger::Ledger::new(),
                 owner: config.own.then_some(me),
                 state: Vec::new(),
                 tick: 0,
@@ -486,10 +490,12 @@ async fn run(config: Config) -> Result<()> {
                         // widgets counted twice is not. Whatever applies these
                         // must therefore treat (job, tick) as the identity of
                         // an effect and ignore a repeat.
-                        for line in String::from_utf8_lossy(&outcome.effects).lines() {
+                        let effects = String::from_utf8_lossy(&outcome.effects).into_owned();
+                        for line in effects.lines() {
                             emit(&config, "effect", &format!("tick {} — {line}", work.tick),
                                  &[("tick", &work.tick.to_string()), ("effect", line)]);
                         }
+                        record_production(&config, work, &effects);
                         // Checkpointed every tick because this state is tiny.
                         // Real work would checkpoint less often and trade a
                         // little replayed work for a lot less traffic.
@@ -696,6 +702,48 @@ async fn run(config: Config) -> Result<()> {
                 _ => {}
             }
         }
+    }
+}
+
+/// Turns "produce widget 2" into two widgets with identities of their own.
+///
+/// The serial is derived from the job's code, the tick, and which item of that
+/// tick it is — never assigned by anyone. So when two nodes briefly continue
+/// the same job, they do not make two widgets each that someone must later
+/// reconcile: they make *the same* widgets, and recording one twice records it
+/// once. There is nothing to deduplicate because there is no duplicate.
+fn record_production(config: &Config, work: &mut Work, effects: &str) {
+    for line in effects.lines() {
+        let mut parts = line.split_whitespace();
+        if parts.next() != Some("produce") {
+            continue;
+        }
+        let Some(kind) = parts.next() else { continue };
+        let count: u32 = parts.next().and_then(|n| n.parse().ok()).unwrap_or(1);
+
+        let mut fresh = 0;
+        for ordinal in 0..count {
+            let serial = ledger::Serial::derive(work.job.id(), work.tick, kind, ordinal);
+            if work.ledger.record(kind, serial) {
+                fresh += 1;
+            }
+        }
+
+        emit(
+            config,
+            "produced",
+            &format!(
+                "{count} {kind}, {fresh} new — {} in the ledger",
+                work.ledger.count(kind)
+            ),
+            &[
+                ("kind", kind),
+                ("claimed", &count.to_string()),
+                ("new", &fresh.to_string()),
+                ("total", &work.ledger.count(kind).to_string()),
+                ("tick", &work.tick.to_string()),
+            ],
+        );
     }
 }
 

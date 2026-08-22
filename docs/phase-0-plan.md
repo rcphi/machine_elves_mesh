@@ -208,7 +208,33 @@ Every survivor picks the lowest peer identifier among everyone still present. Th
 
 **Two nodes continued the same job.** Standbys learn about the owner from checkpoints every 200 ms but about each other from heartbeats every second, so both could be following the owner while neither knew the other existed. When the owner left, each saw an empty membership and concluded it was alone. Now a node answers a newly-seen peer immediately rather than waiting for the next interval.
 
-**Duplicate execution is possible by design, and that changes what an effect is.** The second bug narrows the window but cannot close it: any node that has not yet heard from a peer believes it is alone. Since jobs are deterministic, two nodes continuing the same job produce *identical* effects — wasted work, which is acceptable. Widgets counted twice is not. **Whatever applies effects must treat `(job, tick)` as an effect's identity and ignore a repeat.** This is a requirement on the layer above, discovered here, and it would have been an unpleasant surprise later.
+**Duplicate execution is possible by design, and that changes what a produced thing is.** The second bug narrows the window but cannot close it: any node that has not yet heard from a peer genuinely believes it is alone, and no amount of faster messaging fixes that. Since jobs are deterministic, two nodes continuing the same job produce *identical* output — wasted work, which is acceptable. Widgets counted twice is not.
+
+The first answer was a rule: whatever applies effects should remember what it has already applied and ignore repeats. That works and is worse, because it requires every applier to keep a record and to agree with every other applier about what counts as the same thing.
+
+**The answer taken instead is to make the duplicate not exist.** See below.
+
+## Things are identified by what made them — 2026-08-22
+
+**A produced thing's identity is derived, never assigned.** A widget's serial number is a hash of the job's own code, the tick that made it, and which item of that tick it is. Nobody hands out serial numbers, because an authority handing them out is a thing that can be absent — and this has to work when every node is talking to a different half of the world.
+
+**A job is identified by its code.** Its identity is the hash of its WebAssembly module, so two nodes holding the same bytes agree on which job it is without being told and without anyone maintaining a registry of names.
+
+The consequence is the point: **when two nodes both continue a job, they do not each make a widget that someone must later reconcile. They make the same widget.** Recording it twice records it once. There is nothing to deduplicate because there is no duplicate.
+
+**The ledger is a set, not a count.** Counting makes "add this widget" an operation whose result depends on how many times it happened; membership does not. Merging two nodes' views is set union — commutative, associative, idempotent — so nodes converge whatever order they hear things in and however often, and no node ever has to ask another what it has already seen.
+
+Demonstrated with two nodes on separate meshes, unable to see each other, running the same job from scratch — which is exactly the state two nodes are in when both continue one:
+
+```
+tick  12: produced 2 widget, ledger now holds 2
+tick  13: produced 2 widget, ledger now holds 4
+tick  23: produced 2 widget, ledger now holds 6
+```
+
+Both produced identical records. A world merging their ledgers holds 14 widgets, not 28.
+
+**What this does not solve, and must not be mistaken for solving it:** genuine contention. Two citizens wanting the last unit of steel is not a duplicate — it is a real conflict between different intentions, and no amount of content-derived identity resolves it. That needs ordering, which is what §9.3's consistency tiers are for and what the fair queue decides. The distinction is worth holding onto: **idempotent facts converge for free; contested decisions never will.**
 
 ### A mesh is now a named thing
 

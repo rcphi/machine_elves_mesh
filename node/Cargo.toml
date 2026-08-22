@@ -8,5 +8,6 @@ description = "Phase 0 mesh node: forms an overlay, tracks membership, notices w
 anyhow = "1.0.104"
 futures = "0.3.34"
 libp2p = { version = "0.56.0", features = ["tokio", "quic", "tcp", "noise", "yamux", "gossipsub", "mdns", "identify", "ping", "macros"] }
+sha2 = "0.11.0"
 tokio = { version = "1.53.1", features = ["rt-multi-thread", "macros", "time", "signal"] }
 wasmtime = "48.0.0"
