@@ -4,11 +4,14 @@
 Answers the question Phase 0 actually asks: can these machines reach each
 other without renting a server, and is the answer stable over time?
 
-    ./summarise.py results/all.jsonl
+    ./summarise.py [results/all.jsonl]
 """
 import collections
 import json
+import os
 import sys
+
+DEFAULT_PATH = os.path.join(os.path.dirname(os.path.abspath(__file__)), "results", "all.jsonl")
 
 # Whether a machine could accept an incoming connection, which is what
 # decides whether it can carry relay duty for peers that cannot.
@@ -17,7 +20,7 @@ REACHABLE = {"public", "global"}
 
 def load(path):
     records = []
-    with open(path) as handle:
+    with open(path, encoding="utf-8") as handle:
         for number, line in enumerate(handle, 1):
             line = line.strip()
             if not line:
@@ -114,13 +117,31 @@ def report_mapping(records):
 
 
 def main():
-    if len(sys.argv) != 2:
+    if len(sys.argv) > 2:
         print(__doc__)
         return 2
 
-    records = load(sys.argv[1])
+    path = sys.argv[1] if len(sys.argv) == 2 else DEFAULT_PATH
+
+    # A missing or empty file is the ordinary state before anything has been
+    # collected, not a crash. Say what to do about it.
+    if not os.path.exists(path):
+        print(f"No collected results at {path}")
+        print()
+        print("Collect from the boxes first. Without DNS on your network, name them")
+        print("by address rather than hostname:")
+        print()
+        print("    ./collect.sh rpc@192.168.50.48")
+        return 1
+
+    records = load(path)
     if not records:
-        print("no records")
+        print(f"{path} is empty — collect.sh reached the boxes but found no records.")
+        print()
+        print("On a box, check that measurements are actually being taken:")
+        print()
+        print("    systemctl list-timers 'mesh-probe*'")
+        print("    tail /var/log/mesh-probe/results.jsonl")
         return 1
 
     connectivity = [r for r in records if r.get("test", "connectivity") == "connectivity"]
@@ -170,17 +191,28 @@ def main():
 
     print("Verdict")
     print("-------")
+    print(f"  machines reporting:                  {len(by_label)}")
     print(f"  can accept incoming (relay-capable): {', '.join(relay_capable) or 'NONE'}")
     print(f"  direct connection plausible:         {', '.join(hole_punchable) or 'NONE'}")
     print()
 
     if not relay_capable:
-        print("  No machine can accept an incoming connection. With no rented")
+        print("  No machine here can accept an incoming connection. With no rented")
         print("  infrastructure there is nowhere for a relay to live, so peers that")
-        print("  cannot hole-punch to each other have no path at all.")
+        print("  cannot hole-punch to each other would have no path at all.")
         print()
-        print("  Per docs/phase-0-plan.md this meets the stop criterion. It is a")
-        print("  finding, not a failure — and it arrived for the cost of an afternoon.")
+        if len(by_label) < 3:
+            # One or two machines cannot establish this. A single home
+            # connection describes a single router, and declaring the stop
+            # criterion met from it would kill the project on a sample too
+            # small to support the claim.
+            print(f"  BUT THIS IS ONLY {len(by_label)} MACHINE(S). That is not enough to conclude")
+            print("  anything. The stop criterion in docs/phase-0-plan.md is about the set")
+            print("  of volunteers, and one connection describes one router. Collect from")
+            print("  the others before treating this as a result.")
+        else:
+            print("  Per docs/phase-0-plan.md this meets the stop criterion. It is a")
+            print("  finding, not a failure — and it arrived for the cost of an afternoon.")
     elif len(hole_punchable) < len(by_label):
         print("  Some machines will need relaying through a peer. That is the design's")
         print("  intent (§11.6's fifth contribution lever), so proceed — and measure")
