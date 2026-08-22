@@ -285,7 +285,29 @@ A laptop on a phone hotspot, which is a genuinely different path from the home l
 
 **Reachability is a candidate, not a fact.** Holding a global address means packets *could* arrive; whether a firewall permits them is a separate question the probe cannot answer alone, and carrier and device firewalls routinely block incoming IPv6. The probe's summary field was renamed from `relay_capable` to `relay_candidate` on discovering it had been overstating exactly this. **Confirming it needs a cooperating peer that also has IPv6, and neither existing machine has any.**
 
-**The idle timeout is the number that binds.** Diamond survived ten minutes of silence; the hotspot had been forgotten within five. The keepalive interval the mesh can use is set by the worst connection among the players (§ *Mapping lifetime* in `provision/summarise.py`), so the mobile figure governs, and it is not yet bracketed — one expiry at 300 s and no successful interval below it. Shorter samples are needed before a number can be chosen.
+**The idle timeout, now bracketed.**
+
+| Idle | `diamond` (home broadband) | laptop (mobile hotspot) |
+|---|---|---|
+| 30 s | survived | survived |
+| 60 s | survived | survived |
+| 120 s | survived | survived |
+| 300 s | survived | **forgotten** |
+| 600 s | survived, 6 of 6 | — |
+
+Diamond has now run 45 measurements over about a day without a single expiry, so its router's limit is somewhere past ten minutes and has never been found. The hotspot's sits **between 120 and 300 seconds**.
+
+The keepalive the mesh may use is governed by the worst connection among the players rather than the average, so the mobile figure decides it: **120 s confirmed safe, halved to 60 s**, because the measured value is where the mapping was still alive rather than where it dies, and a keepalive that only just makes it is one dropped packet away from not making it.
+
+**What to actually ship is lower than what the data supports, and that is deliberate.** These are one carrier and one home router. Carriers vary widely and the common industry figure is nearer 25 seconds — WireGuard's persistent keepalive defaults to 25 s for exactly this reason. The cost of being too frequent is some wasted packets; the cost of being too slow is connections that die silently with no error anywhere. **Ship 25–30 s and treat 60 s as evidence that it is conservative rather than arbitrary.**
+
+### The measurement exposes a mechanism doing two jobs at once
+
+Nodes currently heartbeat once a second, which is **roughly 120 times more often than keeping a mapping alive requires**. That is not a bug, because the heartbeat is not a keepalive: it is what makes an unannounced disappearance visible within about three seconds, and slowing it would slow detection in exactly the same proportion.
+
+But it means one mechanism is serving two needs with opposite appetites. **Failure detection wants frequent messages. Keeping a mapping alive wants rare ones. A metered or battery-powered connection wants as few as possible** — and the mobile connection measured here is precisely the case where that matters, being the one machine likely to be on a phone tethering plan.
+
+Nothing needs changing for Phase 0, where every node is mains-powered and the traffic is trivial. It is recorded because the moment a real player runs this on a laptop over mobile data, the two needs will have to be separated: infrequent keepalives to hold the path open, and a detection rate that is a deliberate choice rather than a side effect of how often heartbeats happen to be sent.
 
 ### What this makes possible, and what still blocks it
 
