@@ -12,6 +12,7 @@ set -euo pipefail
 
 LABEL=""
 ISOLATE_LAN=0
+MESH_PORT=4001
 REPO_ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
 
 usage() {
@@ -21,6 +22,8 @@ setup.sh --label <name> [options]
   --label <name>   Identifies this machine in every record. Required.
   --isolate-lan    Additionally block this box from reaching the volunteer's
                    other devices. Off by default: see the warning below.
+  --mesh-port <n>  Port the mesh node listens on (default 4001). Opened
+                   inbound so peers on the same network can reach it.
   --help           Show this.
 
 --isolate-lan is a courtesy to the household, but it can strand the box if
@@ -34,6 +37,7 @@ while [[ $# -gt 0 ]]; do
     case "$1" in
         --label) LABEL="${2:-}"; shift 2 ;;
         --isolate-lan) ISOLATE_LAN=1; shift ;;
+        --mesh-port) MESH_PORT="${2:-}"; shift 2 ;;
         --help|-h) usage; exit 0 ;;
         *) echo "unknown argument: $1" >&2; usage; exit 2 ;;
     esac
@@ -109,8 +113,20 @@ if command -v ufw >/dev/null; then
     ufw --force default deny incoming >/dev/null
     ufw --force default allow outgoing >/dev/null
     ufw allow OpenSSH >/dev/null 2>&1 || ufw allow 22/tcp >/dev/null
+
+    # The mesh node needs inbound. The probe never did — it only ever dials
+    # out — so the original default-deny was correct for it and silently wrong
+    # the moment a node was added, which is exactly how this was found.
+    #
+    # This matters less than it looks for the real thing: peers behind address
+    # translation reach each other by both dialling outward at once, and a
+    # stateful firewall already permits the replies to a connection it opened.
+    # It matters here because a direct dial on a local network is not that.
+    ufw allow "$MESH_PORT/udp" >/dev/null
+    ufw allow "$MESH_PORT/tcp" >/dev/null
+
     ufw --force enable >/dev/null
-    echo "incoming denied except SSH; outgoing allowed"
+    echo "incoming denied except SSH and the mesh port ($MESH_PORT/tcp, $MESH_PORT/udp)"
 else
     echo "ufw not installed; skipping"
 fi
@@ -172,6 +188,7 @@ Done.
   label         $LABEL
   binary        /usr/local/bin/mesh-probe
   results       /var/log/mesh-probe/results.jsonl
+  mesh port     $MESH_PORT (tcp and udp) open inbound
   connectivity  every 30 minutes (plus up to 5 minutes of jitter)
   mapping test  every 25 minutes (plus up to 10 minutes of jitter), one idle
                 interval per run, accumulating across days
