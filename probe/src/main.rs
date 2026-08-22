@@ -419,7 +419,7 @@ fn report(v4: &FamilyResult, v6: &FamilyResult) {
     println!("Please send back the line below.");
     println!();
     println!(
-        "PROBE v0.1 | ipv4={} | ipv6={} | relay-capable={}",
+        "PROBE v0.1 | ipv4={} | ipv6={} | relay-candidate={}",
         v4_verdict.tag,
         v6_verdict.tag,
         if v4_verdict.reachable || v6_verdict.reachable {
@@ -480,8 +480,9 @@ fn describe_v4(result: &FamilyResult) -> Verdict {
         tag = "public".to_string();
         reachable = true;
         notes.push(
-            "IPv4: this connection has a public address and no translation in the way. It can \
-             accept incoming connections and could carry relay duty for others."
+            "IPv4: this connection has a public address with no translation in the way, so it \
+             is a candidate for carrying relay duty. Whether a firewall permits incoming \
+             connections is a separate question this probe cannot answer alone."
                 .to_string(),
         );
     } else if cgnat {
@@ -558,8 +559,14 @@ fn describe_v6(result: &FamilyResult) -> Verdict {
             notes.push(
                 "IPv6: this is the outcome that makes the whole NAT question moot. Two peers \
                  that both have working IPv6 can address each other directly, with no traversal \
-                 and no relay — subject to the firewall permitting it, which this probe does not \
-                 test."
+                 and no relay."
+                    .to_string(),
+            );
+            notes.push(
+                "IPv6: CANDIDATE, NOT CONFIRMED. Holding a global address means packets could \
+                 reach this machine; whether they are allowed to is a separate question this \
+                 probe cannot answer alone. Carrier and device firewalls routinely block \
+                 incoming IPv6. Confirming it needs a cooperating peer that also has IPv6."
                     .to_string(),
             );
             Verdict {
@@ -797,7 +804,7 @@ fn report_json(label: &str, v4: &FamilyResult, v6: &FamilyResult) -> String {
     out.push_str(&format!("\"ipv4\":{},", family_json(v4, &v4_verdict)));
     out.push_str(&format!("\"ipv6\":{},", family_json(v6, &v6_verdict)));
     out.push_str(&format!(
-        "\"relay_capable\":{}",
+        "\"relay_candidate\":{}",
         v4_verdict.reachable || v6_verdict.reachable
     ));
     out.push('}');
@@ -968,7 +975,7 @@ mod tests {
         let record = report_json("vol-1", &empty(Family::V4), &empty(Family::V6));
         assert!(record.starts_with('{') && record.ends_with('}'));
         assert!(record.contains(r#""label":"vol-1""#));
-        assert!(record.contains(r#""relay_capable":false"#));
+        assert!(record.contains(r#""relay_candidate":false"#));
         assert!(record.contains(r#""tag":"unreachable""#));
     }
 

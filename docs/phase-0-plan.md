@@ -271,6 +271,30 @@ Note also that `diamond` was reachable *on the LAN* while its own probe reports 
 
 **One provisioning bug found this way:** `setup.sh` had set the firewall to deny all incoming except SSH. Correct for the probe, which only dials out; silently wrong the moment a node existed. Now fixed, and a reminder that provisioning written for one phase should be re-read at the start of the next.
 
+## First results from a second internet connection — 2026-08-22
+
+A laptop on a phone hotspot, which is a genuinely different path from the home line and the harshest network expected to appear in this population.
+
+| | `diamond` (home broadband) | laptop (mobile hotspot) |
+|---|---|---|
+| IPv4 | endpoint-independent NAT | endpoint-independent NAT |
+| IPv6 | **none** | **global address** |
+| Idle mapping survives | **over 600 s** | **under 300 s** |
+
+**Mobile carriers run IPv6; this home connection does not.** That was the opposite of what was expected — a hotspot was thought most likely to yield carrier-grade NAT. The population will be *mixed* rather than uniformly IPv4, which is a better situation than either uniform case, because a peer with a global address is exactly what peers without one need.
+
+**Reachability is a candidate, not a fact.** Holding a global address means packets *could* arrive; whether a firewall permits them is a separate question the probe cannot answer alone, and carrier and device firewalls routinely block incoming IPv6. The probe's summary field was renamed from `relay_capable` to `relay_candidate` on discovering it had been overstating exactly this. **Confirming it needs a cooperating peer that also has IPv6, and neither existing machine has any.**
+
+**The idle timeout is the number that binds.** Diamond survived ten minutes of silence; the hotspot had been forgotten within five. The keepalive interval the mesh can use is set by the worst connection among the players (§ *Mapping lifetime* in `provision/summarise.py`), so the mobile figure governs, and it is not yet bracketed — one expiry at 300 s and no successful interval below it. Shorter samples are needed before a number can be chosen.
+
+### What this makes possible, and what still blocks it
+
+The two machines cannot currently reach each other at all. Over IPv6 diamond has no address; over IPv4 both sit behind translation with neither publicly reachable, so a direct dial has nowhere to land.
+
+Both being *endpoint-independent* is the encouraging half: each uses the same external port whatever it is talking to, which is the condition under which hole punching works. What is missing is the coordination — two peers must learn each other's live addresses and dial at roughly the same moment, and the mapping expires, so the exchange has to be recent. That is the piece a relay normally provides and the reason §11.6 counts relay bandwidth as a contribution.
+
+**This is now the concrete form of the Phase 0 question.** Not "does peer-to-peer work" in the abstract, but: can two machines behind ordinary translation, with no rented infrastructure and no third party, arrange a meeting? An answer either way is the finding.
+
 ## Volunteer machines and remote management
 
 Volunteers are not technically inclined. Machines are prepared centrally — Ubuntu 26.04, Rust and dependencies preinstalled — and shipped ready to plug in.
