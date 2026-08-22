@@ -109,6 +109,59 @@ These are recorded in advance deliberately. A number chosen after seeing results
 
 **Record the distribution, not the average.** A median of 90 ms with a 99th percentile of 8 s feels broken to every player who hits the tail, and reports as excellent in a summary statistic. Phase 0 reports p50, p95, and p99 for takeover gaps, and the stop criterion is evaluated against **p95**.
 
+## What a job is
+
+Settled 2026-08-21, and it decides whether checkpointing is straightforward or a research project.
+
+**A job is not a program that starts, runs, and finishes.** It is woken up, handed everything it knows, does a small amount of work, hands everything back, and sleeps again. The thing handed back and forth is a serializable blob of state; each wake-up is a tick.
+
+```
+tick(state, inputs) -> (state, effects)
+```
+
+A factory's state holds what is in its input hoppers, what is on the line and how far along, what is in the output bin, wear, and staffing. A tick pulls some material, advances every item, moves finished ones to the bin, and adds a little wear.
+
+**The rule underneath: nothing survives between ticks except the state.** That is the only thing that can be copied to another machine — anything held inside a running program is unreachable, and dies with the host.
+
+Everything downstream then becomes easy rather than hard:
+
+| | |
+|---|---|
+| **Checkpointing** | Keep the state between ticks. No snapshot machinery. |
+| **Migration** | Send the state elsewhere and keep ticking. |
+| **Speculative resume** | Another node with recent state just runs the next ticks. Identical inputs, identical outputs. |
+| **Verification** (§11.4) | Same reason — anyone can re-run a tick and compare. |
+
+**Time arrives as an input; jobs never read the clock.** Two machines running the same tick must agree, and a job that asked the operating system what time it is would disagree with itself. This costs nothing, because §5.9 already makes time a pure function every node computes identically.
+
+**Jobs describe effects; they do not perform them.** A tick returns *"produce twelve widgets", "request forty units of steel"* and the host decides whether and how to apply them. This falls out of §11.4's sandbox — job code has no network and no capabilities — and it is also what makes speculation safe, since running the same tick twice yields the same requested effects and the host applies them once.
+
+**The cost, stated plainly:** no job may start a long computation and hold its progress internally. Everything must be expressible as discrete resumable steps, with working notes in the state. Natural for a tick-based world simulation, and a genuine narrowing of what §11.2's player-authored code can ever be.
+
+### Most things are not jobs
+
+| Kind | Example | Runs? | Sandboxed? | Where |
+|---|---|---|---|---|
+| **Data at rest** | A house, possessions, ownership records | No | No — it is not code | Replicated across peers (§9.1) |
+| **Simulation** | A factory, a farm, water treatment | Yes, tick by tick | Yes | Scheduled on the mesh |
+| **Local interaction** | Walking through your own house | Yes, in real time | No | Only the owner's machine (§9.6) |
+
+A house computes nothing. Peers store a copy so the city persists while its owner sleeps, but storing is not running and there is no code to contain. **The sandbox exists for exactly one purpose: running other people's code on your hardware.**
+
+The line between the second and third rows is whether anyone else needs the thing while you are away. A living room, no. A factory where six people work, yes.
+
+## Graceful drain is a performance feature, not a courtesy
+
+Measured 2026-08-21 on the local rig, and it changed how departure is handled.
+
+**An announced departure is noticed in about 3 ms. An unannounced one takes the full detection window — around 3,400 ms.** Three orders of magnitude.
+
+The first implementation inferred orderliness from whether the transport connection closed cleanly. **That was wrong**, because a killed process still has its sockets closed tidily by the kernel, so a clean close says nothing about whether the departure was planned. §9.6's graceful drain is an *announcement* — only the node itself knows it is leaving, so it has to say so.
+
+A node now publishes a goodbye on SIGTERM or SIGINT and waits briefly for it to propagate. Everything else — unplugged, powered off, network lost, hung — is silence, and silence costs the full window.
+
+This is the strongest argument for making graceful drain the norm rather than the polite exception: it is the difference between a handover and a hole.
+
 ## Volunteer machines and remote management
 
 Volunteers are not technically inclined. Machines are prepared centrally — Ubuntu 26.04, Rust and dependencies preinstalled — and shipped ready to plug in.
@@ -155,7 +208,7 @@ Household isolation (`--isolate-lan`) is opt-in, verifies internet reachability 
 
 1. **Connection probe** (above) — *done*. Ship to volunteers, collect results.
 1a. **Mapping lifetime** — *done*. How long a consumer router holds an idle mapping open before dropping it. Each run tests one idle interval chosen from a list, and the answer accumulates over days. Determines the keepalive interval the mesh will need, which is set by the **worst** router among the players rather than the average one.
-2. **Local container rig** — N nodes, forming an overlay, gossiping membership.
+2. **Local rig** — *done*. Several nodes forming an overlay, gossiping membership, and noticing departures. `node/rig.sh` runs it and checks the result. Processes rather than containers for now: they share one host and reach each other trivially, so this tests the logic and nothing about real networks.
 3. **Job execution** — a sandboxed WASM job with fuel metering, so a job cannot consume unbounded CPU (§11.4).
 4. **Checkpoint and migrate** — a running job's state captured periodically, and resumed elsewhere when its host vanishes (§11.3, §9.4).
 5. **Volunteer run** — the same binary, on real connections, measured against the stop criteria.

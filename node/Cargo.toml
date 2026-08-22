@@ -1,0 +1,11 @@
+[package]
+name = "mesh-node"
+version = "0.1.0"
+edition = "2021"
+description = "Phase 0 mesh node: forms an overlay, tracks membership, notices when a peer disappears."
+
+[dependencies]
+anyhow = "1.0.104"
+futures = "0.3.34"
+libp2p = { version = "0.56.0", features = ["tokio", "quic", "tcp", "noise", "yamux", "gossipsub", "mdns", "identify", "ping", "macros"] }
+tokio = { version = "1.53.1", features = ["rt-multi-thread", "macros", "time", "signal"] }
