@@ -162,6 +162,25 @@ A node now publishes a goodbye on SIGTERM or SIGINT and waits briefly for it to 
 
 This is the strongest argument for making graceful drain the norm rather than the polite exception: it is the difference between a handover and a hole.
 
+## First two-machine result — 2026-08-22
+
+Two physically separate machines: `lightning` (a VM behind its host's address translation) and `diamond` (a dedicated box on a home LAN). `lightning` could reach `diamond`; `diamond` could not reach back at all.
+
+| | Detected after | |
+|---|---|---|
+| Announced departure | **6 ms** | the goodbye arrived; no waiting |
+| Frozen without warning | **3,608 ms** | full detection window, transport never dropped |
+
+**These match the single-host rig almost exactly** (3 ms and 3,450 ms), which is the useful part: crossing a real network boundary cost essentially nothing. Round-trip time between the machines was about 1 ms, so this says nothing yet about behaviour over real distance.
+
+**A node that cannot accept incoming connections still participated fully.** `lightning` sits behind translation and was unreachable from `diamond`, yet it joined, was seen, exchanged heartbeats, and had its departure noticed — because it could reach *one* peer that was reachable, and the resulting connection carries traffic both ways.
+
+That is encouraging for the no-rented-infrastructure decision, and it must not be overstated. It demonstrates **unreachable node + reachable peer works.** It says nothing about **unreachable node + unreachable node**, which is the case needing hole punching or a relay, and the case that decides Phase 0.
+
+Note also that `diamond` was reachable *on the LAN* while its own probe reports `relay_capable: false` — meaning it is not reachable from the internet. Those are different questions and the test only answered the first.
+
+**One provisioning bug found this way:** `setup.sh` had set the firewall to deny all incoming except SSH. Correct for the probe, which only dials out; silently wrong the moment a node existed. Now fixed, and a reminder that provisioning written for one phase should be re-read at the start of the next.
+
 ## Volunteer machines and remote management
 
 Volunteers are not technically inclined. Machines are prepared centrally — Ubuntu 26.04, Rust and dependencies preinstalled — and shipped ready to plug in.
