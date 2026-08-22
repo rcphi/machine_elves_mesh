@@ -299,7 +299,9 @@ Diamond has now run 45 measurements over about a day without a single expiry, so
 
 The keepalive the mesh may use is governed by the worst connection among the players rather than the average, so the mobile figure decides it: **120 s confirmed safe, halved to 60 s**, because the measured value is where the mapping was still alive rather than where it dies, and a keepalive that only just makes it is one dropped packet away from not making it.
 
-**What to actually ship is lower than what the data supports, and that is deliberate.** These are one carrier and one home router. Carriers vary widely and the common industry figure is nearer 25 seconds — WireGuard's persistent keepalive defaults to 25 s for exactly this reason. The cost of being too frequent is some wasted packets; the cost of being too slow is connections that die silently with no error anywhere. **Ship 25–30 s and treat 60 s as evidence that it is conservative rather than arbitrary.**
+**Shipped: 55 s**, leaving better than a twofold margin on the shorter of the two connections measured.
+
+The residual risk is worth stating: these are one carrier and one home router. Carriers vary, and the common industry figure is nearer 25 seconds — WireGuard's persistent keepalive defaults to 25 s for that reason. A carrier more aggressive than the one measured here would break connections silently rather than loudly. It is a one-line change (`--keepalive-ms`) if a volunteer's connection turns out to be shorter, and the probe will say so before it becomes a mystery.
 
 ### The measurement exposes a mechanism doing two jobs at once
 
@@ -307,7 +309,17 @@ Nodes currently heartbeat once a second, which is **roughly 120 times more often
 
 But it means one mechanism is serving two needs with opposite appetites. **Failure detection wants frequent messages. Keeping a mapping alive wants rare ones. A metered or battery-powered connection wants as few as possible** — and the mobile connection measured here is precisely the case where that matters, being the one machine likely to be on a phone tethering plan.
 
-Nothing needs changing for Phase 0, where every node is mains-powered and the traffic is trivial. It is recorded because the moment a real player runs this on a laptop over mobile data, the two needs will have to be separated: infrequent keepalives to hold the path open, and a detection rate that is a deliberate choice rather than a side effect of how often heartbeats happen to be sent.
+**Now separated.** Keepalives are an explicit setting with their own interval, carried by ping rather than inherited from gossip, so a path stays open because something is deliberately holding it open rather than because gossip happens to be chatty enough. The heartbeat rate remains a detection choice and can be changed without silently breaking connectivity, which was the trap.
+
+## Identity and location are already separate
+
+Raised as a question about the Host Identity Protocol, which splits the two jobs an IP address was never meant to do at once: *who you are* and *where you are*. HIP makes the identity a public key and demotes the address to a locator that may change freely.
+
+**This design already has that property.** A peer is a `PeerId` — a hash of its public key — and addresses are separate, plural, and disposable; connections are made to a peer, with addresses being merely how it is currently reached. §8.1 pushes the same split a level higher, where identity belongs to the *person* rather than the host.
+
+**HIP itself is not adopted.** It wants kernel support or a shim, deployment has stayed thin, and it resolves "where is this identity now" with a **rendezvous server** — precisely the infrastructure §11.6 excludes. Adopting it would mean inheriting its hardest dependency to obtain an architecture already in hand.
+
+**Roaming, concretely.** A node moving between networks keeps its identity; QUIC's connection migration survives some path changes outright; and a longer gap simply reads as a disappearance, whereupon its job migrates to a survivor and, on return, it receives checkpoints and stands down. That path is already correct. What a roamed node cannot do is *be found again* at its new address with nothing to announce it to — which is the same reachability problem as everything else rather than a separate one.
 
 ### What this makes possible, and what still blocks it
 

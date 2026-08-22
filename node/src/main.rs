@@ -50,6 +50,24 @@ const KIND_CHECKPOINT: u8 = 3;
 /// How often the node running a job advances it.
 const DEFAULT_JOB_TICK_MS: u64 = 200;
 
+/// How often a quiet connection is poked to stop a router forgetting it.
+///
+/// Measured rather than guessed: the mobile connection tested forgot an idle
+/// mapping somewhere between 120 and 300 seconds, and the home connection did
+/// not forget in over ten minutes across 45 attempts. The keepalive is governed
+/// by the worst connection among the players, so 55 s leaves better than a
+/// twofold margin on the shorter of the two.
+///
+/// **This is a different job from the heartbeat, and the separation is the
+/// point.** Heartbeats run every second because that is what makes an
+/// unannounced disappearance visible within three; keepalives run rarely
+/// because their only purpose is stopping a router forgetting a path. Today the
+/// heartbeats happen to keep mappings alive as a side effect, which is exactly
+/// why this needs its own name — the moment detection is slowed, or a player
+/// runs this on a metered connection where every packet is a cost, the two
+/// requirements pull in opposite directions and one of them silently loses.
+const DEFAULT_KEEPALIVE_MS: u64 = 55_000;
+
 #[derive(Debug, PartialEq)]
 enum Message {
     Heartbeat { label: String },
@@ -170,6 +188,7 @@ struct Config {
     /// ready to continue it.
     job: Option<String>,
     job_tick: Duration,
+    keepalive: Duration,
     /// Which mesh this node belongs to. Nodes in different meshes ignore one
     /// another completely.
     mesh: String,
@@ -256,6 +275,7 @@ fn parse_args() -> Result<Config> {
         json: false,
         job: None,
         job_tick: Duration::from_millis(DEFAULT_JOB_TICK_MS),
+        keepalive: Duration::from_millis(DEFAULT_KEEPALIVE_MS),
         mesh: "default".to_string(),
         own: false,
     };
@@ -282,6 +302,11 @@ fn parse_args() -> Result<Config> {
             "--json" => config.json = true,
             "--job" => config.job = Some(args.next().context("--job needs a path")?),
             "--mesh" => config.mesh = args.next().context("--mesh needs a name")?,
+            "--keepalive-ms" => {
+                config.keepalive = Duration::from_millis(
+                    args.next().context("--keepalive-ms needs a number")?.parse()?,
+                )
+            }
             "--own" => config.own = true,
             "--job-tick-ms" => {
                 config.job_tick =
@@ -361,6 +386,8 @@ fn print_usage() {
     println!("  --json               emit machine-readable events");
     println!("  --run-job <file.wasm> [--ticks N]");
     println!("                       run a job locally and show its effects, then exit");
+    println!("  --keepalive-ms <n>   how often to poke a quiet connection so a router does");
+    println!("                       not forget it (default {DEFAULT_KEEPALIVE_MS})");
     println!("  --mesh <name>        which mesh to join (default \"default\"). Nodes in");
     println!("                       different meshes ignore each other entirely");
     println!("  --job <file.wasm>    hold this job, ready to run or to continue it");
@@ -385,6 +412,7 @@ async fn run(config: Config) -> Result<()> {
         )?
         .with_quic()
         .with_behaviour(|key| {
+            let keepalive = config.keepalive;
             let gossipsub = gossipsub::Behaviour::new(
                 gossipsub::MessageAuthenticity::Signed(key.clone()),
                 gossipsub::ConfigBuilder::default()
@@ -405,10 +433,16 @@ async fn run(config: Config) -> Result<()> {
                     "/machine-elves/0.1".into(),
                     key.public(),
                 )),
-                ping: ping::Behaviour::new(ping::Config::new()),
+                // Ping is the keepalive. Giving it an explicit interval means
+                // paths stay open because something is deliberately holding
+                // them open, rather than because gossip happens to be chatty
+                // enough this week.
+                ping: ping::Behaviour::new(ping::Config::new().with_interval(keepalive)),
             })
         })?
-        .with_swarm_config(|c| c.with_idle_connection_timeout(Duration::from_secs(60)))
+        // Comfortably longer than the keepalive, or a connection would be
+        // dropped for idleness between the very pokes meant to preserve it.
+        .with_swarm_config(|c| c.with_idle_connection_timeout(config.keepalive * 3))
         .build();
 
     let topic = gossipsub::IdentTopic::new(heartbeat_topic(&config.mesh));
@@ -871,6 +905,24 @@ fn json_string(raw: &str) -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn the_keepalive_leaves_margin_on_the_worst_measured_connection() {
+        // The mobile connection tested forgot an idle mapping between 120s and
+        // 300s. A keepalive without real margin is one dropped packet away from
+        // a connection that dies with no error anywhere.
+        let keepalive = Duration::from_millis(DEFAULT_KEEPALIVE_MS);
+        let shortest_confirmed_safe = Duration::from_secs(120);
+        assert!(keepalive * 2 <= shortest_confirmed_safe);
+    }
+
+    #[test]
+    fn keepalive_and_heartbeat_are_separate_settings() {
+        // They serve opposite needs — detection wants frequent, mapping upkeep
+        // wants rare — and collapsing them means one silently loses.
+        assert!(Duration::from_millis(DEFAULT_KEEPALIVE_MS)
+            > Duration::from_millis(DEFAULT_HEARTBEAT_MS) * 10);
+    }
 
     #[test]
     fn different_meshes_never_share_a_topic() {
