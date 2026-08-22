@@ -195,3 +195,55 @@ fn a_job_that_wants_imports_is_refused_at_load() {
         "refused for the wrong reason: {message}"
     );
 }
+
+#[test]
+fn a_greedy_job_is_stopped_before_it_exhausts_the_host() {
+    // Fuel bounds instructions and nothing else. Without a separate memory
+    // ceiling a job can stay well inside its CPU budget and still take the
+    // machine down, which for a volunteer running this on their own hardware is
+    // the same outcome as a successful attack.
+    let path = match wasm("glutton") {
+        Some(p) => p,
+        None => {
+            eprintln!("skipping: glutton not built — run ../jobs/build.sh");
+            return;
+        }
+    };
+
+    // Generous fuel on purpose: this must fail for running out of memory, not
+    // for running out of instructions, or the test proves the wrong thing.
+    let job = job::Job::load_with(&path, 5_000_000_000, 16 * 1024 * 1024).expect("loads");
+    let error = job.tick(b"", b"").expect_err("must be stopped");
+    let message = format!("{error:#}");
+    assert!(
+        !message.contains("exhausted its"),
+        "stopped by the fuel ceiling rather than the memory ceiling: {message}"
+    );
+}
+
+#[test]
+fn the_memory_ceiling_holds_at_several_sizes() {
+    let path = match wasm("glutton") {
+        Some(p) => p,
+        None => return,
+    };
+    for limit in [8 * 1024 * 1024usize, 32 * 1024 * 1024, 64 * 1024 * 1024] {
+        let job = job::Job::load_with(&path, 5_000_000_000, limit).expect("loads");
+        assert!(job.tick(b"", b"").is_err(), "{limit} bytes was not a ceiling");
+    }
+}
+
+#[test]
+fn an_ordinary_job_is_untroubled_by_the_ceiling() {
+    // A limit that also stops honest work is not a limit, it is a bug.
+    let path = match wasm("factory") {
+        Some(p) => p,
+        None => return,
+    };
+    let job = job::Job::load_with(&path, DEFAULT_FUEL, 2 * 1024 * 1024).expect("loads");
+    let mut state = Vec::new();
+    for tick in 0..30u64 {
+        state = job.tick(&state, &inputs(tick, 4, 3)).expect("honest work").state;
+    }
+    assert!(!state.is_empty());
+}

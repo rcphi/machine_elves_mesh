@@ -1,0 +1,12 @@
+[package]
+name = "glutton-job"
+version = "0.1.0"
+edition = "2021"
+description = "A job that allocates without limit, so the memory ceiling can be shown to work."
+
+[lib]
+crate-type = ["cdylib"]
+
+[profile.release]
+opt-level = "z"
+panic = "abort"

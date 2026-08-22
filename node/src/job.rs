@@ -18,7 +18,7 @@
 use std::path::Path;
 
 use anyhow::{anyhow, bail, Context, Result};
-use wasmtime::{Config, Engine, Instance, Module, Store};
+use wasmtime::{Config, Engine, Instance, Module, Store, StoreLimits, StoreLimitsBuilder};
 
 /// wasmtime carries its own `anyhow`, which is a different type from ours even
 /// when the versions match. Flattening its errors to text here keeps that
@@ -35,6 +35,14 @@ fn wasm_err(error: impl std::fmt::Display) -> anyhow::Error {
 /// whether it finished. Fuel is identical everywhere.
 pub const DEFAULT_FUEL: u64 = 50_000_000;
 
+/// Memory ceiling for one tick.
+///
+/// Fuel bounds instructions and says nothing whatsoever about memory, so
+/// without this a job can allocate until the host runs out — never escaping the
+/// sandbox, and taking the machine down anyway. Two ceilings are needed because
+/// there are two ways to consume a host.
+pub const DEFAULT_MEMORY: usize = 64 * 1024 * 1024;
+
 /// Largest state or effects blob a job may hand back.
 ///
 /// Present because the host has to allocate whatever the guest claims, and an
@@ -46,6 +54,7 @@ pub struct Job {
     engine: Engine,
     module: Module,
     fuel: u64,
+    memory: usize,
 }
 
 #[derive(Debug, PartialEq)]
@@ -63,6 +72,10 @@ pub struct Outcome {
 
 impl Job {
     pub fn load(path: impl AsRef<Path>, fuel: u64) -> Result<Self> {
+        Self::load_with(path, fuel, DEFAULT_MEMORY)
+    }
+
+    pub fn load_with(path: impl AsRef<Path>, fuel: u64, memory: usize) -> Result<Self> {
         let mut config = Config::new();
         config.consume_fuel(true);
         let engine = Engine::new(&config).map_err(wasm_err)?;
@@ -92,6 +105,7 @@ impl Job {
             engine,
             module,
             fuel,
+            memory,
         })
     }
 
@@ -103,7 +117,18 @@ impl Job {
     /// the state" is not a rule a job could break, it is a fact about how the
     /// job is run. Making the violation impossible is cheaper than detecting it.
     pub fn tick(&self, state: &[u8], inputs: &[u8]) -> Result<Outcome> {
-        let mut store = Store::new(&self.engine, ());
+        // `Store<StoreLimits>` rather than `Store<()>`: wasmtime asks the store's
+        // own data whether a growth request is allowed, so the limits have to
+        // live there.
+        let limits = StoreLimitsBuilder::new()
+            .memory_size(self.memory)
+            // One instance and one memory: a job has no legitimate reason to
+            // create more, and each one it could create is more host memory.
+            .instances(1)
+            .memories(1)
+            .build();
+        let mut store = Store::new(&self.engine, limits);
+        store.limiter(|limits| limits);
         store.set_fuel(self.fuel).map_err(wasm_err)?;
 
         let instance = Instance::new(&mut store, &self.module, &[])
