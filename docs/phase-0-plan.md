@@ -175,6 +175,14 @@ The line between the second and third rows is whether anyone else needs the thin
 
 The sample factory costs about 2,900 fuel and 36 bytes of state per tick, against a default ceiling of 50,000,000 — so the ceiling is nowhere near ordinary work, which is what a ceiling should look like.
 
+### Determinism holds across machines — 2026-08-22
+
+The same 22 KB job, byte-identical by checksum, ran 30 ticks on `lightning` and on `diamond`. Both produced the same effects in the same ticks, the same 36 bytes of state, and **the same 81,905 fuel consumed** — identical down to the instruction count, not merely to the visible result.
+
+This is §11.4's independent verification working in practice rather than in principle: any node can re-run a tick and compare, with no coordination and nothing to trust. It is also what makes speculative resume sound, since a standby running the next ticks reaches exactly the state the original would have.
+
+**A node never compiles anything.** Diamond had no WebAssembly toolchain, so the compiled job was copied there and run as-is — which is how the real thing works. A player's machine receives compiled jobs; only job *authors* need a compiler.
+
 ## Graceful drain is a performance feature, not a courtesy
 
 Measured 2026-08-21 on the local rig, and it changed how departure is handled.
