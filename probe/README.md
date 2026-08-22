@@ -91,15 +91,21 @@ Two details that make the answer trustworthy:
   If the ISP moves the connection mid-test, the port changes for a reason that
   says nothing about the router.
 
-**One rung of a ladder is measured per run**, and the answer accumulates across
-days rather than being binary-searched inside a single run. An unattended box
-has abundant wall-clock time and no tolerance for a fragile multi-step
-procedure — a run that fails costs one data point rather than the measurement.
-The ladder brackets 120 seconds deliberately, since that is the minimum the
-relevant standard (RFC 4787) asks routers to provide, and real ones range from
-about 30 seconds to many minutes.
+**Each run tests exactly one idle interval**, chosen at random from a list
+running from 15 seconds to 10 minutes. This run might stay silent for 90
+seconds and the next for 240, and over days every interval gets tried many
+times.
 
-`summarise.py` aggregates the rungs into a bracket — "forgets somewhere between
+The alternative would be to narrow in on the answer within a single run, trying
+a long interval and then a shorter one. That is faster in principle and worse in
+practice: it takes many minutes and a failure partway through wastes the whole
+attempt. One interval per run means a failed run costs one data point.
+
+The list deliberately includes values above and below 120 seconds, which is the
+minimum the relevant standard (RFC 4787) asks routers to provide. Real routers
+range from about 30 seconds to many minutes.
+
+`summarise.py` combines the results into a range — "forgets somewhere between
 60s and 90s" — and recommends a keepalive interval at half the shortest
 confirmed-safe value, **taken across machines rather than averaged.** A peer
 whose mapping has expired is unreachable no matter how patient the others are,

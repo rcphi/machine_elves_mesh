@@ -12,8 +12,8 @@ EnvironmentFile=/etc/mesh-probe/config
 ExecStart=/usr/local/bin/mesh-probe --mapping-lifetime --json --label ${LABEL}
 
 # The test spends nearly all its time deliberately sending nothing, so it runs
-# for as long as the idle interval it drew. The ceiling is the longest rung of
-# the ladder plus room for the two queries around it.
+# for as long as the idle interval it chose. The ceiling is the longest interval
+# it can choose, plus room for the two queries around it.
 TimeoutStartSec=900
 
 StandardOutput=append:/var/log/mesh-probe/results.jsonl

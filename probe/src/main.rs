@@ -25,14 +25,18 @@ const ATTR_XOR_MAPPED_ADDRESS: u16 = 0x0020;
 const TIMEOUT: Duration = Duration::from_secs(3);
 const ATTEMPTS: usize = 3;
 
-/// Idle intervals, in seconds, for the mapping-lifetime test.
+/// The idle intervals, in seconds, that the mapping-lifetime test chooses from.
 ///
-/// One rung is measured per run and the answer accumulates statistically
-/// across days, rather than being binary-searched inside a single run. An
-/// unattended box has abundant wall-clock time and no tolerance for a fragile
-/// multi-step procedure: a run that fails here costs one data point instead of
-/// the whole measurement.
-const IDLE_LADDER: &[u64] = &[15, 30, 45, 60, 90, 120, 180, 240, 300, 420, 600];
+/// Each run tests exactly one of these — this run stays silent for 90 seconds,
+/// the next perhaps for 240 — and the answer accumulates over days as every
+/// interval gets tried many times.
+///
+/// The alternative would be to narrow in on the answer within a single run, by
+/// trying a long interval, then a shorter one, and so on. That is faster in
+/// principle and worse here: it takes many minutes, and a failure partway
+/// through wastes the whole attempt. One interval per run means a failed run
+/// costs one data point.
+const IDLE_INTERVALS: &[u64] = &[15, 30, 45, 60, 90, 120, 180, 240, 300, 420, 600];
 
 /// STUN servers on deliberately distinct operators. Mapping behaviour can only
 /// be classified by comparing what two *different* server IPs observe, so this
@@ -701,7 +705,7 @@ fn probe_mapping_lifetime(idle_seconds: u64, verbose: bool) -> MappingTest {
     }
 }
 
-/// Picks one rung of the ladder at random.
+/// Chooses one interval at random.
 ///
 /// Stateless deliberately: the service runs under a read-only filesystem, and
 /// coverage comes from repetition across days rather than from bookkeeping.
@@ -713,7 +717,7 @@ fn pick_idle_interval() -> u64 {
             .map(|d| d.as_nanos() as u64)
             .unwrap_or(0),
     );
-    IDLE_LADDER[(hasher.finish() % IDLE_LADDER.len() as u64) as usize]
+    IDLE_INTERVALS[(hasher.finish() % IDLE_INTERVALS.len() as u64) as usize]
 }
 
 fn report_mapping(test: &MappingTest) {
@@ -880,18 +884,18 @@ mod tests {
     use super::*;
 
     #[test]
-    fn ladder_is_ascending_and_plausible() {
-        assert!(IDLE_LADDER.windows(2).all(|w| w[0] < w[1]));
-        // RFC 4787 asks routers to hold UDP mappings at least 120s; the ladder
-        // must bracket that rather than stopping short of it.
-        assert!(IDLE_LADDER.first().copied().unwrap() < 120);
-        assert!(IDLE_LADDER.last().copied().unwrap() > 120);
+    fn intervals_ascend_and_span_the_interesting_range() {
+        assert!(IDLE_INTERVALS.windows(2).all(|w| w[0] < w[1]));
+        // RFC 4787 asks routers to hold UDP mappings for at least 120s, so the
+        // list must have values on both sides of that rather than stopping short.
+        assert!(IDLE_INTERVALS.first().copied().unwrap() < 120);
+        assert!(IDLE_INTERVALS.last().copied().unwrap() > 120);
     }
 
     #[test]
-    fn picks_only_rungs_from_the_ladder() {
+    fn only_ever_picks_a_listed_interval() {
         for _ in 0..200 {
-            assert!(IDLE_LADDER.contains(&pick_idle_interval()));
+            assert!(IDLE_INTERVALS.contains(&pick_idle_interval()));
         }
     }
 

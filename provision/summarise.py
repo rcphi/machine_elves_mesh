@@ -50,14 +50,14 @@ def report_mapping(records):
 
     safe_per_machine = {}
 
-    for label, rungs in sorted(by_label.items()):
+    for label, intervals in sorted(by_label.items()):
         print(f"\n{label}")
         # The largest interval such that this and every shorter interval always
         # survived. Anything beyond it is not established as safe.
         safe = 0
         first_loss = None
-        for idle in sorted(rungs):
-            counts = rungs[idle]
+        for idle in sorted(intervals):
+            counts = intervals[idle]
             survived = counts.get("survived", 0)
             expired = counts.get("expired", 0)
             unclear = counts.get("inconclusive", 0)
