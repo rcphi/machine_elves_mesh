@@ -17,19 +17,117 @@ use futures::StreamExt;
 use libp2p::swarm::SwarmEvent;
 use libp2p::{gossipsub, identify, mdns, noise, ping, tcp, yamux, Multiaddr, PeerId};
 
-/// The topic every node publishes its heartbeat and its goodbye to.
-const HEARTBEAT_TOPIC: &str = "machine-elves/heartbeat/0.1";
+/// The topic nodes of one mesh publish to, namespaced by the mesh's name.
+///
+/// Nodes only ever see each other through this topic, so two meshes on the same
+/// network with different names are genuinely separate: they discover each
+/// other's addresses and then ignore each other entirely. That is what §5.1
+/// means by city-states being separate shards, and it is also what keeps a test
+/// run from being joined by whatever was left running from the last one.
+fn heartbeat_topic(mesh: &str) -> String {
+    format!("machine-elves/{mesh}/heartbeat/0.1")
+}
 
-/// Prefix marking a message as "I am still here".
-const MSG_HEARTBEAT: &str = "hb";
+/// "I am still here."
+const KIND_HEARTBEAT: u8 = 1;
 
-/// Prefix marking a message as "I am leaving on purpose".
+/// "I am leaving on purpose."
 ///
 /// This is what §9.6 calls a graceful drain, and it has to be an announcement
 /// rather than anything the transport layer reports. A killed process still has
 /// its sockets closed tidily by the kernel, so a clean close says nothing about
 /// whether the departure was orderly — only the node itself knows that.
-const MSG_DEPARTING: &str = "bye";
+const KIND_DEPARTING: u8 = 2;
+
+/// "Here is the job's state as of this tick."
+///
+/// Sent by whichever node is currently running the job, to everyone. A peer
+/// that holds a recent checkpoint can continue the work without asking anyone
+/// for anything, which is what makes takeover fast enough to be worth doing.
+const KIND_CHECKPOINT: u8 = 3;
+
+/// How often the node running a job advances it.
+const DEFAULT_JOB_TICK_MS: u64 = 200;
+
+#[derive(Debug, PartialEq)]
+enum Message {
+    Heartbeat { label: String },
+    Departing { label: String },
+    Checkpoint { label: String, tick: u64, state: Vec<u8> },
+}
+
+fn put_str(out: &mut Vec<u8>, text: &str) {
+    out.extend_from_slice(&(text.len() as u32).to_le_bytes());
+    out.extend_from_slice(text.as_bytes());
+}
+
+fn take_u32(bytes: &[u8], at: &mut usize) -> Option<u32> {
+    let end = at.checked_add(4)?;
+    let value = u32::from_le_bytes(bytes.get(*at..end)?.try_into().ok()?);
+    *at = end;
+    Some(value)
+}
+
+fn take_u64(bytes: &[u8], at: &mut usize) -> Option<u64> {
+    let end = at.checked_add(8)?;
+    let value = u64::from_le_bytes(bytes.get(*at..end)?.try_into().ok()?);
+    *at = end;
+    Some(value)
+}
+
+fn take_bytes(bytes: &[u8], at: &mut usize) -> Option<Vec<u8>> {
+    let len = take_u32(bytes, at)? as usize;
+    let end = at.checked_add(len)?;
+    let value = bytes.get(*at..end)?.to_vec();
+    *at = end;
+    Some(value)
+}
+
+fn encode_heartbeat(label: &str, counter: u64) -> Vec<u8> {
+    let mut out = vec![KIND_HEARTBEAT];
+    put_str(&mut out, label);
+    out.extend_from_slice(&counter.to_le_bytes());
+    out
+}
+
+fn encode_departing(label: &str) -> Vec<u8> {
+    let mut out = vec![KIND_DEPARTING];
+    put_str(&mut out, label);
+    out
+}
+
+fn encode_checkpoint(label: &str, tick: u64, state: &[u8]) -> Vec<u8> {
+    let mut out = vec![KIND_CHECKPOINT];
+    put_str(&mut out, label);
+    out.extend_from_slice(&tick.to_le_bytes());
+    out.extend_from_slice(&(state.len() as u32).to_le_bytes());
+    out.extend_from_slice(state);
+    out
+}
+
+/// Returns `None` for anything unrecognised or malformed.
+///
+/// A future version publishing kinds this one has never heard of must be
+/// ignored rather than misread — mistaking any other message for a heartbeat
+/// would make a departed node look present.
+fn parse_message(bytes: &[u8]) -> Option<Message> {
+    let kind = *bytes.first()?;
+    let mut at = 1usize;
+    let label = String::from_utf8(take_bytes(bytes, &mut at)?).ok()?;
+    if label.is_empty() {
+        return None;
+    }
+    match kind {
+        KIND_HEARTBEAT => Some(Message::Heartbeat { label }),
+        KIND_DEPARTING => Some(Message::Departing { label }),
+        KIND_CHECKPOINT => {
+            let tick = take_u64(bytes, &mut at)?;
+            let state = take_bytes(bytes, &mut at)?;
+            Some(Message::Checkpoint { label, tick, state })
+        }
+        _ => None,
+    }
+}
 
 /// How often this node announces that it is still here.
 ///
@@ -67,9 +165,53 @@ struct Config {
     heartbeat: Duration,
     detect: Duration,
     json: bool,
+    /// A job every node in the mesh holds. One of them runs it; the rest stand
+    /// ready to continue it.
+    job: Option<String>,
+    job_tick: Duration,
+    /// Which mesh this node belongs to. Nodes in different meshes ignore one
+    /// another completely.
+    mesh: String,
+    /// Whether this node starts as the one running the job.
+    own: bool,
 }
 
 /// What is known about one other node.
+/// A job the whole mesh holds, and the bookkeeping for who is running it.
+struct Work {
+    job: job::Job,
+    /// The node currently advancing it. Every node agrees on this by watching
+    /// checkpoints arrive, so nobody has to be told.
+    owner: Option<PeerId>,
+    state: Vec<u8>,
+    tick: u64,
+    /// When this node noticed the owner disappear. Only set between the
+    /// disappearance and the takeover, and used to measure the gap.
+    owner_lost_at: Option<Instant>,
+}
+
+impl Work {
+    /// Decides, with no coordination at all, whether this node should continue
+    /// the job now that its owner is gone.
+    ///
+    /// The rule is simply the lowest peer identifier among everyone still
+    /// present. Every survivor holds the same membership list and applies the
+    /// same comparison, so they all reach the same answer without exchanging a
+    /// single message — and a vote here would cost more time than the takeover
+    /// it was arranging.
+    ///
+    /// Two nodes briefly disagreeing is survivable rather than catastrophic:
+    /// they would run identical ticks from identical state and produce
+    /// identical results (§11.4), so the duplicate is wasted work, not damage.
+    fn should_take_over(me: &PeerId, members: &HashMap<PeerId, Member>) -> bool {
+        // `peer != me` matters as much as the comparison. If this node ever
+        // appears in its own membership — which self-discovery over the local
+        // network will cause — then without it the test is `me < me`, which is
+        // false, and this node silently becomes ineligible forever.
+        members.keys().filter(|peer| *peer != me).all(|peer| me < peer)
+    }
+}
+
 struct Member {
     label: String,
     joined: Instant,
@@ -109,6 +251,10 @@ fn parse_args() -> Result<Config> {
         heartbeat: Duration::from_millis(DEFAULT_HEARTBEAT_MS),
         detect: Duration::from_millis(DEFAULT_DETECT_MS),
         json: false,
+        job: None,
+        job_tick: Duration::from_millis(DEFAULT_JOB_TICK_MS),
+        mesh: "default".to_string(),
+        own: false,
     };
 
     let mut args = std::env::args().skip(1);
@@ -131,6 +277,13 @@ fn parse_args() -> Result<Config> {
                     Duration::from_millis(args.next().context("--detect-ms needs a number")?.parse()?)
             }
             "--json" => config.json = true,
+            "--job" => config.job = Some(args.next().context("--job needs a path")?),
+            "--mesh" => config.mesh = args.next().context("--mesh needs a name")?,
+            "--own" => config.own = true,
+            "--job-tick-ms" => {
+                config.job_tick =
+                    Duration::from_millis(args.next().context("--job-tick-ms needs a number")?.parse()?)
+            }
             "--help" | "-h" => {
                 print_usage();
                 std::process::exit(0);
@@ -205,6 +358,11 @@ fn print_usage() {
     println!("  --json               emit machine-readable events");
     println!("  --run-job <file.wasm> [--ticks N]");
     println!("                       run a job locally and show its effects, then exit");
+    println!("  --mesh <name>        which mesh to join (default \"default\"). Nodes in");
+    println!("                       different meshes ignore each other entirely");
+    println!("  --job <file.wasm>    hold this job, ready to run or to continue it");
+    println!("  --own                start as the node running the job");
+    println!("  --job-tick-ms <n>    how often the running node advances it (default {DEFAULT_JOB_TICK_MS})");
     println!("  --help               show this");
 }
 
@@ -250,7 +408,7 @@ async fn run(config: Config) -> Result<()> {
         .with_swarm_config(|c| c.with_idle_connection_timeout(Duration::from_secs(60)))
         .build();
 
-    let topic = gossipsub::IdentTopic::new(HEARTBEAT_TOPIC);
+    let topic = gossipsub::IdentTopic::new(heartbeat_topic(&config.mesh));
     swarm.behaviour_mut().gossipsub.subscribe(&topic)?;
 
     for addr in &config.listen {
@@ -264,12 +422,30 @@ async fn run(config: Config) -> Result<()> {
     emit(
         &config,
         "started",
-        &format!("node {} is {}", config.label, me),
-        &[("peer_id", &me.to_string())],
+        &format!("node {} is {} on mesh \"{}\"", config.label, me, config.mesh),
+        &[("peer_id", &me.to_string()), ("mesh", &config.mesh)],
     );
+
+    let mut work = match &config.job {
+        Some(path) => {
+            let job = job::Job::load(path, job::DEFAULT_FUEL)?;
+            emit(&config, "job-loaded",
+                 &format!("holding {path}{}", if config.own { ", running it" } else { ", standing by" }),
+                 &[("path", path), ("owner", if config.own { "true" } else { "false" })]);
+            Some(Work {
+                job,
+                owner: config.own.then_some(me),
+                state: Vec::new(),
+                tick: 0,
+                owner_lost_at: None,
+            })
+        }
+        None => None,
+    };
 
     let mut members: HashMap<PeerId, Member> = HashMap::new();
     let mut heartbeat = tokio::time::interval(config.heartbeat);
+    let mut job_tick = tokio::time::interval(config.job_tick);
     let mut terminate = tokio::signal::unix::signal(tokio::signal::unix::SignalKind::terminate())?;
     let mut interrupt = tokio::signal::unix::signal(tokio::signal::unix::SignalKind::interrupt())?;
     // Checked several times per detection window so that a departure is
@@ -282,10 +458,54 @@ async fn run(config: Config) -> Result<()> {
         tokio::select! {
             _ = heartbeat.tick() => {
                 counter += 1;
-                let payload = format!("{MSG_HEARTBEAT}|{}|{counter}|{}", config.label, now_millis());
                 // Failing to publish is normal and uninteresting while this node
                 // is the only one subscribed to the topic.
-                let _ = swarm.behaviour_mut().gossipsub.publish(topic.clone(), payload.as_bytes());
+                let _ = swarm.behaviour_mut().gossipsub
+                    .publish(topic.clone(), encode_heartbeat(&config.label, counter));
+            }
+
+            _ = job_tick.tick() => {
+                let Some(work) = work.as_mut() else { continue };
+                if work.owner != Some(me) { continue }
+
+                let mut inputs = Vec::new();
+                inputs.extend_from_slice(&work.tick.to_le_bytes());
+                inputs.extend_from_slice(&4u32.to_le_bytes());  // steel delivered
+                inputs.extend_from_slice(&3u32.to_le_bytes());  // workers present
+
+                match work.job.tick(&work.state, &inputs) {
+                    Ok(outcome) => {
+                        work.state = outcome.state;
+                        work.tick += 1;
+                        // Effects are reported with the tick that produced
+                        // them, and that pairing is load-bearing rather than
+                        // decorative. Two nodes may briefly continue the same
+                        // job — a node that has not yet heard from a peer
+                        // believes it is alone — and being deterministic, they
+                        // produce identical effects. Wasted work is acceptable;
+                        // widgets counted twice is not. Whatever applies these
+                        // must therefore treat (job, tick) as the identity of
+                        // an effect and ignore a repeat.
+                        for line in String::from_utf8_lossy(&outcome.effects).lines() {
+                            emit(&config, "effect", &format!("tick {} — {line}", work.tick),
+                                 &[("tick", &work.tick.to_string()), ("effect", line)]);
+                        }
+                        // Checkpointed every tick because this state is tiny.
+                        // Real work would checkpoint less often and trade a
+                        // little replayed work for a lot less traffic.
+                        let _ = swarm.behaviour_mut().gossipsub.publish(
+                            topic.clone(),
+                            encode_checkpoint(&config.label, work.tick, &work.state),
+                        );
+                    }
+                    Err(error) => {
+                        emit(&config, "job-failed", &format!("{error:#}"),
+                             &[("tick", &work.tick.to_string())]);
+                        // Stop rather than spin: a job failing every tick would
+                        // otherwise flood the mesh with identical complaints.
+                        work.owner = None;
+                    }
+                }
             }
 
             // Announce the departure rather than simply exiting, so peers learn
@@ -309,6 +529,12 @@ async fn run(config: Config) -> Result<()> {
                         // machine was unplugged, lost power, lost its network, or
                         // hung. This is the case recovery has to be fast enough
                         // to survive, and the only one that costs a visible gap.
+                        if let Some(w) = work.as_mut() {
+                            if w.owner == Some(peer) {
+                                w.owner = None;
+                                w.owner_lost_at = Some(now);
+                            }
+                        }
                         emit(
                             &config,
                             "vanished",
@@ -329,6 +555,15 @@ async fn run(config: Config) -> Result<()> {
                         );
                     }
                 }
+
+                // Run the election after the whole sweep, so the decision is
+                // made against the final membership rather than a list still
+                // being emptied.
+                if let Some(w) = work.as_mut() {
+                    if w.owner.is_none() && w.owner_lost_at.is_some() {
+                        take_over_if_ours(&config, me, w, &members);
+                    }
+                }
             }
 
             event = swarm.select_next_some() => match event {
@@ -339,6 +574,14 @@ async fn run(config: Config) -> Result<()> {
 
                 SwarmEvent::Behaviour(MeshBehaviourEvent::Mdns(mdns::Event::Discovered(peers))) => {
                     for (peer, addr) in peers {
+                        // A node announces itself on every interface it holds,
+                        // so it discovers its own advertisements and would
+                        // otherwise dial itself and enter its own membership
+                        // list. That is quietly fatal: the takeover rule asks
+                        // whether this node's identifier is lower than every
+                        // member's, and it is never lower than its own, so a
+                        // node that sees itself can never continue a job.
+                        if peer == me { continue }
                         swarm.behaviour_mut().gossipsub.add_explicit_peer(&peer);
                         let _ = swarm.dial(addr);
                     }
@@ -348,41 +591,85 @@ async fn run(config: Config) -> Result<()> {
                     gossipsub::Event::Message { message, .. }
                 )) => {
                     let Some(source) = message.source else { continue };
-                    let text = String::from_utf8_lossy(&message.data);
-                    let Some((kind, label)) = parse_message(&text) else { continue };
+                    // Belt as well as braces: whatever route a message took, a
+                    // node must never treat itself as a peer.
+                    if source == me { continue }
+                    let Some(parsed) = parse_message(&message.data) else { continue };
 
-                    if kind == MSG_DEPARTING {
-                        if let Some(member) = members.remove(&source) {
-                            // An announced departure needs no detection window:
-                            // the mesh knows at once and can hand work over
-                            // before anything stalls.
-                            emit(&config, "left",
-                                 &format!("{} left, announced", member.label),
-                                 &[("peer_id", &source.to_string()),
-                                   ("label", &member.label),
-                                   ("was_present_ms",
-                                    &Instant::now().duration_since(member.joined)
-                                        .as_millis().to_string())]);
-                        }
-                        continue;
+                    // Anything heard from a peer proves it is alive, whatever it
+                    // had to say. Counting only heartbeats would let a node
+                    // sending a steady stream of checkpoints be declared dead.
+                    let label = match &parsed {
+                        Message::Heartbeat { label }
+                        | Message::Departing { label }
+                        | Message::Checkpoint { label, .. } => label.clone(),
+                    };
+                    let known = members.contains_key(&source);
+                    if !known && !matches!(parsed, Message::Departing { .. }) {
+                        members.insert(source, Member {
+                            label: label.clone(),
+                            joined: Instant::now(),
+                            last_heard: Instant::now(),
+                            disconnected: false,
+                        });
+                        emit(&config, "joined", &format!("{label} joined"),
+                             &[("peer_id", &source.to_string()), ("label", &label)]);
+                        // Answer immediately rather than waiting for the next
+                        // interval. Until two nodes have heard from each other
+                        // they each believe they are alone, and a node that
+                        // believes it is alone will continue a job that someone
+                        // else is also continuing.
+                        counter += 1;
+                        let _ = swarm.behaviour_mut().gossipsub
+                            .publish(topic.clone(), encode_heartbeat(&config.label, counter));
+                    } else if let Some(member) = members.get_mut(&source) {
+                        member.last_heard = Instant::now();
+                        member.disconnected = false;
                     }
 
-                    if kind != MSG_HEARTBEAT { continue }
+                    match parsed {
+                        Message::Heartbeat { .. } => {}
 
-                    match members.get_mut(&source) {
-                        Some(member) => {
-                            member.last_heard = Instant::now();
-                            member.disconnected = false;
+                        Message::Departing { .. } => {
+                            if let Some(member) = members.remove(&source) {
+                                // An announced departure needs no detection
+                                // window: the mesh knows at once and can hand
+                                // work over before anything stalls.
+                                emit(&config, "left",
+                                     &format!("{} left, announced", member.label),
+                                     &[("peer_id", &source.to_string()),
+                                       ("label", &member.label),
+                                       ("was_present_ms",
+                                        &Instant::now().duration_since(member.joined)
+                                            .as_millis().to_string())]);
+                            }
+                            if let Some(w) = work.as_mut() {
+                                if w.owner == Some(source) {
+                                    w.owner = None;
+                                    w.owner_lost_at = Some(Instant::now());
+                                    take_over_if_ours(&config, me, w, &members);
+                                }
+                            }
                         }
-                        None => {
-                            members.insert(source, Member {
-                                label: label.clone(),
-                                joined: Instant::now(),
-                                last_heard: Instant::now(),
-                                disconnected: false,
-                            });
-                            emit(&config, "joined", &format!("{label} joined"),
-                                 &[("peer_id", &source.to_string()), ("label", &label)]);
+
+                        Message::Checkpoint { tick, state, .. } => {
+                            let Some(w) = work.as_mut() else { continue };
+                            // A checkpoint is also how a node learns who is
+                            // running the job. Nobody announces ownership;
+                            // doing the work is the announcement.
+                            if w.owner != Some(source) {
+                                emit(&config, "job-owner",
+                                     &format!("{label} is running the job"),
+                                     &[("peer_id", &source.to_string()), ("label", &label)]);
+                            }
+                            w.owner = Some(source);
+                            w.owner_lost_at = None;
+                            // Older checkpoints can arrive late; taking one
+                            // would silently undo completed work.
+                            if tick >= w.tick {
+                                w.tick = tick;
+                                w.state = state;
+                            }
                         }
                     }
                 }
@@ -412,6 +699,47 @@ async fn run(config: Config) -> Result<()> {
     }
 }
 
+/// Continues a job whose owner has gone, if this node is the one that should.
+///
+/// No handshake and no agreement: every survivor holds the same membership and
+/// applies the same rule, so they arrive at the same answer independently. The
+/// job resumes from the last checkpoint received, which is why checkpoints are
+/// broadcast to everyone rather than to a chosen successor — the successor is
+/// not known until the moment it is needed.
+fn take_over_if_ours(
+    config: &Config,
+    me: PeerId,
+    work: &mut Work,
+    members: &HashMap<PeerId, Member>,
+) {
+    if !Work::should_take_over(&me, members) {
+        return;
+    }
+    let gap = work
+        .owner_lost_at
+        .map(|at| Instant::now().duration_since(at))
+        .unwrap_or_default();
+
+    work.owner = Some(me);
+    work.owner_lost_at = None;
+
+    emit(
+        config,
+        "took-over",
+        &format!(
+            "continuing the job from tick {} — {:.0} ms after noticing",
+            work.tick,
+            gap.as_secs_f64() * 1000.0
+        ),
+        &[
+            ("tick", &work.tick.to_string()),
+            ("decision_ms", &gap.as_millis().to_string()),
+            ("state_bytes", &work.state.len().to_string()),
+            ("survivors", &(members.len() + 1).to_string()),
+        ],
+    );
+}
+
 /// Announces departure and waits briefly for the message to propagate.
 ///
 /// The wait is the entire point. Exiting immediately would publish into a
@@ -422,11 +750,10 @@ async fn depart(
     topic: &gossipsub::IdentTopic,
     config: &Config,
 ) -> Result<()> {
-    let payload = format!("{MSG_DEPARTING}|{}", config.label);
     let published = swarm
         .behaviour_mut()
         .gossipsub
-        .publish(topic.clone(), payload.as_bytes())
+        .publish(topic.clone(), encode_departing(&config.label))
         .is_ok();
 
     emit(
@@ -448,21 +775,6 @@ async fn depart(
         }
     }
     Ok(())
-}
-
-/// Splits a gossip payload into its kind and the sender's label.
-///
-/// Returns `None` for anything unrecognised, so a future version publishing
-/// message kinds this one has never heard of is ignored rather than
-/// misinterpreted as a heartbeat.
-fn parse_message(text: &str) -> Option<(&str, String)> {
-    let mut parts = text.split('|');
-    let kind = parts.next()?;
-    if kind != MSG_HEARTBEAT && kind != MSG_DEPARTING {
-        return None;
-    }
-    let label = parts.next().filter(|l| !l.is_empty())?;
-    Some((kind, label.to_string()))
 }
 
 fn now_millis() -> u128 {
@@ -513,33 +825,117 @@ mod tests {
     use super::*;
 
     #[test]
-    fn reads_heartbeats_and_goodbyes() {
+    fn different_meshes_never_share_a_topic() {
+        // Two meshes on one network must not find each other. Without this a
+        // leftover process from an earlier run joins the next one and quietly
+        // changes its results — which is exactly how this was discovered.
+        assert_ne!(heartbeat_topic("alpha"), heartbeat_topic("beta"));
+        assert!(heartbeat_topic("shangri-la").contains("shangri-la"));
+    }
+
+    #[test]
+    fn messages_survive_a_round_trip() {
         assert_eq!(
-            parse_message("hb|diamond|42|1787360517214"),
-            Some(("hb", "diamond".to_string()))
+            parse_message(&encode_heartbeat("diamond", 42)),
+            Some(Message::Heartbeat { label: "diamond".into() })
         );
         assert_eq!(
-            parse_message("bye|diamond"),
-            Some(("bye", "diamond".to_string()))
+            parse_message(&encode_departing("diamond")),
+            Some(Message::Departing { label: "diamond".into() })
         );
+        assert_eq!(
+            parse_message(&encode_checkpoint("diamond", 7, b"opaque")),
+            Some(Message::Checkpoint {
+                label: "diamond".into(),
+                tick: 7,
+                state: b"opaque".to_vec()
+            })
+        );
+    }
+
+    #[test]
+    fn checkpoints_carry_bytes_that_are_not_text() {
+        // State is opaque, so the wire format has to survive anything a job
+        // chooses to put in it — the reason this is framed rather than
+        // delimited.
+        let state: Vec<u8> = (0u8..=255).collect();
+        let parsed = parse_message(&encode_checkpoint("n", 1, &state)).expect("parses");
+        assert_eq!(parsed, Message::Checkpoint { label: "n".into(), tick: 1, state });
     }
 
     #[test]
     fn ignores_messages_it_does_not_understand() {
         // A later version publishing a new kind must not be mistaken for a
         // heartbeat, which would make a departed node look present.
-        assert_eq!(parse_message("checkpoint|diamond|..."), None);
-        assert_eq!(parse_message(""), None);
-        assert_eq!(parse_message("hb"), None);
-        assert_eq!(parse_message("hb|"), None);
+        assert_eq!(parse_message(&[]), None);
+        assert_eq!(parse_message(&[KIND_HEARTBEAT]), None);
+        assert_eq!(parse_message(&[99, 1, 0, 0, 0, b'x']), None);
+        // A length claiming more than the message holds.
+        assert_eq!(parse_message(&[KIND_HEARTBEAT, 255, 0, 0, 0, b'x']), None);
     }
 
     #[test]
     fn a_goodbye_is_never_mistaken_for_a_heartbeat() {
-        // The whole distinction between a 4ms handover and a 3s hole rests on
-        // these two never being confused.
-        let (kind, _) = parse_message("bye|beta").expect("parses");
-        assert_ne!(kind, MSG_HEARTBEAT);
+        // The whole distinction between a few milliseconds and a full detection
+        // window rests on these two never being confused.
+        assert!(matches!(
+            parse_message(&encode_departing("beta")),
+            Some(Message::Departing { .. })
+        ));
+    }
+
+    #[test]
+    fn the_lowest_peer_identifier_takes_over_and_only_that_one() {
+        // Every survivor runs this against the same membership, so exactly one
+        // of them may answer yes — otherwise the job is either dropped by all
+        // of them or picked up by all of them.
+        let peers: Vec<PeerId> = (0..5).map(|_| PeerId::random()).collect();
+        let mut sorted = peers.clone();
+        sorted.sort();
+
+        let member = |label: &str| Member {
+            label: label.into(),
+            joined: Instant::now(),
+            last_heard: Instant::now(),
+            disconnected: false,
+        };
+
+        let mut winners = 0;
+        for me in &peers {
+            let others: HashMap<PeerId, Member> = peers
+                .iter()
+                .filter(|p| *p != me)
+                .map(|p| (*p, member("peer")))
+                .collect();
+            if Work::should_take_over(me, &others) {
+                winners += 1;
+                assert_eq!(me, &sorted[0], "the wrong node volunteered");
+            }
+        }
+        assert_eq!(winners, 1, "exactly one node must take over");
+    }
+
+    #[test]
+    fn a_node_that_somehow_sees_itself_is_still_eligible() {
+        // Self-discovery over the local network put a node in its own
+        // membership list, and `me < me` being false made it permanently
+        // unable to continue a job — with no error anywhere to show for it.
+        let me = PeerId::random();
+        let mut members = HashMap::new();
+        members.insert(me, Member {
+            label: "me".into(),
+            joined: Instant::now(),
+            last_heard: Instant::now(),
+            disconnected: false,
+        });
+        assert!(Work::should_take_over(&me, &members));
+    }
+
+    #[test]
+    fn a_lone_survivor_takes_over() {
+        // The last node standing has nobody to lose the comparison to, and the
+        // job should continue rather than stop because no election was possible.
+        assert!(Work::should_take_over(&PeerId::random(), &HashMap::new()));
     }
 
     #[test]

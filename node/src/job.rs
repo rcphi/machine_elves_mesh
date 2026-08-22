@@ -18,7 +18,7 @@
 use std::path::Path;
 
 use anyhow::{anyhow, bail, Context, Result};
-use wasmtime::{Config, Engine, Instance, Module, Store, StoreLimits, StoreLimitsBuilder};
+use wasmtime::{Config, Engine, Instance, Module, Store, StoreLimitsBuilder};
 
 /// wasmtime carries its own `anyhow`, which is a different type from ours even
 /// when the versions match. Flattening its errors to text here keeps that

@@ -183,6 +183,37 @@ This is §11.4's independent verification working in practice rather than in pri
 
 **A node never compiles anything.** Diamond had no WebAssembly toolchain, so the compiled job was copied there and run as-is — which is how the real thing works. A player's machine receives compiled jobs; only job *authors* need a compiler.
 
+## Migration — 2026-08-22
+
+A job runs on one node, which broadcasts its state to everyone after each tick. When that node goes away, a survivor continues from the last checkpoint it received.
+
+| | Resumed after | |
+|---|---|---|
+| Announced departure | **4–9 ms** | the goodbye arrives; whoever should continue simply does |
+| Unannounced loss | **3,263 ms** | the full detection window, then an immediate handover |
+
+**The handover itself costs nothing.** In both cases the decision took 0 ms once the disappearance was known: the successor already held the state and needed to ask nobody's permission. The entire difference between the two rows is *finding out*.
+
+That has a direct consequence for §19's 500 ms resume budget: the budget is comfortably met for the handover, and an unannounced loss is bounded by detection instead. The two are separate numbers and should be tuned separately, which is what §19 already argued and this now measures.
+
+### Choosing a successor without agreeing on one
+
+Every survivor picks the lowest peer identifier among everyone still present. There is no vote and no handshake — each node holds the same membership list, applies the same comparison, and reaches the same answer alone. A vote would cost more time than the takeover it was arranging.
+
+**Checkpoints go to everyone, not to a designated successor**, because the successor is not known until the moment it is needed.
+
+### Three bugs found by running it
+
+**A node discovered itself.** Announcing on every interface, it received its own advertisement, dialled itself, and entered its own membership list. That was quietly fatal: the rule asks whether this node's identifier is lower than every member's, and it is never lower than its own — so a node that saw itself could never continue a job, with no error anywhere to show for it.
+
+**Two nodes continued the same job.** Standbys learn about the owner from checkpoints every 200 ms but about each other from heartbeats every second, so both could be following the owner while neither knew the other existed. When the owner left, each saw an empty membership and concluded it was alone. Now a node answers a newly-seen peer immediately rather than waiting for the next interval.
+
+**Duplicate execution is possible by design, and that changes what an effect is.** The second bug narrows the window but cannot close it: any node that has not yet heard from a peer believes it is alone. Since jobs are deterministic, two nodes continuing the same job produce *identical* effects — wasted work, which is acceptable. Widgets counted twice is not. **Whatever applies effects must treat `(job, tick)` as an effect's identity and ignore a repeat.** This is a requirement on the layer above, discovered here, and it would have been an unpleasant surprise later.
+
+### A mesh is now a named thing
+
+Nodes only see each other through a topic named for their mesh, so two meshes on one network discover each other's addresses and then ignore each other entirely. That is what §5.1 means by city-states being separate shards, and it also stops a leftover process from an earlier test joining the next one — which it had been doing, silently changing results.
+
 ## Graceful drain is a performance feature, not a courtesy
 
 Measured 2026-08-21 on the local rig, and it changed how departure is handled.
@@ -262,7 +293,7 @@ Household isolation (`--isolate-lan`) is opt-in, verifies internet reachability 
 1a. **Mapping lifetime** — *done*. How long a consumer router holds an idle mapping open before dropping it. Each run tests one idle interval chosen from a list, and the answer accumulates over days. Determines the keepalive interval the mesh will need, which is set by the **worst** router among the players rather than the average one.
 2. **Local rig** — *done*. Several nodes forming an overlay, gossiping membership, and noticing departures. `node/rig.sh` runs it and checks the result. Processes rather than containers for now: they share one host and reach each other trivially, so this tests the logic and nothing about real networks.
 3. **Job execution** — *done*. Sandboxed WebAssembly with a CPU ceiling, in `node/src/job.rs`. Sample jobs in `jobs/`, built by `jobs/build.sh`.
-4. **Checkpoint and migrate** — the state half is done and tested; what remains is doing it *across machines*, triggered by the failure detection from step 2 (§11.3, §9.4).
+4. **Checkpoint and migrate** — *done*. A job whose host disappears is continued by a survivor, from the last checkpoint. `node/migration-rig.sh` runs it and checks the result.
 5. **Volunteer run** — the same binary, on real connections, measured against the stop criteria.
 
 ## Open decisions
