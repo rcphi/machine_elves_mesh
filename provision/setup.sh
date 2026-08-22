@@ -13,6 +13,7 @@ set -euo pipefail
 LABEL=""
 ISOLATE_LAN=0
 MESH_PORT=4001
+DIST=""
 REPO_ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
 
 usage() {
@@ -24,6 +25,9 @@ setup.sh --label <name> [options]
                    other devices. Off by default: see the warning below.
   --mesh-port <n>  Port the mesh node listens on (default 4001). Opened
                    inbound so peers on the same network can reach it.
+  --dist <dir>     Install prebuilt binaries from here instead of compiling.
+                   This is the normal path for a volunteer machine, which
+                   should never need a compiler. Produce one with ./release.sh.
   --help           Show this.
 
 --isolate-lan is a courtesy to the household, but it can strand the box if
@@ -38,6 +42,7 @@ while [[ $# -gt 0 ]]; do
         --label) LABEL="${2:-}"; shift 2 ;;
         --isolate-lan) ISOLATE_LAN=1; shift ;;
         --mesh-port) MESH_PORT="${2:-}"; shift 2 ;;
+        --dist) DIST="${2:-}"; shift 2 ;;
         --help|-h) usage; exit 0 ;;
         *) echo "unknown argument: $1" >&2; usage; exit 2 ;;
     esac
@@ -51,16 +56,50 @@ say() { printf '\n\033[1m==> %s\033[0m\n' "$*"; }
 
 # ---------------------------------------------------------------- the binary
 
-say "Building the probe"
-if [[ -x "$REPO_ROOT/probe/target/release/mesh-probe" ]]; then
-    echo "using existing release build"
-else
-    command -v cargo >/dev/null || { echo "cargo not found; install Rust first" >&2; exit 1; }
-    ( cd "$REPO_ROOT/probe" && cargo build --release )
+say "Installing the probe"
+
+# Prebuilt is the normal path. A volunteer machine should never need a compiler,
+# and shipping the same binary everywhere means every box is demonstrably
+# running the same thing rather than something each one built for itself.
+if [[ -z "$DIST" && -d "$REPO_ROOT/dist" ]]; then
+    DIST="$REPO_ROOT/dist"
+    echo "using $DIST"
 fi
-install -m 0755 "$REPO_ROOT/probe/target/release/mesh-probe" /usr/local/bin/mesh-probe
+
+if [[ -n "$DIST" ]]; then
+    [[ -x "$DIST/mesh-probe" ]] || { echo "no mesh-probe in $DIST — run ./release.sh" >&2; exit 1; }
+
+    # Checksums travel with the files precisely so this can be checked. A box
+    # quietly running a truncated copy would produce measurements nobody could
+    # explain.
+    if [[ -f "$DIST/SHA256SUMS" ]]; then
+        ( cd "$DIST" && sha256sum --quiet --check SHA256SUMS ) \
+            || { echo "checksums do not match — the files were damaged in transit" >&2; exit 1; }
+        echo "checksums verified"
+    else
+        echo "no SHA256SUMS present; installing unverified"
+    fi
+
+    install -m 0755 "$DIST/mesh-probe" /usr/local/bin/mesh-probe
+    [[ -x "$DIST/mesh-node" ]] && install -m 0755 "$DIST/mesh-node" /usr/local/bin/mesh-node
+    if [[ -d "$DIST/jobs" ]]; then
+        install -d -m 0755 /usr/local/share/mesh-probe/jobs
+        install -m 0644 "$DIST"/jobs/*.wasm /usr/local/share/mesh-probe/jobs/ 2>/dev/null || true
+    fi
+    [[ -f "$DIST/VERSION" ]] && install -m 0644 "$DIST/VERSION" /usr/local/share/mesh-probe/VERSION
+else
+    echo "no prebuilt binaries given; compiling here"
+    command -v cargo >/dev/null || {
+        echo "cargo not found. Either install Rust, or build elsewhere with" >&2
+        echo "./release.sh and pass --dist <dir>." >&2
+        exit 1
+    }
+    ( cd "$REPO_ROOT/probe" && cargo build --release )
+    install -m 0755 "$REPO_ROOT/probe/target/release/mesh-probe" /usr/local/bin/mesh-probe
+fi
+
 install -d -m 0755 /usr/local/share/mesh-probe
-install -m 0644 "$REPO_ROOT/probe/README.md" /usr/local/share/mesh-probe/README.md
+[[ -f "$REPO_ROOT/probe/README.md" ]] && install -m 0644 "$REPO_ROOT/probe/README.md" /usr/local/share/mesh-probe/README.md
 
 # ---------------------------------------------------------------- the service
 
@@ -187,6 +226,7 @@ Done.
 
   label         $LABEL
   binary        /usr/local/bin/mesh-probe
+  version       $(head -2 /usr/local/share/mesh-probe/VERSION 2>/dev/null | tr '\n' ' ' || echo "built here")
   results       /var/log/mesh-probe/results.jsonl
   mesh port     $MESH_PORT (tcp and udp) open inbound
   connectivity  every 30 minutes (plus up to 5 minutes of jitter)

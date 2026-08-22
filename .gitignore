@@ -1,2 +1,4 @@
 target/
 provision/results/
+dist/
+machine-elves-*.tar.gz

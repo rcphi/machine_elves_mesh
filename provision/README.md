@@ -10,13 +10,32 @@ through a terminal is a measurement that does not happen.
 
 ## Preparing a box
 
-On a fresh Ubuntu Server install, with Rust present:
+**Volunteer machines never compile anything.** Build once, centrally:
 
 ```
-sudo ./setup.sh --label vol-1
+./release.sh                      # produces dist/ and a tarball
+```
+
+Then on the box:
+
+```
+sudo ./setup.sh --label vol-1 --dist dist
 ```
 
 Idempotent. Re-run it to change the label or install an updated binary.
+
+`setup.sh` verifies the checksums that travel with the files before installing
+anything — a box quietly running a truncated copy would produce measurements
+nobody could explain. It also records which build is installed, so a puzzling
+result can be traced to a specific commit.
+
+The probe is built fully static, so it does not care what libraries the target
+machine has. The node currently is not: wasmtime and libp2p pull in C libraries
+that do not build against musl, so it needs a machine resembling the build host.
+`dist/VERSION` says which is which.
+
+Compiling on the box still works — omit `--dist` — but it is the development
+path, not the deployment one.
 
 What it does:
 
