@@ -30,7 +30,10 @@ for host in "$@"; do
     fi
 done
 
-cat "$OUT_DIR"/*.jsonl > "$OUT_DIR/all.jsonl" 2>/dev/null || true
+# The merged file must be excluded from its own inputs: the shell truncates it
+# before cat runs, so leaving it in the glob would silently read an empty file.
+find "$OUT_DIR" -maxdepth 1 -name '*.jsonl' ! -name 'all.jsonl' -print0 \
+    | sort -z | xargs -0 -r cat > "$OUT_DIR/all.jsonl"
 
 echo
 if [[ $failures -gt 0 ]]; then
