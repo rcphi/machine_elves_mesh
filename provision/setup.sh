@@ -61,10 +61,13 @@ say "Installing the probe"
 # Prebuilt is the normal path. A volunteer machine should never need a compiler,
 # and shipping the same binary everywhere means every box is demonstrably
 # running the same thing rather than something each one built for itself.
-if [[ -z "$DIST" && -d "$REPO_ROOT/dist" ]]; then
-    DIST="$REPO_ROOT/dist"
-    echo "using $DIST"
-fi
+for candidate in "$REPO_ROOT/dist" "$REPO_ROOT/prebuilt"; do
+    [[ -n "$DIST" ]] && break
+    # prebuilt/ is committed, so a freshly cloned machine already has a binary
+    # and never needs a compiler. dist/ wins when present because it is what
+    # release.sh just produced.
+    [[ -x "$candidate/mesh-probe" ]] && { DIST="$candidate"; echo "using $DIST"; }
+done
 
 if [[ -n "$DIST" ]]; then
     [[ -x "$DIST/mesh-probe" ]] || { echo "no mesh-probe in $DIST — run ./release.sh" >&2; exit 1; }
@@ -90,10 +93,49 @@ if [[ -n "$DIST" ]]; then
 else
     echo "no prebuilt binaries given; compiling here"
     command -v cargo >/dev/null || {
-        echo "cargo not found. Either install Rust, or build elsewhere with" >&2
-        echo "./release.sh and pass --dist <dir>." >&2
+        cat >&2 <<'MISSING'
+
+cargo not found, and no prebuilt binaries were given.
+
+A machine that runs the probe should not need a compiler. Build on a machine
+that has one, then bring the result here:
+
+    ./release.sh                                 # on the build machine
+    scp machine-elves-*.tar.gz user@this-box:    # copy it over
+    tar -xzf machine-elves-*.tar.gz              # here
+    sudo ./setup.sh --label NAME --dist machine-elves
+
+MISSING
         exit 1
     }
+
+    # Distribution packages of Rust lag behind, and this repository's lock file
+    # is written by a newer cargo than apt ships. The failure that produces is
+    # obscure enough to send someone hunting in the wrong place, so it is caught
+    # here and named.
+    if ! ( cd "$REPO_ROOT/probe" && cargo metadata --format-version 1 >/dev/null 2>&1 ); then
+        cat >&2 <<MISSING
+
+This machine's cargo cannot read this project.
+
+    $(cargo --version)
+
+Almost certainly the distribution package, which lags behind. Rather than
+upgrading it, use a prebuilt binary — a machine running the probe was never
+meant to need a compiler:
+
+    ./release.sh                                 # on the build machine
+    scp machine-elves-*.tar.gz user@this-box:    # copy it over
+    tar -xzf machine-elves-*.tar.gz              # here
+    sudo ./setup.sh --label NAME --dist machine-elves
+
+If this really is a development machine, install Rust through rustup instead
+of apt: https://rustup.rs
+
+MISSING
+        exit 1
+    fi
+
     ( cd "$REPO_ROOT/probe" && cargo build --release )
     install -m 0755 "$REPO_ROOT/probe/target/release/mesh-probe" /usr/local/bin/mesh-probe
 fi
