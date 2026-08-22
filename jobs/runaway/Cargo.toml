@@ -1,0 +1,12 @@
+[package]
+name = "runaway-job"
+version = "0.1.0"
+edition = "2021"
+description = "A job that never stops, so the fuel ceiling can be shown to work."
+
+[lib]
+crate-type = ["cdylib"]
+
+[profile.release]
+opt-level = "z"
+panic = "abort"

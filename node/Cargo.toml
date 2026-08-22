@@ -9,3 +9,4 @@ anyhow = "1.0.104"
 futures = "0.3.34"
 libp2p = { version = "0.56.0", features = ["tokio", "quic", "tcp", "noise", "yamux", "gossipsub", "mdns", "identify", "ping", "macros"] }
 tokio = { version = "1.53.1", features = ["rt-multi-thread", "macros", "time", "signal"] }
+wasmtime = "48.0.0"

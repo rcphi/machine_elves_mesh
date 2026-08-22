@@ -1,0 +1,14 @@
+[package]
+name = "factory-job"
+version = "0.1.0"
+edition = "2021"
+description = "A sample Machine Elves job: raw material in, work over time, product out."
+
+[lib]
+crate-type = ["cdylib"]
+
+[profile.release]
+opt-level = "z"
+lto = true
+# Unwinding would need host support, and a job is allowed no imports at all.
+panic = "abort"

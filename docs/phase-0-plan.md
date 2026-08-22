@@ -150,6 +150,31 @@ A house computes nothing. Peers store a copy so the city persists while its owne
 
 The line between the second and third rows is whether anyone else needs the thing while you are away. A living room, no. A factory where six people work, yes.
 
+## What job execution settled — 2026-08-22
+
+**Jobs get no imports at all.** Not a restricted set: none. A job that asks for anything is refused at load, and the refusal names what it wanted. Every route out of a sandbox — clock, randomness, network, filesystem — arrives as an import, so refusing all of them *is* the boundary, and §11.4's "receive input, compute, return output" becomes literally true rather than a policy someone must enforce. It is also what makes determinism reachable, since every source of variation a job could touch would have come through an import.
+
+**A fresh instance is built every tick.** This looks wasteful and is the opposite. It means anything a job leaves in a global or on its heap is gone before the next tick, so *nothing survives between ticks except the state* stops being a rule a job could break and becomes a fact about how jobs are run. Making the violation impossible is cheaper than detecting it — the same move §17 describes as designing your way out of needing rules.
+
+**The ceiling is on work, not on time.** Fuel is consumed per instruction, so a busy host and an idle one stop the same job at exactly the same point. A wall-clock limit would make two machines disagree about whether a tick completed, which would break both speculative resume and verification.
+
+**State is opaque to the host.** The host moves bytes it never interprets. Only effects are parsed. A job may keep whatever it likes in whatever format it likes, and the host still checkpoints, migrates, and verifies it.
+
+**The guest is treated as hostile at the boundary.** It chooses the pointer and length of its own output, so both are range-checked against its memory, and blobs are capped — an unchecked length is how a job exhausts the host's memory without ever escaping the sandbox.
+
+### Verified, not asserted
+
+| Property | Test |
+|---|---|
+| Determinism | The same tick from the same state gives identical state, effects, and fuel used |
+| Nothing carries over | Ten unrelated ticks in between change nothing about repeating an earlier one |
+| Checkpoint and resume | Twenty ticks straight through equals ten, drop the runner entirely, then ten more |
+| Runaway containment | A job that never returns is stopped by fuel rather than taking the machine |
+| Ceiling is work-based | The same job stops at every fuel level tried |
+| No imports | A module importing `host::now` is refused at load |
+
+The sample factory costs about 2,900 fuel and 36 bytes of state per tick, against a default ceiling of 50,000,000 — so the ceiling is nowhere near ordinary work, which is what a ceiling should look like.
+
 ## Graceful drain is a performance feature, not a courtesy
 
 Measured 2026-08-21 on the local rig, and it changed how departure is handled.
@@ -228,8 +253,8 @@ Household isolation (`--isolate-lan`) is opt-in, verifies internet reachability 
 1. **Connection probe** (above) — *done*. Ship to volunteers, collect results.
 1a. **Mapping lifetime** — *done*. How long a consumer router holds an idle mapping open before dropping it. Each run tests one idle interval chosen from a list, and the answer accumulates over days. Determines the keepalive interval the mesh will need, which is set by the **worst** router among the players rather than the average one.
 2. **Local rig** — *done*. Several nodes forming an overlay, gossiping membership, and noticing departures. `node/rig.sh` runs it and checks the result. Processes rather than containers for now: they share one host and reach each other trivially, so this tests the logic and nothing about real networks.
-3. **Job execution** — a sandboxed WASM job with fuel metering, so a job cannot consume unbounded CPU (§11.4).
-4. **Checkpoint and migrate** — a running job's state captured periodically, and resumed elsewhere when its host vanishes (§11.3, §9.4).
+3. **Job execution** — *done*. Sandboxed WebAssembly with a CPU ceiling, in `node/src/job.rs`. Sample jobs in `jobs/`, built by `jobs/build.sh`.
+4. **Checkpoint and migrate** — the state half is done and tested; what remains is doing it *across machines*, triggered by the failure detection from step 2 (§11.3, §9.4).
 5. **Volunteer run** — the same binary, on real connections, measured against the stop criteria.
 
 ## Open decisions

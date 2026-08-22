@@ -7,6 +7,8 @@
 //! Jobs, checkpointing, and migration come later. Membership has to be
 //! trustworthy first, because everything else is built on knowing who is here.
 
+mod job;
+
 use std::collections::HashMap;
 use std::time::{Duration, Instant, SystemTime};
 
@@ -79,6 +81,21 @@ struct Member {
 }
 
 fn main() -> Result<()> {
+    // Running a job takes no network and no peers, so it is handled before the
+    // swarm exists rather than as a mode of it.
+    let args: Vec<String> = std::env::args().collect();
+    if let Some(at) = args.iter().position(|a| a == "--run-job") {
+        let path = args.get(at + 1).context("--run-job needs a path to a .wasm")?;
+        let ticks: u64 = args
+            .iter()
+            .position(|a| a == "--ticks")
+            .and_then(|i| args.get(i + 1))
+            .map(|t| t.parse())
+            .transpose()?
+            .unwrap_or(20);
+        return run_job(path, ticks);
+    }
+
     let config = parse_args()?;
     let runtime = tokio::runtime::Runtime::new()?;
     runtime.block_on(run(config))
@@ -141,6 +158,42 @@ fn parse_args() -> Result<Config> {
     Ok(config)
 }
 
+/// Runs a job for some ticks and shows what it did.
+///
+/// Every tick feeds the previous state back in, which is the whole contract:
+/// the job keeps nothing of its own between calls.
+fn run_job(path: &str, ticks: u64) -> Result<()> {
+    let job = job::Job::load(path, job::DEFAULT_FUEL)?;
+    println!("running {path} for {ticks} ticks\n");
+
+    let mut state: Vec<u8> = Vec::new();
+    let mut total_fuel = 0u64;
+
+    for tick in 0..ticks {
+        // Steel arriving and people turning up are the world's business, not
+        // the job's, so they are handed in rather than fetched.
+        let mut inputs = Vec::new();
+        inputs.extend_from_slice(&tick.to_le_bytes());
+        inputs.extend_from_slice(&4u32.to_le_bytes()); // steel delivered
+        inputs.extend_from_slice(&3u32.to_le_bytes()); // workers present
+
+        let outcome = job.tick(&state, &inputs)?;
+        total_fuel += outcome.fuel_used;
+
+        for line in String::from_utf8_lossy(&outcome.effects).lines() {
+            println!("  tick {tick:>3}  {line}");
+        }
+        state = outcome.state;
+    }
+
+    println!(
+        "\n{ticks} ticks, {} bytes of state, {total_fuel} fuel ({} per tick)",
+        state.len(),
+        total_fuel / ticks.max(1)
+    );
+    Ok(())
+}
+
 fn print_usage() {
     println!("mesh-node — forms an overlay and tracks who is in it");
     println!();
@@ -150,6 +203,8 @@ fn print_usage() {
     println!("  --heartbeat-ms <n>   how often to announce presence (default {DEFAULT_HEARTBEAT_MS})");
     println!("  --detect-ms <n>      silence before a peer is presumed gone (default {DEFAULT_DETECT_MS})");
     println!("  --json               emit machine-readable events");
+    println!("  --run-job <file.wasm> [--ticks N]");
+    println!("                       run a job locally and show its effects, then exit");
     println!("  --help               show this");
 }
 
