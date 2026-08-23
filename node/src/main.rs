@@ -326,6 +326,23 @@ fn parse_args() -> Result<Config> {
         // fallback for networks that block or mangle UDP.
         config.listen.push("/ip4/0.0.0.0/udp/0/quic-v1".parse()?);
         config.listen.push("/ip4/0.0.0.0/tcp/0".parse()?);
+
+        // And IPv6, where a machine has it. This is not symmetry for its own
+        // sake: a peer with a global IPv6 address has no translation in front
+        // of it, nothing to punch through, no mapping to expire, and no
+        // keepalive to maintain. It is the easiest peer in the world to reach
+        // and listening only on IPv4 makes it unreachable.
+        //
+        // It matters twice over, because the two families cannot address each
+        // other at all. A peer holding both is the only route between members
+        // that have one and members that have the other, and a city whose last
+        // dual-stack member leaves does not degrade — it splits into two meshes
+        // that cannot see one another.
+        //
+        // Failing to bind is normal and not an error: most machines have no
+        // IPv6 route, which is exactly what the connectivity probe reports.
+        config.listen.push("/ip6/::/udp/0/quic-v1".parse()?);
+        config.listen.push("/ip6/::/tcp/0".parse()?);
     }
 
     anyhow::ensure!(
@@ -610,6 +627,15 @@ async fn run(config: Config) -> Result<()> {
                 SwarmEvent::NewListenAddr { address, .. } => {
                     emit(&config, "listening", &format!("listening on {address}"),
                          &[("addr", &address.to_string())]);
+                }
+
+                // A listener that fails to start is usually this machine having
+                // no route for that address family, which is ordinary. Reported
+                // rather than swallowed, because "nobody can reach me" and
+                // "I never opened the door" look identical from outside.
+                SwarmEvent::ListenerError { error, .. } => {
+                    emit(&config, "listen-failed", &format!("{error}"),
+                         &[("error", &error.to_string())]);
                 }
 
                 SwarmEvent::Behaviour(MeshBehaviourEvent::Mdns(mdns::Event::Discovered(peers))) => {

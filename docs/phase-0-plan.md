@@ -381,6 +381,29 @@ local 41999 -> 204.210.210.200:41999
 
 **Prefer remembering peers that are reachable.** A peer with a public address or working IPv6 is worth far more in a cache than one behind translation, because it can be reached without arranging anything. §11.6 already counts that as a contribution.
 
+## Address families, and the peers that bridge them — 2026-08-22
+
+**IPv4 and IPv6 hosts cannot address each other at all.** Not slowly, not partially — an IPv4-only machine has no way to write down an IPv6 destination. Two peers with no family in common have no path.
+
+| Both ends | Result |
+|---|---|
+| Both IPv4 | Works; needs hole punching, which is proven |
+| Both IPv6 | Works, and more easily — no translation, no mapping, no keepalive |
+| One IPv4-only, one IPv6-only | **No path at all** |
+| Either end dual-stack | Works over whichever family they share |
+
+**The node now listens on both families.** It had been binding IPv4 only, which made a peer's most valuable property — a global IPv6 address, with nothing in front of it to punch through and no mapping to expire — invisible to the mesh. Failing to bind is reported rather than swallowed: "nobody can reach me" and "I never opened the door" look identical from outside.
+
+### Relaying across the families, which costs nothing new
+
+An IPv4-only peer reaches an IPv6-only peer through a dual-stack peer that holds a connection to each and carries bytes between them.
+
+**This is not tunnelling.** Nothing wraps IPv6 packets inside IPv4 ones, and no protocol translation happens. The relay simply holds two ordinary connections and forwards a payload from one to the other, which is the same circuit-relay mechanism §11.6 already requires for peers that cannot punch through translation. **The relays are already there; the address-family bridge is a second job for them, not a second mechanism.** End-to-end encryption survives, since the relay carries bytes it cannot read — which is what made player-operated relays safe in the first place.
+
+**The wrinkle: a bridge relay is permanent in a way a NAT relay is not.** A relayed connection between two translated peers is a stopgap — it gets upgraded to a direct one the moment hole punching succeeds. A relayed connection between an IPv4-only peer and an IPv6-only peer can *never* be upgraded, because there is no direct path to upgrade to. The relay carries that traffic for as long as the two want to talk, so bridging is a standing cost on whoever provides it rather than a brief one.
+
+**It mitigates the partition risk without removing it.** A city whose last dual-stack member leaves does not degrade — it splits into two meshes that cannot see each other, each convinced the other vanished. Dual-stack membership is therefore worth watching the way §11.6 watches relay bandwidth: not reachability, but the ability to be a bridge at all.
+
 ## Volunteer machines and remote management
 
 Volunteers are not technically inclined. Machines are prepared centrally — Ubuntu 26.04, Rust and dependencies preinstalled — and shipped ready to plug in.
