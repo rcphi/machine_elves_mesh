@@ -329,6 +329,36 @@ Both being *endpoint-independent* is the encouraging half: each uses the same ex
 
 **This is now the concrete form of the Phase 0 question.** Not "does peer-to-peer work" in the abstract, but: can two machines behind ordinary translation, with no rented infrastructure and no third party, arrange a meeting? An answer either way is the finding.
 
+## The Phase 0 question is answered — 2026-08-22
+
+**Two machines behind ordinary address translation reached each other directly, with no rented infrastructure and no third party in the path.**
+
+`diamond` on home broadband and a laptop on a mobile hotspot — different networks, different carriers, different routers, neither able to be dialled from outside. Both sent outward at once. Contact was mutual and immediate:
+
+```
+<- their packet arrived from 69.224.155.159:2101 after 0.0s
+-> they answered ours after 0.1s
+PUNCH v0.1 | me=204.210.210.200:51650 | peer=69.224.155.159:2101 | result=two-way
+```
+
+This is what the whole phase existed to find out. The architecture does not need a server to let players find each other, which means §12.1's reveal can be true and §11.6's refusal of rented infrastructure is affordable rather than merely principled.
+
+### What it does not prove, and the distinctions matter
+
+**Addresses were discovered through public STUN servers.** A third party observed each machine and told it what it looked like from outside. §11.6's answer — a peer already in the mesh reports what address it sees — is not what was used here, and is untested.
+
+**A human carried the addresses across.** In production that is the invite, and the invite would have to carry a *live* address: mappings expire, and the mobile one expires within five minutes. A hand-copied address that outlives its mapping is worse than useless. **This remains the unsolved half.** Punching works; arranging the meeting at scale does not yet.
+
+**It happened suspiciously fast.** Their packet arrived at 0.0 s — before this side could plausibly have opened a path by sending. The likely explanation is that `diamond`'s router uses the most permissive filtering there is, admitting anyone once the socket has sent anywhere at all, which the STUN traffic had already done. A stricter router would not behave this way and the result would look different. **Two routers is not a sample**, and this one may be the friendly case.
+
+**Nothing here tested sustained use** — only first contact. Whether the path survives, and for how long without traffic, is what the mapping-lifetime measurements bound.
+
+### What follows from it
+
+The remaining work is no longer "can this work at all" but "how do two peers exchange live addresses without a server". That is a narrower question with known shapes: an invite that carries a currently-valid address and is used promptly; a peer already in the mesh acting as introducer for two who are not yet connected; or a player with a genuinely reachable address doing the same job §11.6 already calls the fifth contribution lever.
+
+**The introducer need not be infrastructure.** Any citizen already connected to both parties can perform it, which is precisely what a friend-to-friend invite (§11.6) makes available: the person who invites you is, by construction, already connected to you and to the world.
+
 ## Volunteer machines and remote management
 
 Volunteers are not technically inclined. Machines are prepared centrally — Ubuntu 26.04, Rust and dependencies preinstalled — and shipped ready to plug in.
