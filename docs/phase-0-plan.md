@@ -365,7 +365,9 @@ With both fixed, the test was repeated. **Nothing arrived during the wait.** Not
 
 **A city therefore cannot bootstrap from nothing.** At least one member must be reachable, or every pair needs an introducer already connected to both. That is a real constraint on what a volunteer population must contain, and it was invisible until the instrumentation stopped lying.
 
-**It also explains the node's failure.** The node was dialling `69.224.155.159` while the laptop had moved to `69.224.18.54` — mobile reassigns the address, not merely the port. So the node never sent to the laptop's real address, its router never opened, and the laptop's packets were dropped exactly as this filtering predicts. The node behaved correctly on a stale address.
+**It also explains the node's failure.** The node was dialling `69.224.155.159` while the laptop had moved to `69.224.18.54`, so it never sent to the laptop's real address, its router never opened, and the laptop's packets were dropped exactly as this filtering predicts. The node behaved correctly on stale information.
+
+**The address changed because the hotspot was switched off and on**, not on its own — so a mobile address is stable within a session and reassigned whenever the connection cycles. That is a weaker claim than "mobile reassigns addresses" and a more useful one: the events that invalidate a cached address are the ones a person causes, and they are frequent. A laptop closing, a tunnel, a train, a hotspot toggled — each ends a session, and the address after it is unrelated to the address before.
 
 ### What it does not prove, and the distinctions matter
 
