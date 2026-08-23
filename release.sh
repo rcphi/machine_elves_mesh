@@ -24,8 +24,38 @@ STATIC_TARGET="x86_64-unknown-linux-musl"
 
 say() { printf '\n\033[1m==> %s\033[0m\n' "$*"; }
 
+# Building the node compiles several hundred crates, and running one rustc per
+# core will exhaust a small machine's memory before it exhausts its patience -
+# a laptop can lock up entirely rather than fail. Left alone where there is
+# room; capped where there is not.
+if [[ -z "${CARGO_BUILD_JOBS:-}" ]]; then
+    kb=$(awk '/MemTotal/ {print $2}' /proc/meminfo 2>/dev/null || echo 0)
+    if (( kb > 0 && kb < 8000000 )); then
+        export CARGO_BUILD_JOBS=2
+        echo "note: under 8GB of memory, building with 2 jobs to avoid locking up"
+    fi
+fi
+
+# This is a build machine's job. A machine that only *runs* the software needs
+# none of it - that is what the static binaries are for.
+if [[ "${1:-}" == "--help" ]]; then
+    echo "release.sh - build binaries and jobs into dist/, for copying elsewhere"
+    echo
+    echo "Run this where a toolchain already lives. Machines that only run the"
+    echo "software should receive dist/ and never build anything."
+    exit 0
+fi
+
 build() {
     local crate="$1" binary="$2" target="" built=""
+
+    # Add the target rather than silently falling back. Its absence is the
+    # usual reason a static build "fails" on a machine that has everything else
+    # it needs, and the fallback hid that behind a message about linking.
+    if ! rustup target list --installed 2>/dev/null | grep -qx "$STATIC_TARGET"; then
+        echo "  adding $STATIC_TARGET..."
+        rustup target add "$STATIC_TARGET" >/dev/null 2>&1 || true
+    fi
 
     if rustup target list --installed 2>/dev/null | grep -qx "$STATIC_TARGET"; then
         # Some dependencies compile C — the crypto under the transport layer
@@ -35,7 +65,10 @@ build() {
         if command -v musl-gcc >/dev/null; then
             export CC_x86_64_unknown_linux_musl=musl-gcc
         fi
-        if ( cd "$ROOT/$crate" && cargo build --release --quiet --target "$STATIC_TARGET" 2>/dev/null ); then
+        # Errors are shown rather than discarded. Swallowing them turned every
+        # cause - a missing target, a missing C compiler, running out of memory
+        # - into the same unhelpful sentence.
+        if ( cd "$ROOT/$crate" && cargo build --release --quiet --target "$STATIC_TARGET" ); then
             target="$STATIC_TARGET"
             built="$ROOT/$crate/target/$STATIC_TARGET/release/$binary"
         fi
