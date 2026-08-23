@@ -343,6 +343,30 @@ PUNCH v0.1 | me=204.210.210.200:51650 | peer=69.224.155.159:2101 | result=two-wa
 
 This is what the whole phase existed to find out. The architecture does not need a server to let players find each other, which means §12.1's reveal can be true and §11.6's refusal of rented infrastructure is affordable rather than merely principled.
 
+### Corrected 2026-08-22, later the same day
+
+**The claim above stands, but its explanation was wrong, and the correction matters more than the result.**
+
+Contact was reported at 0.0 s, which was read as packets having already been arriving and buffering — implying the router admitted strangers. It did not. The tool was not reading its socket while it waited for an address to be typed in, so an arriving packet would have sat unread and been indistinguishable from an absent one. A second fault did the same thing again: the twenty-second address refresh read the socket and discarded anything not from a STUN server, silently eating the very packets being measured.
+
+With both fixed, the test was repeated. **Nothing arrived during the wait.** Not one packet, over minutes, while the far side sent every 250 ms. The moment this side sent, contact was mutual within milliseconds.
+
+**So the finding is:** this router admits packets only from an address it has itself already sent to — address-dependent filtering, in RFC 4787's terms. The 0.0 s was never buffering; it is how quickly a reply arrives once the path opens.
+
+### What this changes
+
+**Hole punching works, and requires both sides to know each other's live address first.** Neither can open a path alone. That is not a limitation of the implementation; it is what these two routers do.
+
+**Therefore two strangers behind such routers cannot meet unaided.** Something must tell each of them where the other is, at a moment when both addresses are still valid. Three things can be that something, and none is rented infrastructure:
+
+- **A peer already connected to both** — which is what §11.6's mesh rendezvous provides, and why a newcomer needs one existing contact rather than none.
+- **An invite carrying a live address**, used promptly. §11.6 already says live; this is why.
+- **One member reachable without punching** — a public address, or IPv6.
+
+**A city therefore cannot bootstrap from nothing.** At least one member must be reachable, or every pair needs an introducer already connected to both. That is a real constraint on what a volunteer population must contain, and it was invisible until the instrumentation stopped lying.
+
+**It also explains the node's failure.** The node was dialling `69.224.155.159` while the laptop had moved to `69.224.18.54` — mobile reassigns the address, not merely the port. So the node never sent to the laptop's real address, its router never opened, and the laptop's packets were dropped exactly as this filtering predicts. The node behaved correctly on a stale address.
+
 ### What it does not prove, and the distinctions matter
 
 **Addresses were discovered through public STUN servers.** A third party observed each machine and told it what it looked like from outside. §11.6's answer — a peer already in the mesh reports what address it sees — is not what was used here, and is untested.
