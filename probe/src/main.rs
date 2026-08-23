@@ -55,6 +55,7 @@ fn main() {
     let mut idle: Option<u64> = None;
     let mut punch_mode = false;
     let mut punch_peer: Option<SocketAddr> = None;
+    let mut local_port: u16 = 0;
     let mut args = env::args().skip(1);
 
     while let Some(arg) = args.next() {
@@ -63,6 +64,15 @@ fn main() {
             "--label" => label = args.next().unwrap_or_else(|| "unlabelled".to_string()),
             "--mapping-lifetime" => mapping_lifetime = true,
             "--punch" => punch_mode = true,
+            "--port" => {
+                local_port = args
+                    .next()
+                    .and_then(|v| v.parse().ok())
+                    .unwrap_or_else(|| {
+                        eprintln!("--port needs a number");
+                        std::process::exit(2);
+                    })
+            }
             "--peer" => {
                 punch_peer = args.next().and_then(|v| v.parse().ok());
                 if punch_peer.is_none() {
@@ -117,8 +127,8 @@ fn main() {
         println!();
     }
 
-    let v4 = probe_family(Family::V4, !json);
-    let v6 = probe_family(Family::V6, !json);
+    let v4 = probe_family_on(Family::V4, !json, local_port);
+    let v6 = probe_family_on(Family::V6, !json, local_port);
 
     if json {
         println!("{}", report_json(&label, &v4, &v6));
@@ -140,6 +150,9 @@ fn print_usage() {
     println!("  --punch          try to reach another machine directly, with nothing in");
     println!("                   the middle. Run it on both machines at once.");
     println!("  --peer <addr>    the other machine's address, if you already have it");
+    println!("  --port <n>       bind this local port instead of letting the system choose.");
+    println!("                   Tests whether this router gives the same external address");
+    println!("                   every time, which decides whether peers can be remembered.");
     println!("  --help           show this");
 }
 
@@ -191,7 +204,7 @@ struct FamilyResult {
 /// local port is translated to the same external port when talking to
 /// different destinations, so reusing one socket is what makes the comparison
 /// meaningful. A fresh socket per server would measure nothing.
-fn probe_family(family: Family, verbose: bool) -> FamilyResult {
+fn probe_family_on(family: Family, verbose: bool, local_port: u16) -> FamilyResult {
     let mut result = FamilyResult {
         family,
         local: None,
@@ -199,12 +212,22 @@ fn probe_family(family: Family, verbose: bool) -> FamilyResult {
         errors: Vec::new(),
     };
 
-    let socket = match UdpSocket::bind(family.wildcard()) {
+    // A fixed local port is what makes an address worth remembering. Bound to
+    // zero the kernel picks a fresh one each run, so the external address
+    // changes every restart and nothing can be cached. Bound to a known port,
+    // a router that preserves port numbers gives the same external address
+    // every time — which is the difference between a peer cache that works and
+    // one that is a list of dead ends.
+    let bind = match family {
+        Family::V4 => SocketAddr::from((Ipv4Addr::UNSPECIFIED, local_port)),
+        Family::V6 => SocketAddr::from((Ipv6Addr::UNSPECIFIED, local_port)),
+    };
+    let socket = match UdpSocket::bind(bind) {
         Ok(s) => s,
         Err(e) => {
             result
                 .errors
-                .push(format!("cannot open a {} socket: {}", family.label(), e));
+                .push(format!("cannot open a {} socket on port {local_port}: {e}", family.label()));
             return result;
         }
     };

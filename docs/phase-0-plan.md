@@ -359,6 +359,28 @@ The remaining work is no longer "can this work at all" but "how do two peers exc
 
 **The introducer need not be infrastructure.** Any citizen already connected to both parties can perform it, which is precisely what a friend-to-friend invite (§11.6) makes available: the person who invites you is, by construction, already connected to you and to the world.
 
+## Remembering peers — 2026-08-22
+
+**A player who has joined a city keeps a list of peers it has seen, and uses it to get back in.** The invite is then needed exactly once, ever: after first contact, a machine bootstraps from its own memory, and whoever is still online brings it back. This is what Bitcoin's address manager and BitTorrent's persisted routing table do, and it removes the repeated-bootstrap problem entirely.
+
+**The objection is staleness, and one measurement decides it.** A remembered address is worthless if it has changed. Every observation so far showed a different external port each run — but every run had also bound a *different local port*, because the socket was opened on port zero and the kernel chose. That confounded the two.
+
+Bound to a fixed local port instead, across five separate runs:
+
+```
+local 41999 -> 204.210.210.200:41999
+local 41999 -> 204.210.210.200:41999
+local 41999 -> 204.210.210.200:41999
+local 41999 -> 204.210.210.200:41999
+local 41999 -> 204.210.210.200:41999
+```
+
+**The router preserves the port.** A node that always binds the same local port has the same external address every time it starts. That is the difference between a peer cache that works and a list of dead ends, and it costs nothing to arrange.
+
+**Not yet confirmed elsewhere.** This is one router. Mobile carriers commonly do *not* preserve ports, and the hotspot's observed ports did vary — though those runs also used random local ports, so the question is still open there. Running `--port` on `diamond` and on the hotspot would settle it, and the answer changes how much the cache can be relied on for which peers.
+
+**Prefer remembering peers that are reachable.** A peer with a public address or working IPv6 is worth far more in a cache than one behind translation, because it can be reached without arranging anything. §11.6 already counts that as a contribution.
+
 ## Volunteer machines and remote management
 
 Volunteers are not technically inclined. Machines are prepared centrally — Ubuntu 26.04, Rust and dependencies preinstalled — and shipped ready to plug in.
