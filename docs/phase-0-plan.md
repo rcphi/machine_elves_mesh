@@ -518,6 +518,43 @@ Gamma never learned beta's address at all. Beta heard gamma announced and dialle
 
 **Addresses become known city-wide.** A citizen's address would be known to every member rather than only to those they actually talk to. Any peer-to-peer system reveals an address to whoever you connect to, so this widens an existing exposure rather than creating one — but it is a real widening, and it sits a little awkwardly beside §5.7's decision that people are not searchable. Recorded as a deliberate choice rather than an inherited one.
 
+## A mesh across the internet — 2026-08-22
+
+`diamond` on home broadband and `yoinkerz` on a mobile hotspot, two carriers, no rented infrastructure of any kind, connected on the first attempt:
+
+```
+event=connected   peer=diamond
+event=my-address  /ip4/69.224.18.54/udp/5732/quic-v1  observed_by=diamond
+```
+
+The second line is the one that matters. **A machine behind carrier translation learned its own address because a peer told it what it could see** — no STUN server, no third party, nothing asked of anyone outside the mesh.
+
+### What made it work was not punching
+
+Hole punching does work between these two connections, and it needs both sides to already know each other's live address — which needs an introducer, which needs somebody reachable. That is a chain with a hole in the middle when a city has no reachable member yet.
+
+**The router opened a port on request.** NAT-PMP, offered by most consumer routers under a setting usually labelled UPnP, and it granted exactly the port asked for:
+
+```
+PORTMAP v0.1 | supported=yes | mapped=yes | external=4001
+```
+
+`diamond` was then genuinely listening on the internet. `yoinkerz` dialled it. No punching, no coordination, no timing window, no address exchanged by hand.
+
+**This should have been the first thing tried.** It is how peer-to-peer software has always become reachable, it costs nothing, and it was reached only after a long detour through hole punching — which was worth understanding, but was never the shortest path.
+
+### The shape this settles
+
+**One reachable member is enough.** Not everyone. `yoinkerz` sits behind an unpredictable carrier address and is a complete member: it dials out, is observed, is announced, and can be introduced to anyone. What it cannot do is be dialled first, and it never has to be.
+
+That is the same asymmetry as everything else here — not everyone bridges address families, not everyone has a stable address, not everyone relays. **A city needs some members who can, and mechanisms that let the rest participate fully without.** A player who forwards a port contributes reachability, which §11.6 already counts alongside compute and relay bandwidth.
+
+**Phase 0's question is answered, and by a plainer route than expected.** Ordinary home machines form a mesh across the internet with no rented infrastructure, provided one of them asks its router for a door — and consumer routers say yes.
+
+### Still owed
+
+**The mapping expires in an hour.** The node must renew it, the way it already keeps NAT mappings alive with keepalives. Until it does, a long-running node silently stops being reachable, which is precisely the failure that is hardest to notice.
+
 ## Volunteer machines and remote management
 
 Volunteers are not technically inclined. Machines are prepared centrally — Ubuntu 26.04, Rust and dependencies preinstalled — and shipped ready to plug in.
