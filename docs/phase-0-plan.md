@@ -353,6 +353,24 @@ With both fixed, the test was repeated. **Nothing arrived during the wait.** Not
 
 **So the finding is:** this router admits packets only from an address it has itself already sent to — address-dependent filtering, in RFC 4787's terms. The 0.0 s was never buffering; it is how quickly a reply arrives once the path opens.
 
+### The filtering is per address *and* port — 2026-08-22
+
+Two explanations survived the node's failure, and they needed separating rather than guessing between. Either the router filters per address-and-port, or the node was not sending from the socket it listens on, leaving its listening port with no mapping at all.
+
+Tested with one variable: the raw tool, where the sending socket is certainly the listening socket, aimed at **the right address and a deliberately wrong port**. If the filter were per address, that would have been enough to open it.
+
+**Nothing arrived.** So the filter is per address *and* port. Having sent to `69.224.18.54:9999` does not admit packets from `69.224.18.54:7021`.
+
+### The consequence, stated plainly
+
+**Neither of these machines can accept an unsolicited connection.** One has a predictable address and a closed filter; the other has an open enough filter and an unpredictable address. Between the two of them there is no first packet that can ever land.
+
+So **these two machines cannot connect without a third party**, no matter what is built. That is not a gap in the implementation — it is what these two routers do, and no amount of retrying or cleverness reaches past it.
+
+**This makes the invite structural rather than convenient.** §11.6 chose invite-as-bootstrap for reasons of theme and honesty — that a world should not be findable without a citizen. It turns out to be the only thing that works: an introducer already connected to both parties can observe each one's live address and tell the other, and nothing else can. The mesh rendezvous is not an optimisation; it is the mechanism.
+
+**And a city must contain at least one member reachable without punching** — a public address, or IPv6 with a permissive firewall — or it can never admit anyone it is not already connected to. The laptop measured here has global IPv6 and would serve, if the other machine had any. It does not. That is now the most concrete argument for IPv6 in this project: not performance, not tidiness, but whether a stranger can be let in at all.
+
 ### What this changes
 
 **Hole punching works, and requires both sides to know each other's live address first.** Neither can open a path alone. That is not a limitation of the implementation; it is what these two routers do.
