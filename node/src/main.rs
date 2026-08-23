@@ -47,6 +47,24 @@ const KIND_DEPARTING: u8 = 2;
 /// for anything, which is what makes takeover fast enough to be worth doing.
 const KIND_CHECKPOINT: u8 = 3;
 
+/// "I can see this peer at this address."
+///
+/// A node behind address translation cannot know its own address — only the
+/// peer receiving its packets can see where they came from. So nobody
+/// advertises themselves; everyone reports what they observe of others, and a
+/// node learns where it lives by hearing itself described.
+///
+/// This is also what makes two translated peers able to meet. Announcements
+/// reach the whole mesh at once, so everyone dials the newcomer at the same
+/// moment while the newcomer dials back — and simultaneous dialling is the
+/// only thing that opens a path between two machines neither of which can be
+/// called. **The mesh is its own rendezvous**, which is why §11.6 can refuse
+/// rented infrastructure without refusing the thing it would have provided.
+const KIND_OBSERVED: u8 = 4;
+
+/// How often a node repeats what it can see, for anyone who has since arrived.
+const ANNOUNCE_EVERY: Duration = Duration::from_secs(30);
+
 /// How often the node running a job advances it.
 const DEFAULT_JOB_TICK_MS: u64 = 200;
 
@@ -91,6 +109,7 @@ enum Message {
     Heartbeat { label: String },
     Departing { label: String },
     Checkpoint { label: String, tick: u64, state: Vec<u8> },
+    Observed { label: String, peer: PeerId, addr: Multiaddr },
 }
 
 fn put_str(out: &mut Vec<u8>, text: &str) {
@@ -133,6 +152,16 @@ fn encode_departing(label: &str) -> Vec<u8> {
     out
 }
 
+fn encode_observed(label: &str, peer: &PeerId, addr: &Multiaddr) -> Vec<u8> {
+    let mut out = vec![KIND_OBSERVED];
+    put_str(&mut out, label);
+    let id = peer.to_bytes();
+    out.extend_from_slice(&(id.len() as u32).to_le_bytes());
+    out.extend_from_slice(&id);
+    put_str(&mut out, &addr.to_string());
+    out
+}
+
 fn encode_checkpoint(label: &str, tick: u64, state: &[u8]) -> Vec<u8> {
     let mut out = vec![KIND_CHECKPOINT];
     put_str(&mut out, label);
@@ -161,6 +190,14 @@ fn parse_message(bytes: &[u8]) -> Option<Message> {
             let tick = take_u64(bytes, &mut at)?;
             let state = take_bytes(bytes, &mut at)?;
             Some(Message::Checkpoint { label, tick, state })
+        }
+        KIND_OBSERVED => {
+            let peer = PeerId::from_bytes(&take_bytes(bytes, &mut at)?).ok()?;
+            let addr: Multiaddr = String::from_utf8(take_bytes(bytes, &mut at)?)
+                .ok()?
+                .parse()
+                .ok()?;
+            Some(Message::Observed { label, peer, addr })
         }
         _ => None,
     }
@@ -211,6 +248,10 @@ struct Config {
     /// another completely.
     mesh: String,
     port: u16,
+    /// Local-network discovery. Off is a supported way to run: many machines
+    /// disable it, and a node that depends on it has one route to a peer that
+    /// an operator may have deliberately closed.
+    mdns: bool,
     /// Whether this node starts as the one running the job.
     own: bool,
 }
@@ -297,6 +338,7 @@ fn parse_args() -> Result<Config> {
         keepalive: Duration::from_millis(DEFAULT_KEEPALIVE_MS),
         mesh: "default".to_string(),
         port: DEFAULT_PORT,
+        mdns: true,
         own: false,
     };
 
@@ -329,6 +371,7 @@ fn parse_args() -> Result<Config> {
                 )
             }
             "--own" => config.own = true,
+            "--no-mdns" => config.mdns = false,
             "--job-tick-ms" => {
                 config.job_tick =
                     Duration::from_millis(args.next().context("--job-tick-ms needs a number")?.parse()?)
@@ -430,6 +473,9 @@ fn print_usage() {
     println!("  --port <n>           port to listen on (default {DEFAULT_PORT}). Fixed, so that a");
     println!("                       router preserving port numbers gives this node the same");
     println!("                       address every restart and peers can remember it");
+    println!("  --no-mdns            do not use local-network discovery. Peers are then");
+    println!("                       found only by address, which is how they are found");
+    println!("                       across the internet in any case");
     println!("  --mesh <name>        which mesh to join (default \"default\"). Nodes in");
     println!("                       different meshes ignore each other entirely");
     println!("  --job <file.wasm>    hold this job, ready to run or to continue it");
@@ -455,6 +501,7 @@ async fn run(config: Config) -> Result<()> {
         .with_quic()
         .with_behaviour(|key| {
             let keepalive = config.keepalive;
+            let use_mdns = config.mdns;
             let gossipsub = gossipsub::Behaviour::new(
                 gossipsub::MessageAuthenticity::Signed(key.clone()),
                 gossipsub::ConfigBuilder::default()
@@ -468,7 +515,14 @@ async fn run(config: Config) -> Result<()> {
             Ok(MeshBehaviour {
                 gossipsub,
                 mdns: mdns::tokio::Behaviour::new(
-                    mdns::Config::default(),
+                    if use_mdns {
+                        mdns::Config::default()
+                    } else {
+                        // Left in place but never speaking: a query interval
+                        // beyond any run's lifetime is simpler than making the
+                        // behaviour optional, and cannot half-work.
+                        mdns::Config { query_interval: Duration::from_secs(86_400 * 365), ..Default::default() }
+                    },
                     key.public().to_peer_id(),
                 )?,
                 identify: identify::Behaviour::new(identify::Config::new(
@@ -500,6 +554,11 @@ async fn run(config: Config) -> Result<()> {
     let mut pending: Vec<Multiaddr> = config.dial.clone();
     let mut dial_attempts: u32 = 0;
     let mut dial_retry = tokio::time::interval(DIAL_RETRY);
+    // Where this node can currently see each peer. Observed, never claimed:
+    // a peer's own idea of its address is worthless behind translation.
+    let mut seen_at: HashMap<PeerId, Multiaddr> = HashMap::new();
+    let mut announce = tokio::time::interval(ANNOUNCE_EVERY);
+    let mut my_address: Option<Multiaddr> = None;
 
     let me = *swarm.local_peer_id();
     emit(
@@ -554,6 +613,16 @@ async fn run(config: Config) -> Result<()> {
                          &format!("still trying {} peer(s), attempt {dial_attempts}", pending.len()),
                          &[("peers", &pending.len().to_string()),
                            ("attempts", &dial_attempts.to_string())]);
+                }
+            }
+
+            // Repeat what we can see, for anyone who has arrived since. New
+            // members hear the whole roster this way and dial into it, rather
+            // than waiting to be found.
+            _ = announce.tick() => {
+                for (peer, addr) in &seen_at {
+                    let _ = swarm.behaviour_mut().gossipsub
+                        .publish(topic.clone(), encode_observed(&config.label, peer, addr));
                 }
             }
 
@@ -692,6 +761,14 @@ async fn run(config: Config) -> Result<()> {
                     if before > 0 && pending.is_empty() {
                         emit(&config, "all-reached", "every peer given on the command line answered", &[]);
                     }
+
+                    // Tell everyone where this peer can be reached, at once.
+                    // A newcomer is dialled by the whole mesh in the same
+                    // moment, while it dials back — which is the only way two
+                    // machines behind translation ever meet.
+                    seen_at.insert(peer_id, reached.clone());
+                    let _ = swarm.behaviour_mut().gossipsub
+                        .publish(topic.clone(), encode_observed(&config.label, &peer_id, &reached));
                 }
 
                 SwarmEvent::NewListenAddr { address, .. } => {
@@ -709,6 +786,7 @@ async fn run(config: Config) -> Result<()> {
                 }
 
                 SwarmEvent::Behaviour(MeshBehaviourEvent::Mdns(mdns::Event::Discovered(peers))) => {
+                    if !config.mdns { continue }
                     for (peer, addr) in peers {
                         // A node announces itself on every interface it holds,
                         // so it discovers its own advertisements and would
@@ -738,7 +816,8 @@ async fn run(config: Config) -> Result<()> {
                     let label = match &parsed {
                         Message::Heartbeat { label }
                         | Message::Departing { label }
-                        | Message::Checkpoint { label, .. } => label.clone(),
+                        | Message::Checkpoint { label, .. }
+                        | Message::Observed { label, .. } => label.clone(),
                     };
                     let known = members.contains_key(&source);
                     if !known && !matches!(parsed, Message::Departing { .. }) {
@@ -788,6 +867,35 @@ async fn run(config: Config) -> Result<()> {
                             }
                         }
 
+                        Message::Observed { peer, addr, .. } => {
+                            if peer == me {
+                                // Hearing ourselves described is how a node
+                                // behind translation learns its own address —
+                                // there is no other way to find out, and no
+                                // server was asked.
+                                if my_address.as_ref() != Some(&addr) {
+                                    emit(&config, "my-address",
+                                         &format!("{label} sees this node at {addr}"),
+                                         &[("addr", &addr.to_string()),
+                                           ("observed_by", &label)]);
+                                    my_address = Some(addr);
+                                }
+                                continue;
+                            }
+                            if swarm.is_connected(&peer) || pending.contains(&addr) {
+                                continue;
+                            }
+                            emit(&config, "learned-peer",
+                                 &format!("{label} says {peer} is at {addr}"),
+                                 &[("peer_id", &peer.to_string()), ("addr", &addr.to_string()),
+                                   ("from", &label)]);
+                            // Dial immediately as well as adding to the retry
+                            // list. Everyone who heard this is dialling now,
+                            // and arriving together is the entire point.
+                            let _ = swarm.dial(addr.clone());
+                            pending.push(addr);
+                        }
+
                         Message::Checkpoint { tick, state, .. } => {
                             let Some(w) = work.as_mut() else { continue };
                             // A checkpoint is also how a node learns who is
@@ -818,6 +926,9 @@ async fn run(config: Config) -> Result<()> {
                         if let Some(member) = members.get_mut(&peer_id) {
                             member.disconnected = true;
                         }
+                        // Stop telling others where to find a peer we can no
+                        // longer find ourselves.
+                        seen_at.remove(&peer_id);
                     }
                 }
 

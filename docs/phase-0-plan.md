@@ -445,6 +445,35 @@ event=all-reached
 
 **A bug worth recording, because the wrong version looked right.** A reached peer was first matched against the address the connection *ended up* on. A peer dialled at one address commonly answers from another — a different interface, or the public address its translation assigned — so the entry was never cleared and the peer stayed on the dial list for the rest of the run, retried forever. It is now matched against the address that was *asked for*. The mistake was invisible on a single host, where broadcast discovery reached the peer by another route first and disguised the symptom as something else entirely.
 
+## The mesh is its own rendezvous — 2026-08-22
+
+**Nobody advertises themselves. Everyone reports what they observe of others.**
+
+A node behind address translation cannot know its own address; only the peer receiving its packets can see where they came from. So when a connection is established, the receiving node announces *"I can see this peer at X"* to the whole mesh, and a node learns where it lives by hearing itself described.
+
+Three things fall out of one message.
+
+**Simultaneous dialling, without a coordinator.** The announcement reaches every member at once, and every member dials the newcomer immediately while the newcomer dials back. Two machines neither of which can be called only ever meet by both sending outward at the same moment, and the thing that makes the moment shared is the gossip layer they were already running. **§11.6 can refuse rented infrastructure without refusing what it would have provided.**
+
+**Transitive discovery.** A newcomer needs one address, not a roster. Verified with three nodes and local discovery switched off, where the third knew only the first's address:
+
+```
+gamma is connected to: 2 peers
+gamma discovered its own address: /ip4/…/udp/4203/quic-v1  (seen by beta)
+```
+
+Gamma never learned beta's address at all. Beta heard gamma announced and dialled *it* — the mesh reached out rather than waiting to be found.
+
+**Self-address discovery with no server.** The last STUN dependency in the node is gone. STUN remains in the probe, which is a diagnostic and allowed one; the node itself asks nobody.
+
+**Local discovery is now optional** (`--no-mdns`) and the node is tested without it, because many machines disable it and a node that depends on it has one route to a peer that an operator may have deliberately closed.
+
+### Two costs, accepted deliberately
+
+**A burst.** Every member dialling one newcomer at once is a thundering herd. At the district scale §5.7 describes it is nothing; in the thousands it would need to be a subset — the best-connected members rather than everyone.
+
+**Addresses become known city-wide.** A citizen's address would be known to every member rather than only to those they actually talk to. Any peer-to-peer system reveals an address to whoever you connect to, so this widens an existing exposure rather than creating one — but it is a real widening, and it sits a little awkwardly beside §5.7's decision that people are not searchable. Recorded as a deliberate choice rather than an inherited one.
+
 ## Volunteer machines and remote management
 
 Volunteers are not technically inclined. Machines are prepared centrally — Ubuntu 26.04, Rust and dependencies preinstalled — and shipped ready to plug in.
