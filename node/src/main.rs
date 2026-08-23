@@ -565,6 +565,11 @@ async fn run(config: Config) -> Result<()> {
     // other side happened to already be listening — and neither side can be
     // listening in any useful sense while behind address translation.
     let mut pending: Vec<Multiaddr> = config.dial.clone();
+    // Which address reached which peer, so that losing the peer puts the
+    // address back on the list. Without this a node dials until it succeeds
+    // once and then never again: the first disconnection is permanent, and no
+    // amount of waiting fixes it because nothing is trying.
+    let mut reached_by: HashMap<PeerId, Vec<Multiaddr>> = HashMap::new();
     let mut dial_attempts: u32 = 0;
     let mut dial_retry = tokio::time::interval(DIAL_RETRY);
     // Where this node can currently see each peer. Observed, never claimed:
@@ -795,6 +800,15 @@ async fn run(config: Config) -> Result<()> {
                     let before = pending.len();
                     if let libp2p::core::ConnectedPoint::Dialer { address, .. } = &endpoint {
                         pending.retain(|addr| addr != address);
+                        // Remembered so it can be dialled again later. A peer
+                        // reached once is a peer worth trying to reach again,
+                        // and a configured address is the most reliable thing a
+                        // node has — it does not go stale the way an observed
+                        // one does.
+                        let known = reached_by.entry(peer_id).or_default();
+                        if !known.contains(address) {
+                            known.push(address.clone());
+                        }
                     }
                     emit(&config, "connected",
                          &format!("reached {peer_id} at {reached}"),
@@ -999,6 +1013,28 @@ async fn run(config: Config) -> Result<()> {
                         // Stop telling others where to find a peer we can no
                         // longer find ourselves.
                         seen_at.remove(&peer_id);
+
+                        // And start trying to reach it again. A connection
+                        // ending is the ordinary case — a laptop sleeps, a
+                        // hotspot cycles, a router reboots — and a mesh that
+                        // treats it as final is a mesh that quietly shrinks by
+                        // one every time anything happens.
+                        if let Some(addresses) = reached_by.get(&peer_id) {
+                            let mut resumed = 0;
+                            for addr in addresses {
+                                if !pending.contains(addr) {
+                                    pending.push(addr.clone());
+                                    resumed += 1;
+                                }
+                            }
+                            if resumed > 0 {
+                                dial_attempts = 0;
+                                emit(&config, "redialling",
+                                     &format!("lost a peer; trying its {resumed} known address(es) again"),
+                                     &[("peer_id", &peer_id.to_string()),
+                                       ("addresses", &resumed.to_string())]);
+                            }
+                        }
                     }
                 }
 
