@@ -54,6 +54,7 @@ fn main() {
     let mut mapping_lifetime = false;
     let mut idle: Option<u64> = None;
     let mut punch_mode = false;
+    let mut map_port_mode = false;
     let mut punch_peer: Option<SocketAddr> = None;
     let mut local_port: u16 = 0;
     let mut args = env::args().skip(1);
@@ -64,6 +65,7 @@ fn main() {
             "--label" => label = args.next().unwrap_or_else(|| "unlabelled".to_string()),
             "--mapping-lifetime" => mapping_lifetime = true,
             "--punch" => punch_mode = true,
+            "--map-port" => map_port_mode = true,
             "--port" => {
                 local_port = args
                     .next()
@@ -97,6 +99,14 @@ fn main() {
                 std::process::exit(2);
             }
         }
+    }
+
+    if map_port_mode {
+        if let Err(error) = map_port(if local_port != 0 { local_port } else { 4001 }) {
+            eprintln!("could not ask the router: {error}");
+            std::process::exit(1);
+        }
+        return;
     }
 
     if punch_mode {
@@ -150,6 +160,9 @@ fn print_usage() {
     println!("  --punch          try to reach another machine directly, with nothing in");
     println!("                   the middle. Run it on both machines at once.");
     println!("  --peer <addr>    the other machine's address, if you already have it");
+    println!("  --map-port       ask the router to forward a port to this machine, so it");
+    println!("                   can be reached without being introduced. Use --port to");
+    println!("                   choose which (default 4001)");
     println!("  --port <n>       bind this local port instead of letting the system choose.");
     println!("                   Tests whether this router gives the same external address");
     println!("                   every time, which decides whether peers can be remembered.");
@@ -834,6 +847,137 @@ fn mapping_json(label: &str, test: &MappingTest) -> String {
         json_string(test.outcome.tag()),
         note
     )
+}
+
+// ------------------------------------------------------- asking the router
+
+/// The port routers listen on for mapping requests.
+const NAT_PMP_PORT: u16 = 5351;
+
+/// How long a mapping is requested for, in seconds.
+const MAPPING_LIFETIME: u32 = 3600;
+
+/// Asks the router to forward a port to this machine.
+///
+/// Hole punching only works when both sides already know where the other is,
+/// which needs an introducer, which needs somebody reachable. A forwarded port
+/// is how somebody becomes reachable without one — and a router that will open
+/// a port on request means no person has to be talked through an admin page.
+///
+/// Speaks NAT-PMP, which most consumer routers implement, often under a setting
+/// called UPnP. A refusal is a real answer rather than a failure: it means this
+/// machine cannot make itself reachable and must be introduced by someone else.
+fn map_port(port: u16) -> io::Result<()> {
+    let gateway = default_gateway()?;
+    println!("Machine Elves — asking the router for a port");
+    println!("============================================");
+    println!();
+    println!("  router: {gateway}");
+    println!();
+
+    let socket = UdpSocket::bind("0.0.0.0:0")?;
+    socket.set_read_timeout(Some(Duration::from_secs(2)))?;
+    let router = SocketAddr::from((gateway, NAT_PMP_PORT));
+
+    // First ask what address the router holds. A router that answers this at
+    // all is one that speaks the protocol, which is worth knowing separately
+    // from whether it will agree to the mapping.
+    let mut reply = [0u8; 32];
+    let external = match ask(&socket, router, &[0, 0], &mut reply) {
+        Ok(len) if len >= 12 && reply[1] == 128 && reply[2] == 0 && reply[3] == 0 => {
+            let ip = Ipv4Addr::new(reply[8], reply[9], reply[10], reply[11]);
+            println!("  the router says its public address is {ip}");
+            Some(ip)
+        }
+        Ok(len) if len >= 4 => {
+            println!("  the router answered but refused: result code {}", 
+                     u16::from_be_bytes([reply[2], reply[3]]));
+            None
+        }
+        _ => {
+            println!("  no answer. This router does not speak NAT-PMP, or has it");
+            println!("  switched off — often shown in its settings as UPnP.");
+            println!();
+            println!("PORTMAP v0.1 | supported=no");
+            return Ok(());
+        }
+    };
+
+    // Then ask for the mapping itself. Requesting the same external port as the
+    // internal one keeps the address predictable, which is what lets a peer
+    // remember it; the router may assign a different one anyway, and says so.
+    let mut request = vec![0u8, 1]; // version 0, map UDP
+    request.extend_from_slice(&[0, 0]); // reserved
+    request.extend_from_slice(&port.to_be_bytes()); // internal
+    request.extend_from_slice(&port.to_be_bytes()); // suggested external
+    request.extend_from_slice(&MAPPING_LIFETIME.to_be_bytes());
+
+    match ask(&socket, router, &request, &mut reply) {
+        Ok(len) if len >= 16 && reply[1] == 129 => {
+            let result = u16::from_be_bytes([reply[2], reply[3]]);
+            if result != 0 {
+                println!("  the router refused to open {port}: result code {result}");
+                println!();
+                println!("PORTMAP v0.1 | supported=yes | mapped=no | code={result}");
+                return Ok(());
+            }
+            let assigned = u16::from_be_bytes([reply[10], reply[11]]);
+            let lifetime = u32::from_be_bytes([reply[12], reply[13], reply[14], reply[15]]);
+            println!("  the router opened port {assigned} for {lifetime}s");
+            println!();
+            if assigned == port {
+                println!("  This machine is now reachable from the internet, at the same port");
+                println!("  it asked for — so its address is predictable and can be remembered.");
+            } else {
+                println!("  Reachable, but at {assigned} rather than the {port} requested, so the");
+                println!("  address has to be learned rather than assumed.");
+            }
+            if let Some(ip) = external {
+                println!();
+                println!("  Peers should be told:  {ip}:{assigned}");
+            }
+            println!();
+            println!("PORTMAP v0.1 | supported=yes | mapped=yes | external={assigned}");
+        }
+        _ => {
+            println!("  the router answered the first question and not the second,");
+            println!("  which usually means mapping is disabled rather than absent.");
+            println!();
+            println!("PORTMAP v0.1 | supported=yes | mapped=no");
+        }
+    }
+    Ok(())
+}
+
+fn ask(socket: &UdpSocket, router: SocketAddr, request: &[u8], reply: &mut [u8]) -> io::Result<usize> {
+    for _ in 0..3 {
+        socket.send_to(request, router)?;
+        if let Ok((len, from)) = socket.recv_from(reply) {
+            if from.ip() == router.ip() {
+                return Ok(len);
+            }
+        }
+    }
+    Err(io::Error::new(ErrorKind::TimedOut, "no reply from the router"))
+}
+
+/// The router this machine sends through, read from the kernel's routing table.
+fn default_gateway() -> io::Result<Ipv4Addr> {
+    let routes = std::fs::read_to_string("/proc/net/route")?;
+    for line in routes.lines().skip(1) {
+        let mut fields = line.split_whitespace();
+        let (_iface, destination, gateway) = (fields.next(), fields.next(), fields.next());
+        // The default route is the one whose destination is 0.0.0.0.
+        if destination == Some("00000000") {
+            if let Some(hex) = gateway {
+                if let Ok(raw) = u32::from_str_radix(hex, 16) {
+                    // The kernel writes these little-endian.
+                    return Ok(Ipv4Addr::from(raw.swap_bytes()));
+                }
+            }
+        }
+    }
+    Err(io::Error::other("no default route found"))
 }
 
 // ----------------------------------------------------------- hole punching
