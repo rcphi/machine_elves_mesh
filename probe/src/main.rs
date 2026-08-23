@@ -53,6 +53,8 @@ fn main() {
     let mut label = String::from("unlabelled");
     let mut mapping_lifetime = false;
     let mut idle: Option<u64> = None;
+    let mut punch_mode = false;
+    let mut punch_peer: Option<SocketAddr> = None;
     let mut args = env::args().skip(1);
 
     while let Some(arg) = args.next() {
@@ -60,6 +62,14 @@ fn main() {
             "--json" => json = true,
             "--label" => label = args.next().unwrap_or_else(|| "unlabelled".to_string()),
             "--mapping-lifetime" => mapping_lifetime = true,
+            "--punch" => punch_mode = true,
+            "--peer" => {
+                punch_peer = args.next().and_then(|v| v.parse().ok());
+                if punch_peer.is_none() {
+                    eprintln!("--peer needs an address:port");
+                    std::process::exit(2);
+                }
+            }
             "--idle" => {
                 idle = args.next().and_then(|v| v.parse().ok());
                 if idle.is_none() {
@@ -77,6 +87,14 @@ fn main() {
                 std::process::exit(2);
             }
         }
+    }
+
+    if punch_mode {
+        if let Err(error) = punch(punch_peer, idle.unwrap_or(60)) {
+            eprintln!("punch failed: {error}");
+            std::process::exit(1);
+        }
+        return;
     }
 
     if mapping_lifetime {
@@ -117,7 +135,11 @@ fn print_usage() {
     println!("  --mapping-lifetime");
     println!("                   measure whether this router still remembers an idle");
     println!("                   connection after a while. Takes as long as it waits.");
-    println!("  --idle <seconds> force one idle interval instead of choosing at random");
+    println!("  --idle <seconds> force one idle interval instead of choosing at random;");
+    println!("                   with --punch, how long to keep trying (default 60)");
+    println!("  --punch          try to reach another machine directly, with nothing in");
+    println!("                   the middle. Run it on both machines at once.");
+    println!("  --peer <addr>    the other machine's address, if you already have it");
     println!("  --help           show this");
 }
 
@@ -781,6 +803,178 @@ fn mapping_json(label: &str, test: &MappingTest) -> String {
         json_string(test.outcome.tag()),
         note
     )
+}
+
+// ----------------------------------------------------------- hole punching
+
+/// How often each side sends while trying to meet.
+const PUNCH_EVERY: Duration = Duration::from_millis(250);
+
+/// How often the mapping is refreshed while waiting for the other address.
+///
+/// Comfortably under the shortest measured idle timeout, so that a mapping
+/// learned now is still the mapping in use when the peer's address finally
+/// arrives — which may be minutes later, since a person is copying it by hand.
+const REFRESH_EVERY: Duration = Duration::from_secs(20);
+
+const PUNCH_HELLO: &[u8] = b"MACHINE-ELVES-PUNCH";
+const PUNCH_REPLY: &[u8] = b"MACHINE-ELVES-PONG";
+
+/// Tries to reach another machine directly, with no server in the middle.
+///
+/// Both sides sit behind address translation, so neither can be dialled. The
+/// only thing that opens a path is both of them sending outward at once: each
+/// outbound packet creates a mapping, and with luck the other side's packet
+/// arrives while that mapping is open.
+///
+/// **What this actually measures is filtering, not mapping.** The connectivity
+/// probe reports which external port a router assigns; this reports whether the
+/// router will admit a packet from someone it has not been introduced to. Those
+/// are separate behaviours (RFC 4787 treats them separately) and only the
+/// second decides whether two ordinary home connections can meet.
+///
+/// The socket is created once and never replaced. Mapping is per-socket, so
+/// learning an address on one socket and sending from another would report an
+/// address nothing is listening on.
+fn punch(peer: Option<SocketAddr>, seconds: u64) -> io::Result<()> {
+    let socket = UdpSocket::bind(Family::V4.wildcard())?;
+    socket.set_read_timeout(Some(Duration::from_millis(120)))?;
+
+    let server = STUN_SERVERS
+        .iter()
+        .find_map(|s| resolve(s, Family::V4))
+        .ok_or_else(|| io::Error::other("no STUN server resolved"))?;
+
+    let mut mapped = stun_binding(&socket, server)?;
+    println!("Machine Elves — hole punch");
+    println!("==========================");
+    println!();
+    println!("  This machine is reachable at:  {mapped}");
+    println!();
+
+    let peer = match peer {
+        Some(peer) => peer,
+        None => {
+            println!("  Send that to the other machine, and paste theirs here.");
+            println!("  The mapping is refreshed while you wait, so take your time.");
+            println!();
+            print!("  their address: ");
+            let _ = io::Write::flush(&mut io::stdout());
+
+            let (tx, rx) = std::sync::mpsc::channel();
+            std::thread::spawn(move || {
+                let mut line = String::new();
+                if std::io::BufRead::read_line(&mut io::stdin().lock(), &mut line).is_ok() {
+                    let _ = tx.send(line);
+                }
+            });
+
+            let mut refreshed = SystemTime::now();
+            loop {
+                if let Ok(line) = rx.try_recv() {
+                    match line.trim().parse::<SocketAddr>() {
+                        Ok(peer) => break peer,
+                        Err(_) => return Err(io::Error::other("that is not an address:port")),
+                    }
+                }
+                if refreshed.elapsed().unwrap_or_default() >= REFRESH_EVERY {
+                    refreshed = SystemTime::now();
+                    if let Ok(now) = stun_binding(&socket, server) {
+                        // A changed port means the wait outlasted the mapping and
+                        // whatever was sent to the other side is now wrong.
+                        if now != mapped {
+                            println!();
+                            println!("  !! the address changed to {now} — send them this one instead");
+                            print!("  their address: ");
+                            let _ = io::Write::flush(&mut io::stdout());
+                            mapped = now;
+                        }
+                    }
+                }
+                std::thread::sleep(Duration::from_millis(200));
+            }
+        }
+    };
+
+    println!();
+    println!("  Trying to reach {peer} for {seconds}s.");
+    println!("  Start the other side too — neither can get in alone.");
+    println!();
+
+    let started = SystemTime::now();
+    let deadline = Duration::from_secs(seconds);
+    let mut last_sent = SystemTime::UNIX_EPOCH;
+    let mut heard_from_them: Option<Duration> = None;
+    let mut they_heard_us: Option<Duration> = None;
+    let mut buf = [0u8; 256];
+
+    while started.elapsed().unwrap_or_default() < deadline {
+        if last_sent.elapsed().unwrap_or(Duration::MAX) >= PUNCH_EVERY {
+            last_sent = SystemTime::now();
+            let _ = socket.send_to(PUNCH_HELLO, peer);
+        }
+
+        match socket.recv_from(&mut buf) {
+            Ok((len, from)) => {
+                // The port may differ from the one we were given: the other
+                // side's router can assign a different one than it reported.
+                // The address is what identifies them.
+                if from.ip() != peer.ip() {
+                    continue;
+                }
+                let elapsed = started.elapsed().unwrap_or_default();
+                if buf[..len].starts_with(PUNCH_HELLO) {
+                    if heard_from_them.is_none() {
+                        println!("  <- their packet arrived from {from} after {:.1}s", elapsed.as_secs_f64());
+                        heard_from_them = Some(elapsed);
+                    }
+                    let _ = socket.send_to(PUNCH_REPLY, from);
+                } else if buf[..len].starts_with(PUNCH_REPLY) && they_heard_us.is_none() {
+                    println!("  -> they answered ours after {:.1}s", elapsed.as_secs_f64());
+                    they_heard_us = Some(elapsed);
+                }
+            }
+            Err(e) if e.kind() == ErrorKind::WouldBlock || e.kind() == ErrorKind::TimedOut => {}
+            Err(e) => return Err(e),
+        }
+
+        if heard_from_them.is_some() && they_heard_us.is_some() {
+            break;
+        }
+    }
+
+    println!();
+    let verdict = match (heard_from_them, they_heard_us) {
+        (Some(_), Some(_)) => {
+            println!("  BOTH DIRECTIONS WORK. Two machines behind address translation reached");
+            println!("  each other with nothing in the middle. This is the result Phase 0");
+            println!("  was built to find.");
+            "two-way"
+        }
+        (Some(_), None) => {
+            println!("  Their packets reach us; ours do not reach them. Their router is the");
+            println!("  stricter of the two — a path exists, but only one way, so a peer");
+            println!("  connection would need help from somewhere.");
+            "inbound-only"
+        }
+        (None, Some(_)) => {
+            println!("  Ours reach them; theirs do not reach us. This router is the stricter");
+            println!("  one. A path exists, but only one way.");
+            "outbound-only"
+        }
+        (None, None) => {
+            println!("  Nothing got through in either direction.");
+            println!();
+            println!("  Either the two sides did not overlap in time, or at least one router");
+            println!("  refuses packets from anyone it was not introduced to. Try again with");
+            println!("  both sides started together before concluding the second.");
+            "no-contact"
+        }
+    };
+
+    println!();
+    println!("PUNCH v0.1 | me={mapped} | peer={peer} | result={verdict}");
+    Ok(())
 }
 
 // ------------------------------------------------------------ machine output
