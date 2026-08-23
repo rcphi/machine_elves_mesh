@@ -555,6 +555,34 @@ That is the same asymmetry as everything else here — not everyone bridges addr
 
 **The mapping expires in an hour.** The node must renew it, the way it already keeps NAT mappings alive with keepalives. Until it does, a long-running node silently stops being reachable, which is precisely the failure that is hardest to notice.
 
+## Work migrated across two carriers — 2026-08-23
+
+A factory ran on `diamond` (home broadband) for 1,487 ticks, producing 270 batches of widgets. `diamond` was killed outright — no goodbye, no graceful drain. `yoinkerz` (a laptop on a mobile hotspot, behind an unpredictable carrier address, reachable by nobody) noticed the silence, found itself the only survivor, resumed at **tick 1497**, and carried on producing.
+
+**Nothing was lost.** The takeover tick is *past* the last visible effect, because the factory kept ticking after its last widget and checkpointed every one. The gap was the detection window, not lost work.
+
+Everything in this had been tested separately. None of it had been tested with two carriers between the parts:
+
+| | |
+|---|---|
+| Reachability | asked of a consumer router and granted, then held open by renewal |
+| Address discovery | `yoinkerz` learned its own address from `diamond` observing it — no STUN |
+| Job execution | deterministic WebAssembly, metered on CPU and memory |
+| Checkpointing | broadcast on gossip every tick |
+| Failure detection | silence, no announcement, ~3 s |
+| Takeover | decided alone, by a rule every survivor applies identically |
+| Identity of produced things | derived from the job's code and the tick, so continuing is not duplicating |
+
+**No server. No relay. No rented anything.** One machine asked its own router for a door; the other never needed one.
+
+### Phase 0's question, answered
+
+> Can ordinary people's machines, on ordinary home internet connections, form a mesh that genuinely runs each other's work — and keep doing it when machines disappear?
+
+**Yes**, with one condition worth stating precisely: **at least one member must be reachable.** Not everyone. `yoinkerz` is behind a carrier address that changes whenever the connection cycles, cannot be dialled by anyone, and was nonetheless a complete member — it dialled out, was observed, was announced, and took over the work when the reachable machine died.
+
+That condition is met by any member whose router will open a port on request, which consumer routers do, or by anyone with working IPv6. It is not a dependency on infrastructure; it is a property some members have and others need not.
+
 ## Volunteer machines and remote management
 
 Volunteers are not technically inclined. Machines are prepared centrally — Ubuntu 26.04, Rust and dependencies preinstalled — and shipped ready to plug in.
