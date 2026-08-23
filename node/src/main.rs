@@ -771,6 +771,32 @@ async fn run(config: Config) -> Result<()> {
                         .publish(topic.clone(), encode_observed(&config.label, &peer_id, &reached));
                 }
 
+                // Reported because their absence is a diagnosis. A peer that
+                // cannot reach us at all looks exactly like a peer that reaches
+                // us and fails to shake hands, unless the arrival itself is
+                // visible — and the two have nothing to do with each other.
+                SwarmEvent::IncomingConnection { send_back_addr, .. } => {
+                    emit(&config, "incoming", &format!("something is calling from {send_back_addr}"),
+                         &[("from", &send_back_addr.to_string())]);
+                }
+
+                SwarmEvent::IncomingConnectionError { send_back_addr, error, .. } => {
+                    emit(&config, "incoming-failed",
+                         &format!("{send_back_addr} reached us but the connection failed: {error}"),
+                         &[("from", &send_back_addr.to_string()), ("error", &error.to_string())]);
+                }
+
+                SwarmEvent::OutgoingConnectionError { peer_id, error, .. } => {
+                    // Expected constantly while punching, so only the reason is
+                    // kept, and only when it changes what we would conclude.
+                    let reason = error.to_string();
+                    if !reason.contains("Timeout") && !reason.contains("timed out") {
+                        emit(&config, "dial-failed", &reason,
+                             &[("peer", &peer_id.map(|p| p.to_string()).unwrap_or_default()),
+                               ("error", &reason)]);
+                    }
+                }
+
                 SwarmEvent::NewListenAddr { address, .. } => {
                     emit(&config, "listening", &format!("listening on {address}"),
                          &[("addr", &address.to_string())]);

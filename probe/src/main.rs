@@ -893,11 +893,29 @@ fn punch(peer: Option<SocketAddr>, seconds: u64) -> io::Result<()> {
             });
 
             let mut refreshed = SystemTime::now();
+            let mut early = [0u8; 256];
             loop {
                 if let Ok(line) = rx.try_recv() {
                     match line.trim().parse::<SocketAddr>() {
                         Ok(peer) => break peer,
                         Err(_) => return Err(io::Error::other("that is not an address:port")),
+                    }
+                }
+
+                // Listen while waiting. Without this the socket is never read
+                // until an address has been typed, so a packet that did arrive
+                // sits unread in the buffer and the result is indistinguishable
+                // from nothing having arrived at all — which is worse than no
+                // measurement, because it looks like one.
+                if let Ok((len, from)) = socket.recv_from(&mut early) {
+                    if early[..len].starts_with(PUNCH_HELLO) || early[..len].starts_with(PUNCH_REPLY) {
+                        println!();
+                        println!("  <- {from} reached us unprompted, before we had sent them anything.");
+                        println!("     This router admits packets from strangers.");
+                        print!("  their address: ");
+                        let _ = io::Write::flush(&mut io::stdout());
+                        // Answer, so the other side learns it got through.
+                        let _ = socket.send_to(PUNCH_REPLY, from);
                     }
                 }
                 if refreshed.elapsed().unwrap_or_default() >= REFRESH_EVERY {
