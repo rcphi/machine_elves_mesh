@@ -1,15 +1,42 @@
 #!/usr/bin/env python3
-"""What a mesh node did while nobody was watching.
+"""What a mesh node did, most recently by default.
 
-    ./node-summary.py /var/log/mesh-node/events.jsonl
+    ./node-summary.py                  the current run only
+    ./node-summary.py --since 20m      the last twenty minutes
+    ./node-summary.py --all            everything in the log
 
-Reads the events a node emits and reports the things that only show up over
-days: how often it lost its peers, whether its address moved, whether the
-router kept its promise, and what happened to the work.
+The log outlives every restart, so reading all of it mixes together runs that
+had nothing to do with each other. **The current run is the default**, because
+that is nearly always the question being asked, and a summary that silently
+includes yesterday is worse than one that says it is partial.
 """
 import collections
 import json
+import os
 import sys
+import time
+
+DEFAULT_LOG = "/var/log/mesh-node/events.jsonl"
+
+# Moments worth a line of their own: things that happened *to* the node, rather
+# than the steady hum of it working.
+NOTABLE = {
+    "started": "started up",
+    "claimed": "took the job — nobody else was running it",
+    "job-owner": "saw {label} running the job",
+    "yielded": "gave the job to {label}, which was further along",
+    "took-over": "TOOK OVER the job at tick {tick}",
+    "joined": "{label} appeared",
+    "left": "{label} left, announced",
+    "vanished": "{label} VANISHED without warning",
+    "redialling": "lost a peer — trying its address again",
+    "connected": "connected to {addr}",
+    "my-address": "learned its own address: {addr}",
+    "port-mapped": "the router opened {external}",
+    "port-map-failed": "the router refused a mapping",
+    "job-failed": "the job failed",
+    "listen-failed": "could not listen on an address",
+}
 
 
 def load(path):
@@ -26,98 +53,154 @@ def load(path):
     return events
 
 
-def when(event):
-    return event.get("ts_unix_ms", 0)
+def ago(ms, now_ms):
+    seconds = max(0, (now_ms - ms) / 1000)
+    if seconds < 90:
+        return f"{seconds:.0f}s ago"
+    if seconds < 5400:
+        return f"{seconds / 60:.0f}m ago"
+    return f"{seconds / 3600:.1f}h ago"
 
 
-def span(events):
-    if not events:
-        return "no events"
-    first, last = when(events[0]), when(events[-1])
-    hours = (last - first) / 3_600_000
-    return f"{hours:.1f} hours"
+def clock(ms):
+    return time.strftime("%H:%M:%S", time.localtime(ms / 1000))
+
+
+def timeline(events, now_ms):
+    shown = [e for e in events if e.get("event") in NOTABLE]
+    if not shown:
+        print("\nNothing notable happened — the node has been quietly working.")
+        return
+
+    print("\nWhat happened")
+    print("-------------")
+    previous, repeats = None, 0
+    for index, event in enumerate(shown):
+        kind = event.get("event")
+        last = index == len(shown) - 1
+        # A run of the same kind is collapsed. Twenty consecutive connections
+        # would otherwise bury the one line that mattered.
+        if kind == previous and not last:
+            repeats += 1
+            continue
+        if repeats:
+            print(f"              … and {repeats} more like that")
+            repeats = 0
+        previous = kind
+        fields = {k: event.get(k, "?") for k in ("label", "tick", "addr", "external")}
+        try:
+            description = NOTABLE[kind].format(**fields)
+        except (KeyError, IndexError):
+            description = kind
+        ts = event.get("ts_unix_ms", 0)
+        print(f"  {clock(ts)}  {description}  ({ago(ts, now_ms)})")
 
 
 def main():
-    if len(sys.argv) != 2:
-        print(__doc__)
-        return 2
+    args = list(sys.argv[1:])
+    scope, since_minutes, path = "run", None, DEFAULT_LOG
 
-    events = load(sys.argv[1])
-    if not events:
-        print("no events — the node may never have started, which is itself the finding")
+    while args:
+        arg = args.pop(0)
+        if arg == "--all":
+            scope = "all"
+        elif arg == "--since":
+            try:
+                raw = args.pop(0)
+                since_minutes = float(raw.rstrip("mh")) * (60 if raw.endswith("h") else 1)
+                scope = "since"
+            except (IndexError, ValueError):
+                print("--since wants something like 20m or 2h")
+                return 2
+        elif arg in ("--help", "-h"):
+            print(__doc__)
+            return 0
+        else:
+            path = arg
+
+    if not os.path.exists(path):
+        print(f"no log at {path}")
+        print("\nThe node writes there once installed as a service. If it is not")
+        print("running, that is itself the finding:  systemctl status mesh-node")
         return 1
+
+    events = load(path)
+    if not events:
+        print("the log is empty — the node may never have started, which is the finding")
+        return 1
+
+    total = len(events)
+    now_ms = int(time.time() * 1000)
+
+    # The current run is everything since the node last started, which is the
+    # only boundary the log actually marks.
+    if scope == "run":
+        starts = [i for i, e in enumerate(events) if e.get("event") == "started"]
+        if starts:
+            events = events[starts[-1]:]
+    elif scope == "since":
+        cutoff = now_ms - since_minutes * 60_000
+        events = [e for e in events if e.get("ts_unix_ms", 0) >= cutoff]
+
+    if not events:
+        print("nothing in that window")
+        return 0
 
     kinds = collections.Counter(e.get("event") for e in events)
     node = next((e.get("node") for e in events if e.get("node")), "?")
+    # Chosen with branches rather than a lookup: a dict evaluates every value,
+    # including the one describing a window that was never asked for.
+    if scope == "run":
+        window = "this run"
+    elif scope == "all":
+        window = "the whole log"
+    else:
+        window = f"the last {since_minutes:.0f} minutes"
+    began = events[0].get("ts_unix_ms", 0)
 
-    print(f"{node}: {len(events)} events over {span(events)}\n")
-
-    # A restart is not a failure on its own — the service is meant to come back
-    # — but a node restarting often is a different machine from one that has
-    # been up throughout, and the log looks similar either way.
-    starts = kinds.get("started", 0)
-    print(f"  starts            {starts}" + ("" if starts <= 1 else "   RESTARTED — see below"))
+    print(f"{node} — {window}: {len(events)} of {total} events, "
+          f"from {clock(began)} ({ago(began, now_ms)})\n")
 
     print(f"  peers joined      {kinds.get('joined', 0)}")
     print(f"  peers left        {kinds.get('left', 0)} announced, "
           f"{kinds.get('vanished', 0)} vanished without warning")
+    print(f"  redials           {kinds.get('redialling', 0)}")
 
-    # Reachability is the thing most likely to fail quietly. A mapping that
-    # stops being renewed costs nothing visible until nobody can reach this
-    # node, by which time the cause is hours in the past.
-    mapped = kinds.get("port-mapped", 0)
-    failed = kinds.get("port-map-failed", 0)
-    if mapped or failed:
-        print(f"  router mapping    {mapped} accepted, {failed} refused or unanswered")
-        if failed:
-            last = [e for e in events if e.get("event") == "port-map-failed"][-1]
-            print(f"                    last failure: {last.get('error', '?')[:70]}")
+    mapped, refused = kinds.get("port-mapped", 0), kinds.get("port-map-failed", 0)
+    if mapped or refused:
+        print(f"  router mapping    {mapped} accepted, {refused} refused")
+        if refused and not mapped:
+            print("                    (expected on a mobile connection — there is no")
+            print("                     home router there to open anything)")
     else:
-        print("  router mapping    never asked (or --no-map-port)")
+        print("  router mapping    not asked yet")
 
-    # An address that changes is a cached address that has gone stale, and every
-    # peer holding the old one is now dialling nothing.
     addresses = [e.get("addr") for e in events if e.get("event") == "my-address"]
     distinct = list(dict.fromkeys(addresses))
     if not addresses:
-        print("  own address       never learned — no peer ever observed this node")
+        print("  own address       not learned yet — no peer has observed this node")
     elif len(distinct) == 1:
-        print(f"  own address       {distinct[0]} — unchanged")
+        print(f"  own address       {distinct[0]}")
     else:
-        print(f"  own address       CHANGED {len(distinct) - 1}x")
-        for addr in distinct[-3:]:
-            print(f"                      {addr}")
+        print(f"  own address       moved {len(distinct) - 1}x, now {distinct[-1]}")
 
-    took = kinds.get("took-over", 0)
-    if took or kinds.get("job-loaded"):
+    if kinds.get("job-loaded") or kinds.get("effect"):
         print(f"  work              {kinds.get('effect', 0)} effects, "
-              f"{kinds.get('produced', 0)} productions, {took} takeovers")
+              f"{kinds.get('produced', 0)} productions")
+        print(f"  job ownership     {kinds.get('claimed', 0)} claimed, "
+              f"{kinds.get('took-over', 0)} taken over, {kinds.get('yielded', 0)} yielded")
         if kinds.get("job-failed"):
-            print(f"                    {kinds['job-failed']} job failures")
+            print(f"                    {kinds['job-failed']} FAILURES")
 
-    if starts > 1:
-        print("\nRestarts")
-        print("--------")
-        gaps = []
-        previous = None
-        for event in events:
-            if event.get("event") == "started":
-                if previous is not None:
-                    gaps.append((when(event) - previous) / 60000)
-                previous = when(event)
-        for i, minutes in enumerate(gaps, 2):
-            print(f"  start {i} came {minutes:.0f} minutes after the previous one")
-        if gaps and min(gaps) < 5:
-            print("\n  Restarting within minutes means it is failing rather than being")
-            print("  restarted. Check the events just before each 'started'.")
+    timeline(events, now_ms)
 
-    unreached = kinds.get("dialling", 0)
-    if unreached and not kinds.get("connected"):
-        print("\n  This node dialled and never connected to anything. Either no peer was")
-        print("  reachable, or the addresses it was given are stale — an address behind")
-        print("  a carrier is only good until that connection cycles.")
+    if scope == "run" and total > len(events):
+        print(f"\n  {total - len(events)} earlier events are in the log. --all to see them.")
 
+    if kinds.get("dialling") and not kinds.get("connected"):
+        print("\n  Dialled and never connected. Either no peer was reachable, or the")
+        print("  address given is stale — one behind a carrier is only good until")
+        print("  that connection cycles.")
     return 0
 
 

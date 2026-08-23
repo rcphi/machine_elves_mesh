@@ -118,15 +118,26 @@ setup; `systemctl restart mesh-node` picks them up. Local discovery is off by
 default and asking the router for a port is on, since a mesh with nobody
 reachable cannot admit anyone it is not already connected to.
 
-Read what it did with:
+Two ways to read it:
 
 ```
-./node-summary.py /var/log/mesh-node/events.jsonl
+sudo ./node-summary.py             # what happened, this run
+sudo ./node-watch.sh               # what is happening, live
 ```
 
-That reports the things only visible over days — how often peers were lost,
-whether this node's own address moved, whether the router kept renewing its
-promise, and what became of the work.
+**The summary shows the current run by default**, meaning everything since the
+node last started. The log outlives every restart, so reading all of it mixes
+together runs that had nothing to do with each other — and a summary that
+silently includes yesterday is worse than one that says it is partial. Use
+`--since 20m` or `--all` to widen it.
+
+**There is no need to clear logs.** Restarting the service writes a `started`
+event, which is the boundary the summary uses, so `systemctl restart mesh-node`
+gives a clean view without losing the history.
+
+Both report the same events; the summary counts them and the watcher narrates
+them as they arrive. The watcher is for the minutes when something is being
+deliberately broken and the question is what the node makes of it.
 
 ## Collecting results
 
