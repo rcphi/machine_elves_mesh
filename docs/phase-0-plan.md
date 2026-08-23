@@ -381,6 +381,28 @@ local 41999 -> 204.210.210.200:41999
 
 **Prefer remembering peers that are reachable.** A peer with a public address or working IPv6 is worth far more in a cache than one behind translation, because it can be reached without arranging anything. §11.6 already counts that as a contribution.
 
+### Measured on both machines — 2026-08-22
+
+| | `diamond` (home broadband) | laptop (mobile hotspot) |
+|---|---|---|
+| Same local port each run | 41999 | 41999 |
+| External address | `…:41999`, unchanged across readings | IP unchanged, **port different every reading** |
+| Cacheable over IPv4 | **yes** | **no** |
+
+The home router preserves the port outright: bind 41999, be reachable at 41999, every time. The carrier does not — it hands out a fresh external port whenever a mapping is created, which happens on every restart and after every idle expiry, and those come every few minutes.
+
+**Only the port moves; the IP holds.** That is not enough to cache an address, since an address is both, but it does mean a mobile peer is not *unrecognisable* — merely undiallable.
+
+### The asymmetry that makes this work
+
+A cache does not have to contain everyone.
+
+**You only need to remember peers you can dial. Peers who cannot be dialled remember you instead.**
+
+A mobile peer keeps a cache of stable ones — `diamond`, or anything with global IPv6 — and dials them on startup. It is never found; it finds. Nothing is lost, because a peer that must always initiate is still a full member the moment it does: connections carry traffic both ways once open, which the two-machine test already demonstrated when a node behind translation participated fully while being unreachable itself.
+
+What this does require is that **a city always contains some peers worth remembering.** A city of nothing but mobile connections has no stable address anywhere in it, and no member could rejoin after everyone went offline at once — which is §9.5's cold shard problem arriving by a different road. Another reason the health measures to watch are how many members can be reached and how many can bridge, rather than how many there are.
+
 ## Address families, and the peers that bridge them — 2026-08-22
 
 **IPv4 and IPv6 hosts cannot address each other at all.** Not slowly, not partially — an IPv4-only machine has no way to write down an IPv6 destination. Two peers with no family in common have no path.
