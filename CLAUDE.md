@@ -67,9 +67,10 @@ Available: 3 home connections. No VPSs, by decision.
   and was enough for the node before wasmtime; it is not enough now.
 - Wasmtime for sandboxing (Rust-native, provides the fuel metering §11.4 needs);
   libp2p for §11.6's overlay and gossip.
-- **A node never compiles anything.** Jobs arrive as compiled `.wasm`. The
-  toolchain is only needed on machines that author jobs, which real volunteer
-  machines are not. Build jobs with `jobs/build.sh` and copy the output.
+- **A node never compiles anything.** Jobs arrive as compiled `.wasm`, and both
+  binaries build fully static, so a volunteer machine needs no toolchain and no
+  matching libraries. `./release.sh` produces everything; `setup.sh --dist`
+  installs it. Static builds need `musl-tools` on the *build* machine.
 - Tests accompany behaviour. `cargo test` before claiming anything works.
 - Commit messages carry the *reasoning*, not just the change — much of this
   project's thinking lives there.

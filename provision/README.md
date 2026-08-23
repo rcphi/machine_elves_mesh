@@ -29,10 +29,11 @@ anything — a box quietly running a truncated copy would produce measurements
 nobody could explain. It also records which build is installed, so a puzzling
 result can be traced to a specific commit.
 
-The probe is built fully static, so it does not care what libraries the target
-machine has. The node currently is not: wasmtime and libp2p pull in C libraries
-that do not build against musl, so it needs a machine resembling the build host.
-`dist/VERSION` says which is which.
+Both binaries build fully static, so neither cares what libraries the target
+machine has. This needs `musl-tools` on the build machine — some dependencies
+compile C, and without a C compiler targeting musl the build fails in a way
+that looks like the dependency not supporting musl at all. `dist/VERSION`
+records which target each binary was actually built for.
 
 Compiling on the box still works — omit `--dist` — but it is the development
 path, not the deployment one.

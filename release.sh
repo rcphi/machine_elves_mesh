@@ -28,6 +28,13 @@ build() {
     local crate="$1" binary="$2" target="" built=""
 
     if rustup target list --installed 2>/dev/null | grep -qx "$STATIC_TARGET"; then
+        # Some dependencies compile C — the crypto under the transport layer
+        # does — and need a C compiler targeting musl rather than this system.
+        # Without it the build fails in a way that looks like the dependency
+        # not supporting musl at all, which is what it was mistaken for.
+        if command -v musl-gcc >/dev/null; then
+            export CC_x86_64_unknown_linux_musl=musl-gcc
+        fi
         if ( cd "$ROOT/$crate" && cargo build --release --quiet --target "$STATIC_TARGET" 2>/dev/null ); then
             target="$STATIC_TARGET"
             built="$ROOT/$crate/target/$STATIC_TARGET/release/$binary"
@@ -35,10 +42,10 @@ build() {
     fi
 
     if [[ -z "$target" ]]; then
-        # Not every dependency builds against musl. Falling back is better than
-        # failing, as long as the manifest says which one this is — a
-        # dynamically linked binary needs a matching machine.
+        # Falling back is better than failing, as long as the manifest says
+        # which this is — a dynamically linked binary needs a matching machine.
         echo "  $binary: static build unavailable, linking against this system"
+        command -v musl-gcc >/dev/null || echo "    (install musl-tools and it will probably succeed)"
         ( cd "$ROOT/$crate" && cargo build --release --quiet )
         target="$(rustc -vV | awk '/^host:/ {print $2}')"
         built="$ROOT/$crate/target/release/$binary"
