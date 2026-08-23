@@ -249,6 +249,14 @@ struct Config {
     /// another completely.
     mesh: String,
     port: u16,
+    /// Where this node's identity is kept between runs.
+    ///
+    /// §8.1 makes identity a persistent keypair, and it was being generated
+    /// fresh every start — so a node returning from a restart was a stranger
+    /// who happened to be at a familiar address. Nothing could recognise it,
+    /// no peer could remember it, and a cache of peers was a cache of
+    /// identities that would never appear again.
+    identity: String,
     /// Whether to ask the router to forward this node's port.
     ///
     /// On by default. A mesh where nobody is reachable cannot admit anyone it
@@ -365,6 +373,7 @@ fn parse_args() -> Result<Config> {
         keepalive: Duration::from_millis(DEFAULT_KEEPALIVE_MS),
         mesh: "default".to_string(),
         port: DEFAULT_PORT,
+        identity: "/var/lib/mesh-node/identity".to_string(),
         map_port: true,
         mdns: true,
         own: false,
@@ -393,6 +402,7 @@ fn parse_args() -> Result<Config> {
             "--job" => config.job = Some(args.next().context("--job needs a path")?),
             "--mesh" => config.mesh = args.next().context("--mesh needs a name")?,
             "--port" => config.port = args.next().context("--port needs a number")?.parse()?,
+            "--identity" => config.identity = args.next().context("--identity needs a path")?,
             "--keepalive-ms" => {
                 config.keepalive = Duration::from_millis(
                     args.next().context("--keepalive-ms needs a number")?.parse()?,
@@ -508,6 +518,9 @@ fn print_usage() {
     println!("  --no-mdns            do not use local-network discovery. Peers are then");
     println!("                       found only by address, which is how they are found");
     println!("                       across the internet in any case");
+    println!("  --identity <file>    where to keep this node's identity, so it is the");
+    println!("                       same node after a restart (default");
+    println!("                       /var/lib/mesh-node/identity)");
     println!("  --mesh <name>        which mesh to join (default \"default\"). Nodes in");
     println!("                       different meshes ignore each other entirely");
     println!("  --job <file.wasm>    hold this job, ready to run or to continue it");
@@ -522,8 +535,72 @@ fn hostname() -> String {
         .unwrap_or_else(|_| "unlabelled".to_string())
 }
 
+/// The keypair that makes this node the same node it was yesterday.
+///
+/// Written on first use and read thereafter. A node whose identity file cannot
+/// be written still runs — it simply cannot be recognised across a restart,
+/// which is worth continuing for and worth saying out loud.
+fn load_or_create_identity(config: &Config) -> Result<libp2p::identity::Keypair> {
+    use libp2p::identity::Keypair;
+    let path = std::path::Path::new(&config.identity);
+
+    if let Ok(bytes) = std::fs::read(path) {
+        match Keypair::from_protobuf_encoding(&bytes) {
+            Ok(keypair) => {
+                emit(config, "identity-loaded",
+                     &format!("this node is {} again", keypair.public().to_peer_id()),
+                     &[("peer_id", &keypair.public().to_peer_id().to_string()),
+                       ("path", &config.identity)]);
+                return Ok(keypair);
+            }
+            // A corrupt file is not a reason to refuse to start, but replacing
+            // it silently would change who this node is without saying so.
+            Err(error) => {
+                emit(config, "identity-unreadable",
+                     &format!("{} could not be read ({error}) — making a new identity, \
+                               and every peer that remembered this node will not know it",
+                              config.identity),
+                     &[("path", &config.identity), ("error", &error.to_string())]);
+            }
+        }
+    }
+
+    let keypair = Keypair::generate_ed25519();
+    let encoded = keypair
+        .to_protobuf_encoding()
+        .map_err(|e| anyhow::anyhow!("{e}"))?;
+
+    if let Some(parent) = path.parent() {
+        let _ = std::fs::create_dir_all(parent);
+    }
+    match std::fs::write(path, &encoded) {
+        Ok(()) => {
+            // Readable only by this node: the private key is what makes it
+            // this node rather than any other.
+            #[cfg(unix)]
+            {
+                use std::os::unix::fs::PermissionsExt;
+                let _ = std::fs::set_permissions(path, std::fs::Permissions::from_mode(0o600));
+            }
+            emit(config, "identity-created",
+                 &format!("a new identity, kept at {}", config.identity),
+                 &[("peer_id", &keypair.public().to_peer_id().to_string()),
+                   ("path", &config.identity)]);
+        }
+        Err(error) => {
+            emit(config, "identity-not-saved",
+                 &format!("could not write {} ({error}) — this node will be a stranger \
+                           after every restart",
+                          config.identity),
+                 &[("path", &config.identity), ("error", &error.to_string())]);
+        }
+    }
+    Ok(keypair)
+}
+
 async fn run(config: Config) -> Result<()> {
-    let mut swarm = libp2p::SwarmBuilder::with_new_identity()
+    let keypair = load_or_create_identity(&config)?;
+    let mut swarm = libp2p::SwarmBuilder::with_existing_identity(keypair)
         .with_tokio()
         .with_tcp(
             tcp::Config::default(),

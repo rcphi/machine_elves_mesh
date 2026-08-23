@@ -583,6 +583,24 @@ Everything in this had been tested separately. None of it had been tested with t
 
 That condition is met by any member whose router will open a port on request, which consumer routers do, or by anyone with working IPv6. It is not a dependency on infrastructure; it is a property some members have and others need not.
 
+## What running it for real found — 2026-08-23
+
+Five faults, none of which any rig here had caught. Every one needed two machines that keep working while unable to see each other, and then meet again.
+
+**A lost peer was never dialled again.** An address came off the list once reached and nothing put it back, so the first disconnection was permanent. Waiting did not help because nothing was trying.
+
+**The redial hung off the wrong signal.** It fired when the transport reported a closed connection — but a machine that vanishes closes nothing. A killed process, a closed laptop, a switched-off hotspot: the connection stays open in the transport's opinion until an idle timeout minutes away. It now hangs off silence, which is the only warning a vanished machine gives.
+
+**Two owners deadlocked.** Each deferred to the other's checkpoint, so both stopped and the job stalled with nobody running it and no disappearance to notice. Settled now by a rule both apply identically: whoever is further along keeps it, ties to the lower identifier.
+
+**`--own` meant claim always**, so a node returning from a restart took work somebody was already doing. It now listens for three detection windows and claims only if nobody answered.
+
+**A connection storm.** A connection prompted an announcement, an announcement prompted every peer to dial, and each dial made another connection — dozens within a second, between two machines.
+
+**And identity was not persistent**, against §8.1: generated fresh every start, so a node returning from a restart was a stranger who happened to be at a familiar address. Nothing could recognise it and no peer cache could ever contain it. Now written to disk on first use and read thereafter.
+
+**The lesson is about testing rather than about any of the bugs.** All six live in the same place: what happens *after* something goes wrong and then comes back. A rig that starts a connection and tears it down never visits there. A person turning a phone off and on visits immediately.
+
 ## Volunteer machines and remote management
 
 Volunteers are not technically inclined. Machines are prepared centrally — Ubuntu 26.04, Rust and dependencies preinstalled — and shipped ready to plug in.
