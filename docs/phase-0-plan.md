@@ -426,6 +426,25 @@ An IPv4-only peer reaches an IPv6-only peer through a dual-stack peer that holds
 
 **It mitigates the partition risk without removing it.** A city whose last dual-stack member leaves does not degrade — it splits into two meshes that cannot see each other, each convinced the other vanished. Dual-stack membership is therefore worth watching the way §11.6 watches relay bandwidth: not reachability, but the ability to be a bridge at all.
 
+## The node reaches peers by address, not only by broadcast — 2026-08-22
+
+Discovery had been mDNS only, which finds peers on the same local network and nothing else. That is not merely a limitation: **many machines have mDNS disabled**, so the node's only route to a peer was one an operator may have deliberately switched off.
+
+Two changes make a node reachable across the internet.
+
+**A fixed listening port.** The node bound whatever the system offered, so its external address changed every restart and was worth nothing to remember. Bound to a known port, a router that preserves port numbers — as the home connection measured here does — gives the same external address every time, and a peer's address survives restarts.
+
+**Persistent dialling.** A peer is retried every two seconds until reached, rather than attempted once at startup. **This is not politeness, it is the mechanism.** Two nodes behind translation cannot be dialled; the only thing that opens a path is both sending outward at once, and each attempt is a packet outward. A single attempt succeeds only if the other side happened to already be listening, which neither can usefully be. Whoever started second would fail permanently if the first had given up.
+
+Verified across two hosts, with the statically linked binary copied to a machine that never compiled it:
+
+```
+event=connected  addr=/ip4/192.168.50.48/udp/4001/quic-v1  after_attempts=1  still_pending=0
+event=all-reached
+```
+
+**A bug worth recording, because the wrong version looked right.** A reached peer was first matched against the address the connection *ended up* on. A peer dialled at one address commonly answers from another — a different interface, or the public address its translation assigned — so the entry was never cleared and the peer stayed on the dial list for the rest of the run, retried forever. It is now matched against the address that was *asked for*. The mistake was invisible on a single host, where broadcast discovery reached the peer by another route first and disguised the symptom as something else entirely.
+
 ## Volunteer machines and remote management
 
 Volunteers are not technically inclined. Machines are prepared centrally — Ubuntu 26.04, Rust and dependencies preinstalled — and shipped ready to plug in.

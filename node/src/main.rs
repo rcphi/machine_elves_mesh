@@ -50,6 +50,24 @@ const KIND_CHECKPOINT: u8 = 3;
 /// How often the node running a job advances it.
 const DEFAULT_JOB_TICK_MS: u64 = 200;
 
+/// The port a node listens on unless told otherwise.
+///
+/// Fixed rather than chosen by the system, and that is what makes a node
+/// findable. A router that preserves port numbers — as the home connection
+/// measured here does — then maps this to the same external port every time,
+/// so a peer's address survives restarts and can be remembered. Bound to zero
+/// the system picks a new port each run, the external address changes with it,
+/// and nothing about a peer is worth writing down.
+const DEFAULT_PORT: u16 = 4001;
+
+/// How often to try a peer that has not answered yet.
+///
+/// Retrying is not politeness, it is the mechanism. Two nodes behind address
+/// translation cannot be dialled; the only thing that opens a path is both of
+/// them sending outward at once, and each attempt is a packet outward. Whoever
+/// starts second would fail permanently if the first had given up.
+const DIAL_RETRY: Duration = Duration::from_secs(2);
+
 /// How often a quiet connection is poked to stop a router forgetting it.
 ///
 /// Measured rather than guessed: the mobile connection tested forgot an idle
@@ -192,6 +210,7 @@ struct Config {
     /// Which mesh this node belongs to. Nodes in different meshes ignore one
     /// another completely.
     mesh: String,
+    port: u16,
     /// Whether this node starts as the one running the job.
     own: bool,
 }
@@ -277,6 +296,7 @@ fn parse_args() -> Result<Config> {
         job_tick: Duration::from_millis(DEFAULT_JOB_TICK_MS),
         keepalive: Duration::from_millis(DEFAULT_KEEPALIVE_MS),
         mesh: "default".to_string(),
+        port: DEFAULT_PORT,
         own: false,
     };
 
@@ -302,6 +322,7 @@ fn parse_args() -> Result<Config> {
             "--json" => config.json = true,
             "--job" => config.job = Some(args.next().context("--job needs a path")?),
             "--mesh" => config.mesh = args.next().context("--mesh needs a name")?,
+            "--port" => config.port = args.next().context("--port needs a number")?.parse()?,
             "--keepalive-ms" => {
                 config.keepalive = Duration::from_millis(
                     args.next().context("--keepalive-ms needs a number")?.parse()?,
@@ -324,8 +345,9 @@ fn parse_args() -> Result<Config> {
         // QUIC first: it establishes in fewer round trips and is friendlier to
         // the address translation most players sit behind. TCP is kept as the
         // fallback for networks that block or mangle UDP.
-        config.listen.push("/ip4/0.0.0.0/udp/0/quic-v1".parse()?);
-        config.listen.push("/ip4/0.0.0.0/tcp/0".parse()?);
+        let port = config.port;
+        config.listen.push(format!("/ip4/0.0.0.0/udp/{port}/quic-v1").parse()?);
+        config.listen.push(format!("/ip4/0.0.0.0/tcp/{port}").parse()?);
 
         // And IPv6, where a machine has it. This is not symmetry for its own
         // sake: a peer with a global IPv6 address has no translation in front
@@ -341,8 +363,8 @@ fn parse_args() -> Result<Config> {
         //
         // Failing to bind is normal and not an error: most machines have no
         // IPv6 route, which is exactly what the connectivity probe reports.
-        config.listen.push("/ip6/::/udp/0/quic-v1".parse()?);
-        config.listen.push("/ip6/::/tcp/0".parse()?);
+        config.listen.push(format!("/ip6/::/udp/{port}/quic-v1").parse()?);
+        config.listen.push(format!("/ip6/::/tcp/{port}").parse()?);
     }
 
     anyhow::ensure!(
@@ -405,6 +427,9 @@ fn print_usage() {
     println!("                       run a job locally and show its effects, then exit");
     println!("  --keepalive-ms <n>   how often to poke a quiet connection so a router does");
     println!("                       not forget it (default {DEFAULT_KEEPALIVE_MS})");
+    println!("  --port <n>           port to listen on (default {DEFAULT_PORT}). Fixed, so that a");
+    println!("                       router preserving port numbers gives this node the same");
+    println!("                       address every restart and peers can remember it");
     println!("  --mesh <name>        which mesh to join (default \"default\"). Nodes in");
     println!("                       different meshes ignore each other entirely");
     println!("  --job <file.wasm>    hold this job, ready to run or to continue it");
@@ -468,9 +493,13 @@ async fn run(config: Config) -> Result<()> {
     for addr in &config.listen {
         swarm.listen_on(addr.clone())?;
     }
-    for addr in &config.dial {
-        swarm.dial(addr.clone())?;
-    }
+    // Peers we are trying to reach and have not reached yet. Kept rather than
+    // dialled once and forgotten, because a single attempt only succeeds if the
+    // other side happened to already be listening — and neither side can be
+    // listening in any useful sense while behind address translation.
+    let mut pending: Vec<Multiaddr> = config.dial.clone();
+    let mut dial_attempts: u32 = 0;
+    let mut dial_retry = tokio::time::interval(DIAL_RETRY);
 
     let me = *swarm.local_peer_id();
     emit(
@@ -511,6 +540,23 @@ async fn run(config: Config) -> Result<()> {
 
     loop {
         tokio::select! {
+            _ = dial_retry.tick(), if !pending.is_empty() => {
+                dial_attempts += 1;
+                for addr in &pending {
+                    // Failures are expected and frequent: until the other side
+                    // is also sending, there is nothing at the far end willing
+                    // to answer. The attempt is worth making anyway, because
+                    // the outgoing packet is what opens this side's path.
+                    let _ = swarm.dial(addr.clone());
+                }
+                if dial_attempts == 1 || dial_attempts % 15 == 0 {
+                    emit(&config, "dialling",
+                         &format!("still trying {} peer(s), attempt {dial_attempts}", pending.len()),
+                         &[("peers", &pending.len().to_string()),
+                           ("attempts", &dial_attempts.to_string())]);
+                }
+            }
+
             _ = heartbeat.tick() => {
                 counter += 1;
                 // Failing to publish is normal and uninteresting while this node
@@ -624,6 +670,30 @@ async fn run(config: Config) -> Result<()> {
             }
 
             event = swarm.select_next_some() => match event {
+                SwarmEvent::ConnectionEstablished { peer_id, endpoint, .. } => {
+                    // Stop dialling this one. The address matched must be the
+                    // address *we asked for*, not the one the connection ended
+                    // up on: a peer dialled at one address commonly answers
+                    // from another — a different interface, or the public
+                    // address its translation assigned — and comparing against
+                    // that leaves the peer on the list forever, quietly dialled
+                    // for the rest of the run.
+                    let reached = endpoint.get_remote_address().clone();
+                    let before = pending.len();
+                    if let libp2p::core::ConnectedPoint::Dialer { address, .. } = &endpoint {
+                        pending.retain(|addr| addr != address);
+                    }
+                    emit(&config, "connected",
+                         &format!("reached {peer_id} at {reached}"),
+                         &[("peer_id", &peer_id.to_string()),
+                           ("addr", &reached.to_string()),
+                           ("after_attempts", &dial_attempts.to_string()),
+                           ("still_pending", &pending.len().to_string())]);
+                    if before > 0 && pending.is_empty() {
+                        emit(&config, "all-reached", "every peer given on the command line answered", &[]);
+                    }
+                }
+
                 SwarmEvent::NewListenAddr { address, .. } => {
                     emit(&config, "listening", &format!("listening on {address}"),
                          &[("addr", &address.to_string())]);
