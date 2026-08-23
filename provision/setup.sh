@@ -23,6 +23,7 @@ NODE_MESH=""
 NODE_PEERS=""
 NODE_JOB=""
 NODE_OWN=no
+NODE_BINARY=""
 REPO_ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
 
 usage() {
@@ -40,6 +41,11 @@ setup.sh --label <name> [options]
   --peer <addr>    A peer for the node to dial, as a multiaddr. Repeatable.
   --job <file>     A job for the node to hold, ready to run or to continue.
   --own            Start as the node running that job.
+  --node-binary <f>
+                   Install this mesh-node binary. For a machine that has one
+                   copied over on its own rather than a whole dist directory,
+                   which is the usual case when it cannot reach the build
+                   machine to fetch more.
   --dist <dir>     Install prebuilt binaries from here instead of compiling.
                    This is the normal path for a volunteer machine, which
                    should never need a compiler. Produce one with ./release.sh.
@@ -62,6 +68,7 @@ while [[ $# -gt 0 ]]; do
         --peer) NODE_PEERS="$NODE_PEERS ${2:-}"; shift 2 ;;
         --job) NODE_JOB="${2:-}"; shift 2 ;;
         --own) NODE_OWN=yes; shift ;;
+        --node-binary) NODE_BINARY="${2:-}"; shift 2 ;;
         --help|-h) usage; exit 0 ;;
         *) echo "unknown argument: $1" >&2; usage; exit 2 ;;
     esac
@@ -192,8 +199,24 @@ systemctl enable --now mesh-probe-mapping.timer
 if [[ -n "$NODE_MESH" ]]; then
     say "Installing the mesh node"
 
+    if [[ -n "$NODE_BINARY" ]]; then
+        [[ -x "$NODE_BINARY" ]] || { echo "no executable at $NODE_BINARY" >&2; exit 1; }
+        install -m 0755 "$NODE_BINARY" /usr/local/bin/mesh-node
+        echo "installed the node from $NODE_BINARY"
+    fi
+
     if [[ ! -x /usr/local/bin/mesh-node ]]; then
-        echo "no mesh-node binary was installed — pass --dist with one" >&2
+        cat >&2 <<'MISSING'
+
+No mesh-node binary. The probe is installed and measuring; the node is not.
+
+The node is too large to keep in the repository, so it has to be copied from
+wherever it was built:
+
+    scp someone@build-machine:path/to/mesh-node ~/mesh-node
+    sudo ./setup.sh --label NAME --mesh MESH --node-binary ~/mesh-node
+
+MISSING
         exit 1
     fi
 
