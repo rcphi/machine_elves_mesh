@@ -203,6 +203,18 @@ if [[ -n "$NODE_MESH" ]]; then
     install -d -m 0755 -o meshnode -g meshnode /var/log/mesh-node /var/lib/mesh-node
     install -d -m 0755 /etc/mesh-node
 
+    # Jobs are copied somewhere the service can actually read. It runs with
+    # ProtectHome, so a job left in a home directory is invisible to it — and
+    # the failure is a permission error at startup, which reads as a
+    # configuration mistake rather than a path problem.
+    if [[ -n "$NODE_JOB" ]]; then
+        [[ -f "$NODE_JOB" ]] || { echo "no job file at $NODE_JOB" >&2; exit 1; }
+        install -d -m 0755 /var/lib/mesh-node/jobs
+        install -m 0644 "$NODE_JOB" "/var/lib/mesh-node/jobs/$(basename "$NODE_JOB")"
+        NODE_JOB="/var/lib/mesh-node/jobs/$(basename "$NODE_JOB")"
+        echo "job installed at $NODE_JOB"
+    fi
+
     {
         printf 'LABEL=%s\n' "$LABEL"
         printf 'MESH=%s\n' "$NODE_MESH"
