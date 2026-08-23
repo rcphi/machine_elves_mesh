@@ -9,6 +9,7 @@
 
 mod job;
 mod ledger;
+mod portmap;
 
 use std::collections::HashMap;
 use std::time::{Duration, Instant, SystemTime};
@@ -248,6 +249,13 @@ struct Config {
     /// another completely.
     mesh: String,
     port: u16,
+    /// Whether to ask the router to forward this node's port.
+    ///
+    /// On by default. A mesh where nobody is reachable cannot admit anyone it
+    /// is not already connected to, so a node that never asks makes the whole
+    /// arrangement depend on somebody else having asked. A router that says no
+    /// simply says no, and the mapping lapses on its own if the node dies.
+    map_port: bool,
     /// Local-network discovery. Off is a supported way to run: many machines
     /// disable it, and a node that depends on it has one route to a peer that
     /// an operator may have deliberately closed.
@@ -338,6 +346,7 @@ fn parse_args() -> Result<Config> {
         keepalive: Duration::from_millis(DEFAULT_KEEPALIVE_MS),
         mesh: "default".to_string(),
         port: DEFAULT_PORT,
+        map_port: true,
         mdns: true,
         own: false,
     };
@@ -372,6 +381,7 @@ fn parse_args() -> Result<Config> {
             }
             "--own" => config.own = true,
             "--no-mdns" => config.mdns = false,
+            "--no-map-port" => config.map_port = false,
             "--job-tick-ms" => {
                 config.job_tick =
                     Duration::from_millis(args.next().context("--job-tick-ms needs a number")?.parse()?)
@@ -473,6 +483,9 @@ fn print_usage() {
     println!("  --port <n>           port to listen on (default {DEFAULT_PORT}). Fixed, so that a");
     println!("                       router preserving port numbers gives this node the same");
     println!("                       address every restart and peers can remember it");
+    println!("  --no-map-port        do not ask the router to forward this node's port.");
+    println!("                       Asking is the default: a mesh needs somebody reachable,");
+    println!("                       and a router that declines simply declines");
     println!("  --no-mdns            do not use local-network discovery. Peers are then");
     println!("                       found only by address, which is how they are found");
     println!("                       across the internet in any case");
@@ -559,6 +572,8 @@ async fn run(config: Config) -> Result<()> {
     let mut seen_at: HashMap<PeerId, Multiaddr> = HashMap::new();
     let mut announce = tokio::time::interval(ANNOUNCE_EVERY);
     let mut my_address: Option<Multiaddr> = None;
+    let mut renew_mapping = tokio::time::interval(portmap::RENEW_EVERY);
+    let mut mapping: Option<portmap::Mapping> = None;
 
     let me = *swarm.local_peer_id();
     emit(
@@ -619,6 +634,35 @@ async fn run(config: Config) -> Result<()> {
             // Repeat what we can see, for anyone who has arrived since. New
             // members hear the whole roster this way and dial into it, rather
             // than waiting to be found.
+            // Asked for repeatedly, not once. A mapping expires, and a node
+            // that asks at startup and forgets stops being reachable an hour
+            // later while appearing perfectly healthy — which is the kind of
+            // failure that gets diagnosed as something else entirely.
+            _ = renew_mapping.tick(), if config.map_port => {
+                match portmap::request(config.port, portmap::LIFETIME_SECS).await {
+                    Ok(now) => {
+                        if mapping != Some(now) {
+                            emit(&config, "port-mapped",
+                                 &format!("the router forwards {}:{} to this node for {}s",
+                                          now.external_ip, now.external_port, now.lifetime),
+                                 &[("external", &format!("{}:{}", now.external_ip, now.external_port)),
+                                   ("lifetime", &now.lifetime.to_string()),
+                                   ("as_asked", if now.external_port == config.port { "true" } else { "false" })]);
+                            mapping = Some(now);
+                        }
+                    }
+                    Err(error) => {
+                        // Reported every time rather than once. If a router
+                        // stops renewing, reachability is being lost right now,
+                        // and a single line an hour ago would not say so.
+                        emit(&config, "port-map-failed", &format!("{error}"),
+                             &[("error", &error.to_string()),
+                               ("was_mapped", if mapping.is_some() { "true" } else { "false" })]);
+                        mapping = None;
+                    }
+                }
+            }
+
             _ = announce.tick() => {
                 for (peer, addr) in &seen_at {
                     let _ = swarm.behaviour_mut().gossipsub
@@ -1081,6 +1125,13 @@ async fn depart(
         },
         &[("announced", if published { "true" } else { "false" })],
     );
+
+    // Give the port back. It would lapse on its own, but leaving a door open in
+    // somebody's router after leaving is untidy in the same way as vanishing
+    // without saying goodbye.
+    if config.map_port {
+        let _ = portmap::release(config.port).await;
+    }
 
     let deadline = tokio::time::Instant::now() + Duration::from_millis(500);
     while tokio::time::Instant::now() < deadline {
