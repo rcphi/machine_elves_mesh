@@ -18,9 +18,17 @@ echo
 # The steady hum of working is filtered out. Effects and heartbeats arrive
 # several times a second and would bury the one line that matters.
 tail -n 0 -F "$LOG" 2>/dev/null | python3 -u -c '
-import json, sys, time
+import json, signal, sys, time
+
+# Ctrl-C is how this is meant to end. A traceback makes an ordinary exit look
+# like a fault.
+signal.signal(signal.SIGINT, lambda *_: sys.exit(0))
 
 SAY = {
+    "identity-created":  "made a new identity — peers will not know it yet",
+    "identity-loaded":   "this node is itself again, across the restart",
+    "identity-unreadable":"IDENTITY FILE UNREADABLE — becoming a stranger",
+    "identity-not-saved":"identity could not be saved — a stranger after every restart",
     "started":        "started up",
     "claimed":        "TOOK THE JOB — nobody else was running it",
     "job-owner":      "{label} is running the job",

@@ -21,6 +21,10 @@ DEFAULT_LOG = "/var/log/mesh-node/events.jsonl"
 # Moments worth a line of their own: things that happened *to* the node, rather
 # than the steady hum of it working.
 NOTABLE = {
+    "identity-created": "made a new identity — peers will not know it yet",
+    "identity-loaded": "was itself again across the restart",
+    "identity-unreadable": "IDENTITY FILE UNREADABLE — became a stranger",
+    "identity-not-saved": "could not save its identity — a stranger after every restart",
     "started": "started up",
     "claimed": "took the job — nobody else was running it",
     "job-owner": "saw {label} running the job",
@@ -165,6 +169,15 @@ def main():
     print(f"  peers left        {kinds.get('left', 0)} announced, "
           f"{kinds.get('vanished', 0)} vanished without warning")
     print(f"  redials           {kinds.get('redialling', 0)}")
+
+    # Whether this node was recognisable across its restarts. A node that
+    # cannot be is one no peer can ever have cached, however long it runs.
+    if kinds.get("identity-loaded"):
+        print("  identity          kept across restarts")
+    elif kinds.get("identity-created"):
+        print("  identity          newly made this run")
+    elif kinds.get("identity-not-saved") or kinds.get("identity-unreadable"):
+        print("  identity          NOT PERSISTED — a stranger after every restart")
 
     mapped, refused = kinds.get("port-mapped", 0), kinds.get("port-map-failed", 0)
     if mapped or refused:
