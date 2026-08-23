@@ -309,6 +309,14 @@ fn stun_binding(socket: &UdpSocket, server: SocketAddr) -> io::Result<SocketAddr
                 // A late reply to an earlier query can arrive on this shared
                 // socket; the transaction ID is what makes them distinguishable.
                 if from.ip() != server.ip() {
+                    // Anything else on this socket is a peer trying to reach us
+                    // — which is the very thing being measured. Discarding it
+                    // silently here made the address-refresh quietly eat the
+                    // evidence, so it is reported before being ignored.
+                    if buf[..len].starts_with(PUNCH_HELLO) || buf[..len].starts_with(PUNCH_REPLY) {
+                        println!();
+                        println!("  <- {from} reached us (noticed while refreshing our address)");
+                    }
                     continue;
                 }
                 match parse_binding_response(&buf[..len], &transaction) {
