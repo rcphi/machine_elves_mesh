@@ -1,0 +1,10 @@
+/var/log/mesh-node/events.jsonl {
+    daily
+    rotate 14
+    compress
+    delaycompress
+    missingok
+    notifempty
+    copytruncate
+    su meshnode meshnode
+}

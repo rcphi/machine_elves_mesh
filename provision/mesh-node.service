@@ -1,0 +1,50 @@
+[Unit]
+Description=Machine Elves mesh node
+Documentation=file:/usr/local/share/mesh-probe/README.md
+After=network-online.target
+Wants=network-online.target
+
+[Service]
+Type=simple
+User=meshnode
+Group=meshnode
+ExecStart=/usr/local/bin/mesh-node-run
+
+# A node that dies should come back. The restart itself is data — a node
+# restarting hourly is a finding, and one that stays down is a gap in the
+# record that looks exactly like a quiet network.
+Restart=always
+RestartSec=10
+
+# One JSON record per line, so a partial write from a power cut costs one
+# event rather than the file.
+StandardOutput=append:/var/log/mesh-node/events.jsonl
+StandardError=append:/var/log/mesh-node/events.jsonl
+
+# Less confined than the probe, because it does more: it listens, it dials, and
+# it executes other people's code. The sandbox around that code is the WASM
+# runtime (§11.4); this is the layer beneath, and it still gets no more of the
+# machine than it needs.
+NoNewPrivileges=true
+PrivateTmp=true
+PrivateDevices=true
+ProtectSystem=strict
+ProtectHome=true
+ReadWritePaths=/var/log/mesh-node /var/lib/mesh-node
+ProtectKernelTunables=true
+ProtectKernelModules=true
+ProtectKernelLogs=true
+ProtectControlGroups=true
+ProtectClock=true
+ProtectHostname=true
+RestrictAddressFamilies=AF_INET AF_INET6 AF_UNIX AF_NETLINK
+RestrictNamespaces=true
+RestrictRealtime=true
+RestrictSUIDSGID=true
+LockPersonality=true
+SystemCallArchitectures=native
+SystemCallFilter=@system-service
+CapabilityBoundingSet=
+
+[Install]
+WantedBy=multi-user.target

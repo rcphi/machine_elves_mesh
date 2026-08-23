@@ -1,0 +1,32 @@
+#!/usr/bin/env bash
+#
+# Turns the config file into a command line.
+#
+# A wrapper rather than a longer ExecStart because peers are a list, and systemd
+# cannot expand one from an environment file. Keeping the logic here also means
+# a person can read what the service will actually run.
+set -euo pipefail
+
+CONFIG=/etc/mesh-node/config
+[[ -f "$CONFIG" ]] || { echo "no $CONFIG" >&2; exit 1; }
+# shellcheck disable=SC1090
+source "$CONFIG"
+
+args=(--label "${LABEL:-$(hostname)}" --mesh "${MESH:-default}" --port "${PORT:-4001}" --json)
+
+# Local discovery off by default: many machines disable it, and depending on it
+# means having one route to a peer that an operator may have deliberately shut.
+[[ "${MDNS:-no}" == "yes" ]] || args+=(--no-mdns)
+[[ "${MAP_PORT:-yes}" == "yes" ]] || args+=(--no-map-port)
+
+# Peers are whitespace-separated in the config; each becomes its own flag.
+for peer in ${PEERS:-}; do
+    args+=(--peer "$peer")
+done
+
+if [[ -n "${JOB:-}" ]]; then
+    args+=(--job "$JOB")
+    [[ "${OWN:-no}" == "yes" ]] && args+=(--own)
+fi
+
+exec /usr/local/bin/mesh-node "${args[@]}" ${EXTRA:-}

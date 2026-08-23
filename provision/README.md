@@ -98,6 +98,36 @@ It is worth doing anyway: a friend's other devices are not part of the
 experiment, and their household should not have to think about what the box can
 see.
 
+## Running the mesh node too
+
+The probe measures the network and joins nothing. To also run the node:
+
+```
+sudo ./setup.sh --label vol-1 --dist dist \
+     --mesh shangri-la \
+     --peer /ip4/203.0.113.9/udp/4001/quic-v1 \
+     --job /usr/local/share/mesh-probe/jobs/factory_job.wasm
+```
+
+It runs under systemd with `Restart=always`, so a node that dies comes back —
+and the restart itself is data. A node restarting hourly is a finding; one that
+stays down leaves a gap in the record that looks exactly like a quiet network.
+
+Settings live in `/etc/mesh-node/config` and can be changed without re-running
+setup; `systemctl restart mesh-node` picks them up. Local discovery is off by
+default and asking the router for a port is on, since a mesh with nobody
+reachable cannot admit anyone it is not already connected to.
+
+Read what it did with:
+
+```
+./node-summary.py /var/log/mesh-node/events.jsonl
+```
+
+That reports the things only visible over days — how often peers were lost,
+whether this node's own address moved, whether the router kept renewing its
+promise, and what became of the work.
+
 ## Collecting results
 
 From the operator's machine:

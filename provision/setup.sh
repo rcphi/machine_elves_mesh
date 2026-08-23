@@ -18,6 +18,11 @@ DIST=""
 # comparable across days. Not the mesh port: this one is only ever used to ask
 # what address the world sees.
 STABLE_PORT=41999
+# Set to run the mesh node as a service as well as the probe.
+NODE_MESH=""
+NODE_PEERS=""
+NODE_JOB=""
+NODE_OWN=no
 REPO_ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
 
 usage() {
@@ -29,6 +34,12 @@ setup.sh --label <name> [options]
                    other devices. Off by default: see the warning below.
   --mesh-port <n>  Port the mesh node listens on (default 4001). Opened
                    inbound so peers on the same network can reach it.
+  --mesh <name>    Also run the mesh node as a service, on this mesh. Without
+                   this only the probe is installed, which measures the network
+                   and joins nothing.
+  --peer <addr>    A peer for the node to dial, as a multiaddr. Repeatable.
+  --job <file>     A job for the node to hold, ready to run or to continue.
+  --own            Start as the node running that job.
   --dist <dir>     Install prebuilt binaries from here instead of compiling.
                    This is the normal path for a volunteer machine, which
                    should never need a compiler. Produce one with ./release.sh.
@@ -47,6 +58,10 @@ while [[ $# -gt 0 ]]; do
         --isolate-lan) ISOLATE_LAN=1; shift ;;
         --mesh-port) MESH_PORT="${2:-}"; shift 2 ;;
         --dist) DIST="${2:-}"; shift 2 ;;
+        --mesh) NODE_MESH="${2:-}"; shift 2 ;;
+        --peer) NODE_PEERS="$NODE_PEERS ${2:-}"; shift 2 ;;
+        --job) NODE_JOB="${2:-}"; shift 2 ;;
+        --own) NODE_OWN=yes; shift ;;
         --help|-h) usage; exit 0 ;;
         *) echo "unknown argument: $1" >&2; usage; exit 2 ;;
     esac
@@ -172,6 +187,45 @@ systemctl daemon-reload
 systemctl enable --now mesh-probe.timer
 systemctl enable --now mesh-probe-mapping.timer
 
+# ---------------------------------------------------------------- the node
+
+if [[ -n "$NODE_MESH" ]]; then
+    say "Installing the mesh node"
+
+    if [[ ! -x /usr/local/bin/mesh-node ]]; then
+        echo "no mesh-node binary was installed — pass --dist with one" >&2
+        exit 1
+    fi
+
+    if ! id -u meshnode >/dev/null 2>&1; then
+        useradd --system --no-create-home --shell /usr/sbin/nologin meshnode
+    fi
+    install -d -m 0755 -o meshnode -g meshnode /var/log/mesh-node /var/lib/mesh-node
+    install -d -m 0755 /etc/mesh-node
+
+    {
+        printf 'LABEL=%s\n' "$LABEL"
+        printf 'MESH=%s\n' "$NODE_MESH"
+        printf 'PORT=%s\n' "$MESH_PORT"
+        printf 'PEERS="%s"\n' "${NODE_PEERS# }"
+        printf 'JOB=%s\n' "$NODE_JOB"
+        printf 'OWN=%s\n' "$NODE_OWN"
+        printf 'MAP_PORT=yes\n'
+        printf 'MDNS=no\n'
+    } > /etc/mesh-node/config
+    chmod 0644 /etc/mesh-node/config
+
+    install -m 0755 "$REPO_ROOT/provision/mesh-node-run" /usr/local/bin/mesh-node-run
+    install -m 0644 "$REPO_ROOT/provision/mesh-node.service" /etc/systemd/system/mesh-node.service
+    install -m 0644 "$REPO_ROOT/provision/logrotate.mesh-node" /etc/logrotate.d/mesh-node
+    systemctl daemon-reload
+    systemctl enable --now mesh-node.service
+    sleep 2
+    systemctl is-active --quiet mesh-node.service \
+        && echo "node running on mesh \"$NODE_MESH\"" \
+        || echo "node failed to start — journalctl -u mesh-node" >&2
+fi
+
 # ------------------------------------------------------- keep the box awake
 
 say "Preventing the box from going quiet on its own"
@@ -276,6 +330,7 @@ Done.
   results       /var/log/mesh-probe/results.jsonl
   mesh port     $MESH_PORT (tcp and udp) open inbound
   probe port    $STABLE_PORT (fixed, so addresses are comparable over time)
+  node          ${NODE_MESH:-not installed}${NODE_MESH:+, logging to /var/log/mesh-node/events.jsonl}
   connectivity  every 30 minutes (plus up to 5 minutes of jitter)
   mapping test  every 25 minutes (plus up to 10 minutes of jitter), one idle
                 interval per run, accumulating across days
