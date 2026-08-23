@@ -157,6 +157,12 @@ def main():
 
     relay_capable = []
     hole_punchable = []
+    # A machine that speaks both families is the only route between members
+    # that speak one and members that speak the other. Counting them is not
+    # bookkeeping: a city with one is a city that splits the day that one
+    # leaves, and nobody will have noticed beforehand.
+    bridges = []
+    bridge_readings = []
 
     for label, runs in sorted(by_label.items()):
         runs.sort(key=lambda r: r.get("ts_unix", 0))
@@ -198,6 +204,22 @@ def main():
                 print(f"                {a}")
             print("              a remembered address would have gone stale this often")
 
+        # Averaged over every reading rather than taken from the latest,
+        # because what matters is how often a bridge was *present*, not whether
+        # one happened to be there when someone last looked.
+        both = sum(
+            1 for r in runs
+            if r.get("ipv4", {}).get("tag") not in (None, "unreachable")
+            and r.get("ipv6", {}).get("tag") == "global"
+        )
+        if both:
+            share = 100.0 * both / len(runs)
+            print(f"  bridging    yes, in {both}/{len(runs)} readings ({share:.0f}%)")
+            bridges.append(label)
+        else:
+            print("  bridging    no — speaks only one address family")
+        bridge_readings.append(both / len(runs) if runs else 0.0)
+
         if latest.get("relay_candidate", latest.get("relay_capable")):
             relay_capable.append(label)
         if v4 in REACHABLE or v6 in REACHABLE or v4 == "nat-endpoint-independent":
@@ -210,9 +232,27 @@ def main():
     print("Verdict")
     print("-------")
     print(f"  machines reporting:                  {len(by_label)}")
+    expected = sum(bridge_readings)
+    print(f"  can bridge the address families:     "
+          f"{', '.join(bridges) or 'NONE'}  ({expected:.1f} present on average)")
     print(f"  can accept incoming (relay-capable): {', '.join(relay_capable) or 'NONE'}")
     print(f"  direct connection plausible:         {', '.join(hole_punchable) or 'NONE'}")
     print()
+
+    # Said before anything else, because it is the only failure here that is
+    # not a degradation. Everything else makes the mesh worse; this one cuts it
+    # in half, with each half believing the other simply left.
+    if not bridges and len(by_label) > 1:
+        print("  NO MACHINE SPEAKS BOTH ADDRESS FAMILIES. If every machine here uses the")
+        print("  same one that is merely a fact; if they differ, these machines cannot")
+        print("  reach each other at all and no amount of relaying helps, because a relay")
+        print("  must itself speak both.")
+        print()
+    elif len(bridges) == 1:
+        print(f"  ONLY {bridges[0]} CAN BRIDGE. It is a single point of failure nobody would")
+        print("  notice until it left, and its leaving would not slow the mesh down — it")
+        print("  would split it into two halves unable to see one another.")
+        print()
 
     if not relay_capable:
         print("  No machine here can accept an incoming connection. With no rented")

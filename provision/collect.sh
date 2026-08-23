@@ -17,7 +17,9 @@
 set -euo pipefail
 
 OUT_DIR="${OUT_DIR:-$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)/results}"
-REMOTE_LOG="/var/log/mesh-probe/results.jsonl"
+# Overridable, because a machine running the userspace loop keeps its readings
+# in a home directory rather than under /var/log.
+REMOTE_LOG="${REMOTE_LOG:-/var/log/mesh-probe/results.jsonl}"
 
 [[ $# -gt 0 ]] || { echo "usage: collect.sh <host> [host…]" >&2; exit 2; }
 mkdir -p "$OUT_DIR"
