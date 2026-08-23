@@ -14,6 +14,10 @@ LABEL=""
 ISOLATE_LAN=0
 MESH_PORT=4001
 DIST=""
+# The port the connectivity probe binds every time, so its readings are
+# comparable across days. Not the mesh port: this one is only ever used to ask
+# what address the world sees.
+STABLE_PORT=41999
 REPO_ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
 
 usage() {
@@ -155,7 +159,7 @@ fi
 
 install -d -m 0755 -o meshprobe -g meshprobe /var/log/mesh-probe
 install -d -m 0755 /etc/mesh-probe
-printf 'LABEL=%s\n' "$LABEL" > /etc/mesh-probe/config
+{ printf 'LABEL=%s\n' "$LABEL"; printf 'PORT=%s\n' "$STABLE_PORT"; } > /etc/mesh-probe/config
 chmod 0644 /etc/mesh-probe/config
 
 say "Installing the timer"
@@ -271,6 +275,7 @@ Done.
   version       $(head -2 /usr/local/share/mesh-probe/VERSION 2>/dev/null | tr '\n' ' ' || echo "built here")
   results       /var/log/mesh-probe/results.jsonl
   mesh port     $MESH_PORT (tcp and udp) open inbound
+  probe port    $STABLE_PORT (fixed, so addresses are comparable over time)
   connectivity  every 30 minutes (plus up to 5 minutes of jitter)
   mapping test  every 25 minutes (plus up to 10 minutes of jitter), one idle
                 interval per run, accumulating across days

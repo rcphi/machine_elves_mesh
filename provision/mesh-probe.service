@@ -9,7 +9,12 @@ Type=oneshot
 User=meshprobe
 Group=meshprobe
 EnvironmentFile=/etc/mesh-probe/config
-ExecStart=/usr/local/bin/mesh-probe --json --label ${LABEL}
+# A fixed local port on purpose. Bound to zero the system picks a new one each
+# run, the external address changes every time, and the log cannot tell an
+# address that genuinely moved from one that was never going to be the same
+# twice. Fixed, every reading is comparable to the last, and the log answers
+# on its own whether a remembered address would still work.
+ExecStart=/usr/local/bin/mesh-probe --json --label ${LABEL} --port ${PORT}
 
 # One JSON record appended per run. Line-oriented so a partial write from a
 # power cut costs one measurement rather than the file.

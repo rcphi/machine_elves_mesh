@@ -180,7 +180,25 @@ def main():
         if silent:
             print(f"  silent runs {silent} of {len(runs)}  (no STUN server answered)")
 
-        if latest.get("relay_capable"):
+        # Whether a remembered address would still have worked. This is the
+        # question a peer cache turns on, and it is answerable only by looking
+        # across time — which is why the probe binds a fixed port, so two
+        # readings are comparable at all.
+        addresses = []
+        for r in runs:
+            seen = r.get("ipv4", {}).get("observers") or []
+            if seen:
+                addresses.append(seen[0]["mapped"])
+        distinct = list(dict.fromkeys(addresses))
+        if len(distinct) == 1:
+            print(f"  address     {distinct[0]} — unchanged across {len(addresses)} readings")
+        elif len(distinct) > 1:
+            print(f"  address     CHANGED {len(distinct) - 1}x over {len(addresses)} readings")
+            for a in distinct[-3:]:
+                print(f"                {a}")
+            print("              a remembered address would have gone stale this often")
+
+        if latest.get("relay_candidate", latest.get("relay_capable")):
             relay_capable.append(label)
         if v4 in REACHABLE or v6 in REACHABLE or v4 == "nat-endpoint-independent":
             hole_punchable.append(label)
