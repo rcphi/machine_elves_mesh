@@ -646,6 +646,16 @@ async fn run(config: Config) -> Result<()> {
         tokio::select! {
             _ = dial_retry.tick(), if !pending.is_empty() => {
                 dial_attempts += 1;
+                // Anything already reaching a live peer is skipped. A retry
+                // loop that keeps dialling a connected peer opens a new
+                // connection every two seconds forever.
+                let live: Vec<Multiaddr> = reached_by
+                    .iter()
+                    .filter(|(peer, _)| swarm.is_connected(peer))
+                    .flat_map(|(_, addrs)| addrs.iter().cloned())
+                    .collect();
+                pending.retain(|addr| !live.contains(addr));
+
                 for addr in &pending {
                     // Failures are expected and frequent: until the other side
                     // is also sending, there is nothing at the far end willing
@@ -789,6 +799,11 @@ async fn run(config: Config) -> Result<()> {
                         // machine was unplugged, lost power, lost its network, or
                         // hung. This is the case recovery has to be fast enough
                         // to survive, and the only one that costs a visible gap.
+                        // Silence is the only warning a vanished machine gives,
+                        // so it has to be what starts the search for it again.
+                        redial_lost_peer(&config, &peer, &reached_by,
+                                         &mut pending, &mut dial_attempts);
+
                         if let Some(w) = work.as_mut() {
                             if w.owner == Some(peer) {
                                 w.owner = None;
@@ -839,6 +854,13 @@ async fn run(config: Config) -> Result<()> {
                     let before = pending.len();
                     if let libp2p::core::ConnectedPoint::Dialer { address, .. } = &endpoint {
                         pending.retain(|addr| addr != address);
+                        // Every address known to reach this peer comes off the
+                        // list, not only the one that happened to succeed.
+                        // Otherwise the others keep being dialled at a peer
+                        // already sitting on the other end of a connection.
+                        if let Some(known) = reached_by.get(&peer_id) {
+                            pending.retain(|addr| !known.contains(addr));
+                        }
                         // Remembered so it can be dialled again later. A peer
                         // reached once is a peer worth trying to reach again,
                         // and a configured address is the most reliable thing a
@@ -859,13 +881,20 @@ async fn run(config: Config) -> Result<()> {
                         emit(&config, "all-reached", "every peer given on the command line answered", &[]);
                     }
 
-                    // Tell everyone where this peer can be reached, at once.
-                    // A newcomer is dialled by the whole mesh in the same
-                    // moment, while it dials back — which is the only way two
-                    // machines behind translation ever meet.
+                    // Announced only when this is news. Announcing on every
+                    // connection made a loop: a connection prompts an
+                    // announcement, an announcement prompts everyone to dial,
+                    // and each dial makes another connection. Two nodes
+                    // produced dozens within a second, all to each other.
+                    let is_news = seen_at.get(&peer_id) != Some(&reached);
                     seen_at.insert(peer_id, reached.clone());
-                    let _ = swarm.behaviour_mut().gossipsub
-                        .publish(topic.clone(), encode_observed(&config.label, &peer_id, &reached));
+                    if is_news {
+                        // A newcomer is dialled by the whole mesh in the same
+                        // moment, while it dials back — which is the only way
+                        // two machines behind translation ever meet.
+                        let _ = swarm.behaviour_mut().gossipsub
+                            .publish(topic.clone(), encode_observed(&config.label, &peer_id, &reached));
+                    }
                 }
 
                 // Reported because their absence is a diagnosis. A peer that
@@ -1005,7 +1034,15 @@ async fn run(config: Config) -> Result<()> {
                                 }
                                 continue;
                             }
-                            if swarm.is_connected(&peer) || pending.contains(&addr) {
+                            // Already connected, already trying, or already
+                            // known to reach a peer we have — each is a reason
+                            // not to dial again, and the last one matters most
+                            // during a burst, when is_connected can still be
+                            // false for a connection halfway through opening.
+                            if swarm.is_connected(&peer)
+                                || pending.contains(&addr)
+                                || reached_by.values().any(|known| known.contains(&addr))
+                            {
                                 continue;
                             }
                             emit(&config, "learned-peer",
@@ -1076,22 +1113,8 @@ async fn run(config: Config) -> Result<()> {
                         // hotspot cycles, a router reboots — and a mesh that
                         // treats it as final is a mesh that quietly shrinks by
                         // one every time anything happens.
-                        if let Some(addresses) = reached_by.get(&peer_id) {
-                            let mut resumed = 0;
-                            for addr in addresses {
-                                if !pending.contains(addr) {
-                                    pending.push(addr.clone());
-                                    resumed += 1;
-                                }
-                            }
-                            if resumed > 0 {
-                                dial_attempts = 0;
-                                emit(&config, "redialling",
-                                     &format!("lost a peer; trying its {resumed} known address(es) again"),
-                                     &[("peer_id", &peer_id.to_string()),
-                                       ("addresses", &resumed.to_string())]);
-                            }
-                        }
+                        redial_lost_peer(&config, &peer_id, &reached_by,
+                                         &mut pending, &mut dial_attempts);
                     }
                 }
 
@@ -1146,6 +1169,43 @@ fn record_production(config: &Config, work: &mut Work, effects: &str) {
                 ("new", &fresh.to_string()),
                 ("total", &work.ledger.count(kind).to_string()),
                 ("tick", &work.tick.to_string()),
+            ],
+        );
+    }
+}
+
+/// Puts a lost peer's addresses back on the list to be dialled.
+///
+/// Called both when the transport reports a connection closed and when a peer
+/// simply goes silent, because those are different events and only the second
+/// happens when a machine actually disappears. A process killed outright, a
+/// laptop closing, a hotspot switched off — none of them close anything. The
+/// connection stays open in the transport's opinion until an idle timeout
+/// minutes away, so a mesh that waits for that has already given up.
+fn redial_lost_peer(
+    config: &Config,
+    peer: &PeerId,
+    reached_by: &HashMap<PeerId, Vec<Multiaddr>>,
+    pending: &mut Vec<Multiaddr>,
+    attempts: &mut u32,
+) {
+    let Some(addresses) = reached_by.get(peer) else { return };
+    let mut resumed = 0;
+    for addr in addresses {
+        if !pending.contains(addr) {
+            pending.push(addr.clone());
+            resumed += 1;
+        }
+    }
+    if resumed > 0 {
+        *attempts = 0;
+        emit(
+            config,
+            "redialling",
+            &format!("lost a peer; trying its {resumed} known address(es) again"),
+            &[
+                ("peer_id", &peer.to_string()),
+                ("addresses", &resumed.to_string()),
             ],
         );
     }
