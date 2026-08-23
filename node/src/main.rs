@@ -278,9 +278,28 @@ struct Work {
     /// When this node noticed the owner disappear. Only set between the
     /// disappearance and the takeover, and used to measure the gap.
     owner_lost_at: Option<Instant>,
+    /// When this node may claim work nobody has answered for.
+    ///
+    /// A node told to run a job listens before doing so. Claiming immediately
+    /// means a node returning from a reboot takes work that somebody else has
+    /// been doing perfectly well, and both then run it — wasteful, and only
+    /// harmless because identical work produces identical results.
+    claim_after: Option<Instant>,
 }
 
 impl Work {
+    /// Which of two nodes running the same job should keep it.
+    ///
+    /// Both sides evaluate this and must agree, or the job either stalls
+    /// because each yields to the other, or is run twice because neither does.
+    ///
+    /// Whoever is further along keeps it: their work is the work that would be
+    /// lost. Ties go to the lower identifier, which is arbitrary and, more
+    /// importantly, the same arbitrary answer on both machines.
+    fn theirs(mine: (u64, &PeerId), theirs: (u64, &PeerId)) -> bool {
+        theirs.0 > mine.0 || (theirs.0 == mine.0 && theirs.1 < mine.1)
+    }
+
     /// Decides, with no coordination at all, whether this node should continue
     /// the job now that its owner is gone.
     ///
@@ -597,10 +616,16 @@ async fn run(config: Config) -> Result<()> {
             Some(Work {
                 job,
                 ledger: ledger::Ledger::new(),
-                owner: config.own.then_some(me),
+                // Not claimed yet, even when told to run it. Listening first
+                // costs a few seconds once; claiming first costs duplicated
+                // work every time a node restarts.
+                owner: None,
                 state: Vec::new(),
                 tick: 0,
                 owner_lost_at: None,
+                claim_after: config
+                    .own
+                    .then(|| Instant::now() + config.detect * 3),
             })
         }
         None => None,
@@ -685,6 +710,20 @@ async fn run(config: Config) -> Result<()> {
 
             _ = job_tick.tick() => {
                 let Some(work) = work.as_mut() else { continue };
+
+                // Claim only after listening long enough to have heard an
+                // existing owner. Any checkpoint received clears this, so the
+                // claim happens exactly when nobody answered for the work.
+                if let Some(at) = work.claim_after {
+                    if work.owner.is_none() && Instant::now() >= at {
+                        work.claim_after = None;
+                        work.owner = Some(me);
+                        emit(&config, "claimed",
+                             "nobody was running this job, so this node is",
+                             &[("tick", &work.tick.to_string())]);
+                    }
+                }
+
                 if work.owner != Some(me) { continue }
 
                 let mut inputs = Vec::new();
@@ -982,14 +1021,32 @@ async fn run(config: Config) -> Result<()> {
 
                         Message::Checkpoint { tick, state, .. } => {
                             let Some(w) = work.as_mut() else { continue };
-                            // A checkpoint is also how a node learns who is
-                            // running the job. Nobody announces ownership;
-                            // doing the work is the announcement.
-                            if w.owner != Some(source) {
+
+                            // Somebody is running it, so this node has no cause
+                            // to claim it.
+                            w.claim_after = None;
+
+                            if w.owner == Some(me) {
+                                // Two nodes running the same job, which a
+                                // partition produces whenever both sides
+                                // continue. Resolved by a rule both apply
+                                // identically — deferring to whoever sent last
+                                // would make each yield to the other in turn,
+                                // and the job would stop entirely.
+                                if !Work::theirs((w.tick, &me), (tick, &source)) {
+                                    continue;
+                                }
+                                emit(&config, "yielded",
+                                     &format!("{label} is further along, so it keeps the job"),
+                                     &[("peer_id", &source.to_string()), ("label", &label),
+                                       ("their_tick", &tick.to_string()),
+                                       ("our_tick", &w.tick.to_string())]);
+                            } else if w.owner != Some(source) {
                                 emit(&config, "job-owner",
                                      &format!("{label} is running the job"),
                                      &[("peer_id", &source.to_string()), ("label", &label)]);
                             }
+
                             w.owner = Some(source);
                             w.owner_lost_at = None;
                             // Older checkpoints can arrive late; taking one
@@ -1333,6 +1390,28 @@ mod tests {
             }
         }
         assert_eq!(winners, 1, "exactly one node must take over");
+    }
+
+    #[test]
+    fn the_node_further_along_keeps_the_job() {
+        let a = PeerId::random();
+        let b = PeerId::random();
+        // Whoever has done more work keeps it: their ticks are the ones that
+        // would be thrown away.
+        assert!(Work::theirs((10, &a), (12, &b)), "behind, should yield");
+        assert!(!Work::theirs((12, &a), (10, &b)), "ahead, should keep");
+    }
+
+    #[test]
+    fn a_tie_is_broken_the_same_way_on_both_machines() {
+        // The rule matters more than the winner. If the two sides disagree,
+        // either both yield and the job stops, or neither does and it runs
+        // twice for as long as the disagreement lasts.
+        let mut peers = vec![PeerId::random(), PeerId::random()];
+        peers.sort();
+        let (low, high) = (&peers[0], &peers[1]);
+        assert!(Work::theirs((5, high), (5, low)), "high yields to low");
+        assert!(!Work::theirs((5, low), (5, high)), "low keeps it");
     }
 
     #[test]
