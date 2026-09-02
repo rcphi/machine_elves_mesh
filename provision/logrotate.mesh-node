@@ -6,5 +6,7 @@
     missingok
     notifempty
     copytruncate
-    su meshnode meshnode
+    # No su directive. systemd's StandardOutput=append creates the file as
+    # root whatever User= says, so rotating as meshnode cannot truncate it —
+    # logrotate then skips the file silently and it grows without limit.
 }

@@ -66,6 +66,15 @@ const KIND_OBSERVED: u8 = 4;
 /// How often a node repeats what it can see, for anyone who has since arrived.
 const ANNOUNCE_EVERY: Duration = Duration::from_secs(30);
 
+/// How often to write a line about work being done.
+///
+/// A job ticking five times a second produces some 432,000 events a day, and
+/// left unchecked they were 100% of a log that reached 192 MB in ten days. They
+/// are also the least informative thing in it: a factory producing widgets is
+/// the steady hum, not an event. One line a minute says the same thing, and
+/// leaves the log made of things that actually happened.
+const WORK_SUMMARY_EVERY: Duration = Duration::from_secs(60);
+
 /// How often the node running a job advances it.
 const DEFAULT_JOB_TICK_MS: u64 = 200;
 
@@ -674,6 +683,9 @@ async fn run(config: Config) -> Result<()> {
     let mut announce = tokio::time::interval(ANNOUNCE_EVERY);
     let mut my_address: Option<Multiaddr> = None;
     let mut renew_mapping = tokio::time::interval(portmap::RENEW_EVERY);
+    let mut work_summary = tokio::time::interval(WORK_SUMMARY_EVERY);
+    let mut since_summary: HashMap<String, u64> = HashMap::new();
+    let mut ticks_since_summary: u64 = 0;
     let mut mapping: Option<portmap::Mapping> = None;
 
     let me = *swarm.local_peer_id();
@@ -780,6 +792,31 @@ async fn run(config: Config) -> Result<()> {
                 }
             }
 
+            _ = work_summary.tick(), if work.is_some() => {
+                let Some(w) = work.as_ref() else { continue };
+                if ticks_since_summary == 0 {
+                    // Silence here is the interesting case: a node that holds a
+                    // job and is not advancing it. Said once rather than
+                    // repeatedly, so a standby does not narrate its own idleness
+                    // forever.
+                    continue;
+                }
+                let mut what: Vec<String> = since_summary
+                    .iter()
+                    .map(|(kind, count)| format!("{kind} ×{count}"))
+                    .collect();
+                what.sort();
+                emit(&config, "working",
+                     &format!("tick {} — {ticks_since_summary} ticks in the last minute; {}",
+                              w.tick,
+                              if what.is_empty() { "nothing produced".to_string() } else { what.join(", ") }),
+                     &[("tick", &w.tick.to_string()),
+                       ("ticks", &ticks_since_summary.to_string()),
+                       ("ledger", &w.ledger.len().to_string())]);
+                ticks_since_summary = 0;
+                since_summary.clear();
+            }
+
             _ = announce.tick() => {
                 for (peer, addr) in &seen_at {
                     let _ = swarm.behaviour_mut().gossipsub
@@ -831,12 +868,17 @@ async fn run(config: Config) -> Result<()> {
                         // widgets counted twice is not. Whatever applies these
                         // must therefore treat (job, tick) as the identity of
                         // an effect and ignore a repeat.
+                        ticks_since_summary += 1;
                         let effects = String::from_utf8_lossy(&outcome.effects).into_owned();
+                        // Counted rather than written out. What a reader wants
+                        // to know is that work is happening and roughly how
+                        // much; the individual ticks are noise that buries
+                        // everything else.
                         for line in effects.lines() {
-                            emit(&config, "effect", &format!("tick {} — {line}", work.tick),
-                                 &[("tick", &work.tick.to_string()), ("effect", line)]);
+                            let kind = line.split_whitespace().take(2).collect::<Vec<_>>().join(" ");
+                            *since_summary.entry(kind).or_insert(0) += 1;
                         }
-                        record_production(&config, work, &effects);
+                        record_production(work, &effects);
                         // Checkpointed every tick because this state is tiny.
                         // Real work would checkpoint less often and trade a
                         // little replayed work for a lot less traffic.
@@ -1216,7 +1258,7 @@ async fn run(config: Config) -> Result<()> {
 /// the same job, they do not make two widgets each that someone must later
 /// reconcile: they make *the same* widgets, and recording one twice records it
 /// once. There is nothing to deduplicate because there is no duplicate.
-fn record_production(config: &Config, work: &mut Work, effects: &str) {
+fn record_production(work: &mut Work, effects: &str) {
     for line in effects.lines() {
         let mut parts = line.split_whitespace();
         if parts.next() != Some("produce") {
@@ -1225,29 +1267,10 @@ fn record_production(config: &Config, work: &mut Work, effects: &str) {
         let Some(kind) = parts.next() else { continue };
         let count: u32 = parts.next().and_then(|n| n.parse().ok()).unwrap_or(1);
 
-        let mut fresh = 0;
         for ordinal in 0..count {
             let serial = ledger::Serial::derive(work.job.id(), work.tick, kind, ordinal);
-            if work.ledger.record(kind, serial) {
-                fresh += 1;
-            }
+            work.ledger.record(kind, serial);
         }
-
-        emit(
-            config,
-            "produced",
-            &format!(
-                "{count} {kind}, {fresh} new — {} in the ledger",
-                work.ledger.count(kind)
-            ),
-            &[
-                ("kind", kind),
-                ("claimed", &count.to_string()),
-                ("new", &fresh.to_string()),
-                ("total", &work.ledger.count(kind).to_string()),
-                ("tick", &work.tick.to_string()),
-            ],
-        );
     }
 }
 

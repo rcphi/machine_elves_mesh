@@ -195,14 +195,22 @@ def main():
             seen = r.get("ipv4", {}).get("observers") or []
             if seen:
                 addresses.append(seen[0]["mapped"])
-        distinct = list(dict.fromkeys(addresses))
-        if len(distinct) == 1:
-            print(f"  address     {distinct[0]} — unchanged across {len(addresses)} readings")
-        elif len(distinct) > 1:
-            print(f"  address     CHANGED {len(distinct) - 1}x over {len(addresses)} readings")
-            for a in distinct[-3:]:
-                print(f"                {a}")
-            print("              a remembered address would have gone stale this often")
+        if not addresses:
+            print("  address     never observed")
+        else:
+            # How often the usual address held, not how many times it changed.
+            # Counting transitions made an address seen 1,759 times out of 1,780
+            # read as "CHANGED 81x", which is true and thoroughly misleading:
+            # what a peer cache cares about is the chance a remembered address
+            # still works, and that is a proportion.
+            counts = collections.Counter(addresses)
+            usual, seen_count = counts.most_common(1)[0]
+            share = 100.0 * seen_count / len(addresses)
+            print(f"  address     {usual}")
+            print(f"              seen in {seen_count}/{len(addresses)} readings ({share:.1f}%)")
+            if len(counts) > 1:
+                print(f"              {len(counts) - 1} other address(es) seen; a remembered one")
+                print(f"              would have been wrong about {100 - share:.1f}% of the time")
 
         # Averaged over every reading rather than taken from the latest,
         # because what matters is how often a bridge was *present*, not whether
