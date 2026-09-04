@@ -63,6 +63,66 @@ const KIND_CHECKPOINT: u8 = 3;
 /// rented infrastructure without refusing the thing it would have provided.
 const KIND_OBSERVED: u8 = 4;
 
+/// "These things now exist."
+///
+/// The inventory does not travel in the checkpoint, and the reason is size: the
+/// checkpoint goes out five times a second so that a takeover costs almost no
+/// replayed work, and a third of a million items would not fit in it or in any
+/// sane message. So the ledger is replicated the way a grow-only set wants to
+/// be — each item announced once, as it is made, and merged by union wherever
+/// it lands.
+///
+/// Union is why this needs no ordering, no acknowledgement, and no memory of
+/// who has been told what. A delta heard twice is a delta heard once, and one
+/// heard late is not late. The same message also carries pieces of an existing
+/// ledger during a repair, because a chunk of history and a fresh production
+/// are the same thing to a set.
+const KIND_PRODUCED: u8 = 5;
+
+/// "This is everything I hold, in 32 bytes."
+///
+/// Deltas alone converge only for nodes that were listening. Anyone offline
+/// when an item was announced never hears of it again, because gossip does not
+/// retain. So nodes periodically publish a hash of their whole set: agreement
+/// costs 32 bytes to confirm, and disagreement is what triggers a repair.
+///
+/// It says *that* two nodes differ, never *how*. That is the cheap half of
+/// reconciliation, and it is the half that runs constantly.
+const KIND_LEDGER_DIGEST: u8 = 6;
+
+/// How many items to put in one message.
+///
+/// Gossipsub refuses anything oversized, and a refused repair is invisible —
+/// it does not fail loudly, it simply never arrives. Sized well inside the
+/// default cap so that a long kind name cannot push a chunk over it.
+const LEDGER_CHUNK: usize = 512;
+
+/// How often nodes say what they hold.
+///
+/// Rarely, because agreement is the normal case and this is the message that
+/// confirms it. The deltas do the actual replicating; this only catches what
+/// they missed.
+const DIGEST_EVERY: Duration = Duration::from_secs(60);
+
+/// The least time between two repairs.
+///
+/// A repair sends an entire ledger, and every node that hears a digest it
+/// disagrees with wants to send one. Without a floor, a single node joining an
+/// established mesh would draw a simultaneous full dump from everybody, which
+/// is the connection storm again wearing different clothes. One repair, then
+/// quiet long enough to find out whether it worked.
+const REPAIR_NO_SOONER_THAN: Duration = Duration::from_secs(30);
+
+/// Whether enough time has passed to send another full ledger.
+fn repair_allowed(last: &mut Option<Instant>) -> bool {
+    let now = Instant::now();
+    if last.is_none_or(|when| now.duration_since(when) >= REPAIR_NO_SOONER_THAN) {
+        *last = Some(now);
+        return true;
+    }
+    false
+}
+
 /// How often a node repeats what it can see, for anyone who has since arrived.
 const ANNOUNCE_EVERY: Duration = Duration::from_secs(30);
 
@@ -120,6 +180,8 @@ enum Message {
     Departing { label: String },
     Checkpoint { label: String, tick: u64, state: Vec<u8> },
     Observed { label: String, peer: PeerId, addr: Multiaddr },
+    Produced { label: String, items: Vec<(String, ledger::Serial)> },
+    LedgerDigest { label: String, held: u64, digest: [u8; 32] },
 }
 
 fn put_str(out: &mut Vec<u8>, text: &str) {
@@ -181,6 +243,23 @@ fn encode_checkpoint(label: &str, tick: u64, state: &[u8]) -> Vec<u8> {
     out
 }
 
+fn encode_produced(label: &str, items: &[(String, ledger::Serial)]) -> Vec<u8> {
+    let mut out = vec![KIND_PRODUCED];
+    put_str(&mut out, label);
+    let body = ledger::encode_items(items.iter().map(|(kind, serial)| (kind.as_str(), serial)));
+    out.extend_from_slice(&(body.len() as u32).to_le_bytes());
+    out.extend_from_slice(&body);
+    out
+}
+
+fn encode_ledger_digest(label: &str, held: u64, digest: &[u8; 32]) -> Vec<u8> {
+    let mut out = vec![KIND_LEDGER_DIGEST];
+    put_str(&mut out, label);
+    out.extend_from_slice(&held.to_le_bytes());
+    out.extend_from_slice(digest);
+    out
+}
+
 /// Returns `None` for anything unrecognised or malformed.
 ///
 /// A future version publishing kinds this one has never heard of must be
@@ -208,6 +287,20 @@ fn parse_message(bytes: &[u8]) -> Option<Message> {
                 .parse()
                 .ok()?;
             Some(Message::Observed { label, peer, addr })
+        }
+        KIND_PRODUCED => {
+            let items = ledger::decode_items(&take_bytes(bytes, &mut at)?);
+            // An empty batch is not worth announcing, and accepting one would
+            // mean a malformed message and a meaningless one look the same.
+            if items.is_empty() {
+                return None;
+            }
+            Some(Message::Produced { label, items })
+        }
+        KIND_LEDGER_DIGEST => {
+            let held = take_u64(bytes, &mut at)?;
+            let digest: [u8; 32] = bytes.get(at..at + 32)?.try_into().ok()?;
+            Some(Message::LedgerDigest { label, held, digest })
         }
         _ => None,
     }
@@ -266,6 +359,13 @@ struct Config {
     /// no peer could remember it, and a cache of peers was a cache of
     /// identities that would never appear again.
     identity: String,
+    /// Where the inventory lives between runs.
+    ///
+    /// Kept beside the identity because it is the same kind of thing: the part
+    /// of a node that is not recreated by starting it again. Held only in
+    /// memory, a ledger was a tally of the current session wearing the name of
+    /// a permanent record.
+    ledger: String,
     /// Whether to ask the router to forward this node's port.
     ///
     /// On by default. A mesh where nobody is reachable cannot admit anyone it
@@ -383,6 +483,7 @@ fn parse_args() -> Result<Config> {
         mesh: "default".to_string(),
         port: DEFAULT_PORT,
         identity: "/var/lib/mesh-node/identity".to_string(),
+        ledger: "/var/lib/mesh-node/ledger".to_string(),
         map_port: true,
         mdns: true,
         own: false,
@@ -412,6 +513,7 @@ fn parse_args() -> Result<Config> {
             "--mesh" => config.mesh = args.next().context("--mesh needs a name")?,
             "--port" => config.port = args.next().context("--port needs a number")?.parse()?,
             "--identity" => config.identity = args.next().context("--identity needs a path")?,
+            "--ledger" => config.ledger = args.next().context("--ledger needs a path")?,
             "--keepalive-ms" => {
                 config.keepalive = Duration::from_millis(
                     args.next().context("--keepalive-ms needs a number")?.parse()?,
@@ -530,6 +632,9 @@ fn print_usage() {
     println!("  --identity <file>    where to keep this node's identity, so it is the");
     println!("                       same node after a restart (default");
     println!("                       /var/lib/mesh-node/identity)");
+    println!("  --ledger <file>      where to keep what this node knows exists, so an");
+    println!("                       inventory outlives the process that built it");
+    println!("                       (default /var/lib/mesh-node/ledger)");
     println!("  --mesh <name>        which mesh to join (default \"default\"). Nodes in");
     println!("                       different meshes ignore each other entirely");
     println!("  --job <file.wasm>    hold this job, ready to run or to continue it");
@@ -683,6 +788,8 @@ async fn run(config: Config) -> Result<()> {
     let mut announce = tokio::time::interval(ANNOUNCE_EVERY);
     let mut my_address: Option<Multiaddr> = None;
     let mut renew_mapping = tokio::time::interval(portmap::RENEW_EVERY);
+    let mut say_digest = tokio::time::interval(DIGEST_EVERY);
+    let mut last_repair: Option<Instant> = None;
     let mut work_summary = tokio::time::interval(WORK_SUMMARY_EVERY);
     let mut since_summary: HashMap<String, u64> = HashMap::new();
     let mut ticks_since_summary: u64 = 0;
@@ -721,9 +828,33 @@ async fn run(config: Config) -> Result<()> {
             emit(&config, "job-loaded",
                  &format!("holding {path}{}", if config.own { ", running it" } else { ", standing by" }),
                  &[("path", path), ("owner", if config.own { "true" } else { "false" })]);
+            // What this node already knew existed, from before it was last
+            // stopped. A ledger that started empty made every restart look
+            // like the world had never been built in.
+            let ledger = match ledger::Ledger::load(std::path::Path::new(&config.ledger)) {
+                Ok(ledger) => {
+                    if !ledger.is_empty() {
+                        emit(&config, "ledger-loaded",
+                             &format!("remembers {} things that already exist", ledger.len()),
+                             &[("held", &ledger.len().to_string()), ("path", &config.ledger)]);
+                    }
+                    ledger
+                }
+                // Unreadable is not empty, and saying so matters: this node is
+                // about to rebuild an inventory from whatever its peers happen
+                // to mention, which will look like agreement long before it is.
+                Err(error) => {
+                    emit(&config, "ledger-unreadable",
+                         &format!("{} could not be read ({error}) — starting from nothing, \
+                                   and anything no peer mentions again is forgotten",
+                                  config.ledger),
+                         &[("path", &config.ledger), ("error", &error.to_string())]);
+                    ledger::Ledger::new()
+                }
+            };
             Some(Work {
                 job,
-                ledger: ledger::Ledger::new(),
+                ledger,
                 // Not claimed yet, even when told to run it. Listening first
                 // costs a few seconds once; claiming first costs duplicated
                 // work every time a node restarts.
@@ -828,6 +959,26 @@ async fn run(config: Config) -> Result<()> {
                 }
             }
 
+            // Said by every node holding the job, owner or not. A standby's
+            // ledger is as authoritative as anyone's — it is the same set —
+            // and a standby is exactly the node most likely to have missed
+            // something while it was away.
+            _ = say_digest.tick(), if work.is_some() => {
+                if let Some(w) = work.as_ref() {
+                    // Published even when empty, and *especially* when empty.
+                    // A node holding nothing is the one most in need of being
+                    // sent something, and staying quiet until it has something
+                    // to report is how it would stay empty: the only thing
+                    // that prompts a peer to send history is hearing a digest
+                    // that disagrees with its own.
+                    let _ = swarm.behaviour_mut().gossipsub.publish(
+                        topic.clone(),
+                        encode_ledger_digest(&config.label,
+                                             w.ledger.len() as u64,
+                                             &w.ledger.digest()));
+                }
+            }
+
             _ = work_summary.tick(), if work.is_some() => {
                 let Some(w) = work.as_ref() else { continue };
                 if ticks_since_summary == 0 {
@@ -914,7 +1065,7 @@ async fn run(config: Config) -> Result<()> {
                             let kind = line.split_whitespace().take(2).collect::<Vec<_>>().join(" ");
                             *since_summary.entry(kind).or_insert(0) += 1;
                         }
-                        record_production(work, &effects);
+                        let fresh = record_production(work, &effects);
                         // Checkpointed every tick because this state is tiny.
                         // Real work would checkpoint less often and trade a
                         // little replayed work for a lot less traffic.
@@ -922,6 +1073,11 @@ async fn run(config: Config) -> Result<()> {
                             topic.clone(),
                             encode_checkpoint(&config.label, work.tick, &work.state),
                         );
+                        // Separately from the checkpoint, and that separation
+                        // is the design: the checkpoint is where the job *is*,
+                        // small and sent constantly; this is what the job has
+                        // *made*, and it is sent once per thing, forever.
+                        publish_production(&mut swarm, &topic, &config, &fresh);
                     }
                     Err(error) => {
                         emit(&config, "job-failed", &format!("{error:#}"),
@@ -1124,7 +1280,9 @@ async fn run(config: Config) -> Result<()> {
                         Message::Heartbeat { label }
                         | Message::Departing { label }
                         | Message::Checkpoint { label, .. }
-                        | Message::Observed { label, .. } => label.clone(),
+                        | Message::Observed { label, .. }
+                        | Message::Produced { label, .. }
+                        | Message::LedgerDigest { label, .. } => label.clone(),
                     };
                     let known = members.contains_key(&source);
                     if !known && !matches!(parsed, Message::Departing { .. }) {
@@ -1144,6 +1302,20 @@ async fn run(config: Config) -> Result<()> {
                         counter += 1;
                         let _ = swarm.behaviour_mut().gossipsub
                             .publish(topic.clone(), encode_heartbeat(&config.label, counter));
+                        // And say what we hold, for the same reason. A node
+                        // that has just arrived has missed everything made
+                        // before it did, and waiting for the periodic digest
+                        // would leave it ignorant of the world for a minute
+                        // after joining it. The first digest each node sends
+                        // goes out before it is connected to anybody, so this
+                        // is in practice the one that starts a repair.
+                        if let Some(w) = work.as_ref() {
+                            let _ = swarm.behaviour_mut().gossipsub.publish(
+                                topic.clone(),
+                                encode_ledger_digest(&config.label,
+                                                     w.ledger.len() as u64,
+                                                     &w.ledger.digest()));
+                        }
                     } else if let Some(member) = members.get_mut(&source) {
                         member.last_heard = Instant::now();
                         member.disconnected = false;
@@ -1151,6 +1323,57 @@ async fn run(config: Config) -> Result<()> {
 
                     match parsed {
                         Message::Heartbeat { .. } => {}
+
+                        Message::Produced { items, .. } => {
+                            // Merged whether or not this node runs the job. A
+                            // standby that never advances a tick still holds a
+                            // full inventory this way, which is the point: the
+                            // record of what exists does not belong to whoever
+                            // happens to be doing the work.
+                            if let Some(w) = work.as_mut() {
+                                let added = w.ledger.absorb(items);
+                                if !added.is_empty() {
+                                    // Written down, not merely believed. The
+                                    // in-memory set and the file have to agree
+                                    // or a restart quietly undoes the merge.
+                                    let _ = ledger::append(
+                                        std::path::Path::new(&config.ledger), &added);
+                                }
+                            }
+                        }
+
+                        Message::LedgerDigest { held, digest, .. } => {
+                            if let Some(w) = work.as_ref() {
+                                let ours = w.ledger.digest();
+                                if ours != digest {
+                                    // Somebody is missing something. Whoever
+                                    // holds more sends; on a tie the lower
+                                    // identifier does, which is the same rule
+                                    // that settles job ownership — one rule
+                                    // fewer to get wrong, and both sides reach
+                                    // the same answer without discussing it.
+                                    let mine = w.ledger.len() as u64;
+                                    let ours_to_send = mine > held
+                                        || (mine == held && me < source);
+                                    if ours_to_send && repair_allowed(&mut last_repair) {
+                                        emit(&config, "ledger-repairing",
+                                             &format!("{label} holds {held} against this node's {mine} \
+                                                       — sending what is here"),
+                                             &[("their_held", &held.to_string()),
+                                               ("our_held", &mine.to_string()),
+                                               ("label", &label)]);
+                                        let all: Vec<_> = w.ledger.iter()
+                                            .map(|(kind, serial)| (kind.to_string(), *serial))
+                                            .collect();
+                                        for chunk in all.chunks(LEDGER_CHUNK) {
+                                            let _ = swarm.behaviour_mut().gossipsub.publish(
+                                                topic.clone(),
+                                                encode_produced(&config.label, chunk));
+                                        }
+                                    }
+                                }
+                            }
+                        }
 
                         Message::Departing { .. } => {
                             if let Some(member) = members.remove(&source) {
@@ -1294,7 +1517,15 @@ async fn run(config: Config) -> Result<()> {
 /// the same job, they do not make two widgets each that someone must later
 /// reconcile: they make *the same* widgets, and recording one twice records it
 /// once. There is nothing to deduplicate because there is no duplicate.
-fn record_production(work: &mut Work, effects: &str) {
+/// Records what a tick made, returning whatever the ledger had not already held.
+///
+/// The return is what gets announced and written down. It is usually everything
+/// produced, but not always: a tick replayed after a takeover derives the same
+/// serials as the node that ran it before, so re-running work the mesh already
+/// knows about correctly announces nothing. That is the duplicate problem
+/// dissolving rather than being handled.
+fn record_production(work: &mut Work, effects: &str) -> Vec<(String, ledger::Serial)> {
+    let mut fresh = Vec::new();
     for line in effects.lines() {
         let mut parts = line.split_whitespace();
         if parts.next() != Some("produce") {
@@ -1305,8 +1536,41 @@ fn record_production(work: &mut Work, effects: &str) {
 
         for ordinal in 0..count {
             let serial = ledger::Serial::derive(work.job.id(), work.tick, kind, ordinal);
-            work.ledger.record(kind, serial);
+            if work.ledger.record(kind, serial) {
+                fresh.push((kind.to_string(), serial));
+            }
         }
+    }
+    fresh
+}
+
+/// Writes new items down and tells everyone about them.
+///
+/// Both halves matter and neither is enough alone: the file is what survives a
+/// restart, and the announcement is what lets a node that was not running the
+/// job know the thing exists at all.
+fn publish_production(
+    swarm: &mut libp2p::Swarm<MeshBehaviour>,
+    topic: &gossipsub::IdentTopic,
+    config: &Config,
+    fresh: &[(String, ledger::Serial)],
+) {
+    if fresh.is_empty() {
+        return;
+    }
+    if let Err(error) = ledger::append(std::path::Path::new(&config.ledger), fresh) {
+        // Said once per occurrence rather than swallowed. A node whose ledger
+        // is not being written still works and still converges with its peers
+        // — it just forgets everything when it restarts, which is exactly the
+        // failure that is invisible until the restart.
+        emit(config, "ledger-not-saved", &format!("{error}"),
+             &[("path", &config.ledger), ("error", &error.to_string())]);
+    }
+    for chunk in fresh.chunks(LEDGER_CHUNK) {
+        let _ = swarm
+            .behaviour_mut()
+            .gossipsub
+            .publish(topic.clone(), encode_produced(&config.label, chunk));
     }
 }
 
@@ -1529,6 +1793,109 @@ mod tests {
                 state: b"opaque".to_vec()
             })
         );
+    }
+
+    fn serials(ticks: &[u64]) -> Vec<(String, ledger::Serial)> {
+        ticks
+            .iter()
+            .map(|tick| {
+                ("widget".to_string(), ledger::Serial::derive(&[7; 32], *tick, "widget", 0))
+            })
+            .collect()
+    }
+
+    #[test]
+    fn productions_and_digests_survive_a_round_trip() {
+        let items = serials(&[1, 2, 3]);
+        assert_eq!(
+            parse_message(&encode_produced("diamond", &items)),
+            Some(Message::Produced { label: "diamond".into(), items })
+        );
+
+        let digest = [9u8; 32];
+        assert_eq!(
+            parse_message(&encode_ledger_digest("diamond", 1234, &digest)),
+            Some(Message::LedgerDigest { label: "diamond".into(), held: 1234, digest })
+        );
+    }
+
+    #[test]
+    fn an_announcement_of_nothing_is_not_a_message() {
+        // Otherwise "malformed" and "meaningless" arrive looking identical,
+        // and a parser that accepts both can no longer reject either.
+        assert_eq!(parse_message(&encode_produced("diamond", &[])), None);
+    }
+
+    #[test]
+    fn a_production_is_never_mistaken_for_another_kind_of_message() {
+        // The nightmare in a hand-rolled codec: a new message kind that an
+        // older parser reads as an old one. A heartbeat that is really an
+        // inventory would make a departed node look present.
+        let produced = encode_produced("diamond", &serials(&[1]));
+        assert!(matches!(parse_message(&produced), Some(Message::Produced { .. })));
+        let digest = encode_ledger_digest("diamond", 1, &[0; 32]);
+        assert!(matches!(parse_message(&digest), Some(Message::LedgerDigest { .. })));
+    }
+
+    #[test]
+    fn two_nodes_separated_and_reunited_end_up_holding_the_same_things() {
+        // The whole point of choosing deltas over a ledger that rides in the
+        // checkpoint. Neither node is authoritative and neither asks what the
+        // other has; they announce what they made and union what they hear.
+        let mut alone = ledger::Ledger::new();
+        let mut apart = ledger::Ledger::new();
+        for (kind, serial) in serials(&[1, 2, 3]) {
+            alone.record(&kind, serial);
+        }
+        for (kind, serial) in serials(&[3, 4, 5]) {
+            apart.record(&kind, serial);
+        }
+        assert_ne!(alone.digest(), apart.digest(), "should start disagreeing");
+
+        // Each sends everything it holds, exactly as a repair does, and each
+        // absorbs the other's. Tick 3 was made by both and is one item.
+        let from_alone = encode_produced("alone", &alone.iter()
+            .map(|(k, s)| (k.to_string(), *s)).collect::<Vec<_>>());
+        let from_apart = encode_produced("apart", &apart.iter()
+            .map(|(k, s)| (k.to_string(), *s)).collect::<Vec<_>>());
+        let Some(Message::Produced { items: theirs, .. }) = parse_message(&from_apart) else {
+            panic!("did not parse");
+        };
+        let Some(Message::Produced { items: ours, .. }) = parse_message(&from_alone) else {
+            panic!("did not parse");
+        };
+        alone.absorb(theirs);
+        apart.absorb(ours);
+
+        assert_eq!(alone.digest(), apart.digest(), "should have converged");
+        assert_eq!(alone.len(), 5, "tick 3 was made twice and exists once");
+    }
+
+    #[test]
+    fn a_second_repair_waits() {
+        // A node joining an established mesh disagrees with everyone at once.
+        // Without a floor between repairs, every peer answers with a full
+        // ledger simultaneously.
+        let mut last = None;
+        assert!(repair_allowed(&mut last), "the first repair should go");
+        assert!(!repair_allowed(&mut last), "an immediate second should not");
+        last = Some(Instant::now() - REPAIR_NO_SOONER_THAN);
+        assert!(repair_allowed(&mut last), "one should go again after the wait");
+    }
+
+    #[test]
+    fn a_repair_is_broken_into_messages_a_peer_will_accept() {
+        // An oversized publish is dropped by gossipsub without complaint, so a
+        // repair that is too big does not fail — it silently never arrives.
+        let many = serials(&(0..LEDGER_CHUNK as u64 * 2 + 7).collect::<Vec<_>>());
+        let chunks: Vec<_> = many.chunks(LEDGER_CHUNK).collect();
+        assert_eq!(chunks.len(), 3, "should be split, not sent whole");
+        for chunk in chunks {
+            let encoded = encode_produced("diamond", chunk);
+            assert!(encoded.len() < 64 * 1024,
+                    "a chunk came to {} bytes, near gossipsub's cap", encoded.len());
+            assert!(matches!(parse_message(&encoded), Some(Message::Produced { .. })));
+        }
     }
 
     #[test]

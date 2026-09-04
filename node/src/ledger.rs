@@ -16,8 +16,50 @@
 //! it is applied — the property a world with no coordinator actually needs.
 
 use std::collections::BTreeSet;
+use std::io::{self, Read, Write};
+use std::path::Path;
 
 use sha2::{Digest, Sha256};
+
+/// One item on the wire and on disk: the length of its kind, the kind, the
+/// serial. The same shape in both places on purpose — a chunk of ledger sent
+/// to a peer and a chunk of ledger written to a file are the same thing, and
+/// giving them one encoding means there is only one of them to get wrong.
+pub fn encode_items<'a>(items: impl Iterator<Item = (&'a str, &'a Serial)>) -> Vec<u8> {
+    let mut out = Vec::new();
+    for (kind, serial) in items {
+        out.extend_from_slice(&(kind.len() as u32).to_le_bytes());
+        out.extend_from_slice(kind.as_bytes());
+        out.extend_from_slice(serial.as_bytes());
+    }
+    out
+}
+
+/// Reads back what `encode_items` wrote.
+///
+/// A trailing partial record is dropped rather than refused. The file is
+/// appended to as things are made, so a power cut lands mid-record eventually;
+/// losing the last item is the correct outcome, and refusing to start because
+/// of it is not.
+pub fn decode_items(bytes: &[u8]) -> Vec<(String, Serial)> {
+    let mut items = Vec::new();
+    let mut at = 0usize;
+    while at + 4 <= bytes.len() {
+        let len = u32::from_le_bytes(bytes[at..at + 4].try_into().expect("4 bytes")) as usize;
+        at += 4;
+        // A length that runs past the end is the truncated-record case.
+        let Some(kind) = bytes.get(at..at + len) else { break };
+        let Ok(kind) = std::str::from_utf8(kind) else { break };
+        at += len;
+        let Some(serial) = bytes.get(at..at + 32) else { break };
+        at += 32;
+        items.push((
+            kind.to_string(),
+            Serial::from_bytes(serial.try_into().expect("32 bytes")),
+        ));
+    }
+    items
+}
 
 /// The identity of one produced thing.
 ///
@@ -46,6 +88,14 @@ impl Serial {
 
     pub fn short(&self) -> String {
         self.0[..6].iter().map(|b| format!("{b:02x}")).collect()
+    }
+
+    pub fn as_bytes(&self) -> &[u8; 32] {
+        &self.0
+    }
+
+    pub fn from_bytes(bytes: [u8; 32]) -> Self {
+        Serial(bytes)
     }
 }
 
@@ -78,7 +128,7 @@ impl Ledger {
     /// whatever order they hear things in and however often — which is why no
     /// node ever has to ask another what it has already seen.
     pub fn merge(&mut self, other: &Ledger) {
-        self.items.extend(other.items.iter().cloned());
+        self.absorb(other.items.iter().cloned().collect());
     }
 
     pub fn count(&self, kind: &str) -> usize {
@@ -92,6 +142,83 @@ impl Ledger {
     pub fn is_empty(&self) -> bool {
         self.items.is_empty()
     }
+
+    /// Everything, in an order every node agrees on.
+    ///
+    /// The set is ordered, so two nodes holding the same items iterate them
+    /// identically no matter what order they arrived in. Everything below
+    /// depends on that: a digest computed from this is comparable between
+    /// machines, and a file written from it can be read back into the same set.
+    pub fn iter(&self) -> impl Iterator<Item = (&str, &Serial)> {
+        self.items.iter().map(|(kind, serial)| (kind.as_str(), serial))
+    }
+
+    /// A short stand-in for the whole set, for asking "do we agree?" cheaply.
+    ///
+    /// Two nodes exchange 32 bytes instead of megabytes, and learn whether
+    /// they hold the same things. It says nothing about *what* differs — only
+    /// that something does, which is enough to decide whether to look.
+    pub fn digest(&self) -> [u8; 32] {
+        let mut hasher = Sha256::new();
+        hasher.update(b"machine-elves/ledger-digest/1");
+        for (kind, serial) in self.iter() {
+            hasher.update((kind.len() as u32).to_le_bytes());
+            hasher.update(kind.as_bytes());
+            hasher.update(serial.as_bytes());
+        }
+        hasher.finalize().into()
+    }
+
+    /// Absorbs items from a peer or a file, returning those that were new.
+    ///
+    /// Returns the items themselves rather than a count because the caller has
+    /// to write them down, and the set is sorted — new arrivals land wherever
+    /// they belong, not at the end. There is no way to recover them afterwards
+    /// by looking at the set.
+    pub fn absorb(&mut self, items: Vec<(String, Serial)>) -> Vec<(String, Serial)> {
+        items
+            .into_iter()
+            .filter(|(kind, serial)| self.items.insert((kind.clone(), *serial)))
+            .collect()
+    }
+
+    /// Reads a ledger back from disk. A missing file is an empty ledger.
+    ///
+    /// This is the difference between an inventory and a session's tally. The
+    /// set is grow-only precisely so that it can outlive the process that
+    /// built it; keeping it only in memory threw that away every restart.
+    pub fn load(path: &Path) -> io::Result<Self> {
+        let mut ledger = Self::new();
+        match std::fs::File::open(path) {
+            Ok(mut file) => {
+                let mut bytes = Vec::new();
+                file.read_to_end(&mut bytes)?;
+                ledger.absorb(decode_items(&bytes));
+                Ok(ledger)
+            }
+            Err(error) if error.kind() == io::ErrorKind::NotFound => Ok(ledger),
+            Err(error) => Err(error),
+        }
+    }
+}
+
+/// Adds items to the file without rewriting it.
+///
+/// Append rather than replace, because the set only ever grows: what is already
+/// written is never wrong, so there is nothing to rewrite. A full rewrite of a
+/// third of a million items several times a second would also be the single
+/// most expensive thing this program does.
+pub fn append(path: &Path, items: &[(String, Serial)]) -> io::Result<()> {
+    if items.is_empty() {
+        return Ok(());
+    }
+    if let Some(parent) = path.parent() {
+        std::fs::create_dir_all(parent)?;
+    }
+    let mut file = std::fs::OpenOptions::new().create(true).append(true).open(path)?;
+    file.write_all(&encode_items(
+        items.iter().map(|(kind, serial)| (kind.as_str(), serial)),
+    ))
 }
 
 #[cfg(test)]
@@ -99,6 +226,64 @@ mod tests {
     use super::*;
 
     const JOB: [u8; 32] = [7; 32];
+
+    fn ledger_of(ticks: &[u64]) -> Ledger {
+        let mut ledger = Ledger::new();
+        for tick in ticks {
+            ledger.record("widget", Serial::derive(&JOB, *tick, "widget", 0));
+        }
+        ledger
+    }
+
+    #[test]
+    fn two_nodes_holding_the_same_things_agree_on_the_digest() {
+        // Insertion order differs, because two nodes hear about things in
+        // whatever order the network delivers them. The digest is what lets
+        // them notice they nonetheless match, without shipping the contents.
+        let forwards = ledger_of(&[1, 2, 3, 4, 5]);
+        let backwards = ledger_of(&[5, 4, 3, 2, 1]);
+        assert_eq!(forwards.digest(), backwards.digest());
+    }
+
+    #[test]
+    fn a_missing_item_changes_the_digest() {
+        assert_ne!(ledger_of(&[1, 2, 3]).digest(), ledger_of(&[1, 2]).digest());
+    }
+
+    #[test]
+    fn a_ledger_survives_being_written_down_and_read_back() {
+        let original = ledger_of(&[1, 2, 3]);
+        let bytes = encode_items(original.iter());
+        let mut recovered = Ledger::new();
+        recovered.absorb(decode_items(&bytes));
+        assert_eq!(original.digest(), recovered.digest());
+        assert_eq!(recovered.len(), 3);
+    }
+
+    #[test]
+    fn a_file_cut_off_mid_record_costs_only_that_record() {
+        // What a power cut during an append actually leaves behind. Losing the
+        // last item is correct; refusing to start is not.
+        let bytes = encode_items(ledger_of(&[1, 2, 3]).iter());
+        for cut in 1..bytes.len() {
+            let recovered = decode_items(&bytes[..cut]);
+            assert!(recovered.len() <= 3, "invented items from truncated bytes");
+        }
+        // Two whole records plus a fragment of the third.
+        let whole = 4 + "widget".len() + 32;
+        assert_eq!(decode_items(&bytes[..whole * 2 + 3]).len(), 2);
+    }
+
+    #[test]
+    fn absorbing_reports_only_what_was_new() {
+        let mut ledger = ledger_of(&[1, 2]);
+        let arriving = encode_items(ledger_of(&[2, 3]).iter());
+        assert_eq!(ledger.absorb(decode_items(&arriving)).len(), 1, "only tick 3 is new");
+        assert_eq!(ledger.len(), 3);
+        // Hearing it again changes nothing, which is why nobody has to track
+        // what they have already sent.
+        assert!(ledger.absorb(decode_items(&arriving)).is_empty());
+    }
 
     #[test]
     fn the_same_production_has_the_same_identity() {
