@@ -28,6 +28,21 @@ pub const LIFETIME_SECS: u32 = 3600;
 /// lost. Renewing at the last moment would make any single failure fatal.
 pub const RENEW_EVERY: Duration = Duration::from_secs(LIFETIME_SECS as u64 / 4);
 
+/// How long to wait for the router on each attempt.
+pub const ATTEMPT_TIMEOUT: Duration = Duration::from_secs(2);
+
+/// How many times to ask before concluding the router will not answer.
+pub const ATTEMPTS: u32 = 3;
+
+/// The longest a request can take: every attempt timing out in turn.
+///
+/// This is the number that matters to the caller. A router that does not speak
+/// NAT-PMP at all — a phone's hotspot, most notably — never replies, so this
+/// full budget is spent on every single renewal rather than being a rare worst
+/// case. Anything awaiting a request inline is therefore unresponsive for this
+/// long, every `RENEW_EVERY`, forever.
+pub const WORST_CASE: Duration = Duration::from_secs(ATTEMPT_TIMEOUT.as_secs() * ATTEMPTS as u64);
+
 #[derive(Debug, Clone, Copy, PartialEq)]
 pub struct Mapping {
     pub external_ip: Ipv4Addr,
@@ -93,9 +108,9 @@ async fn ask(
     message: &[u8],
     reply: &mut [u8],
 ) -> io::Result<usize> {
-    for _ in 0..3 {
+    for _ in 0..ATTEMPTS {
         socket.send_to(message, router).await?;
-        match tokio::time::timeout(Duration::from_secs(2), socket.recv_from(reply)).await {
+        match tokio::time::timeout(ATTEMPT_TIMEOUT, socket.recv_from(reply)).await {
             Ok(Ok((len, from))) if from.ip() == router.ip() => return Ok(len),
             Ok(Ok(_)) => continue,
             Ok(Err(e)) => return Err(e),

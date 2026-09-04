@@ -687,6 +687,25 @@ async fn run(config: Config) -> Result<()> {
     let mut since_summary: HashMap<String, u64> = HashMap::new();
     let mut ticks_since_summary: u64 = 0;
     let mut mapping: Option<portmap::Mapping> = None;
+    // The renewal's answer, carried back from a task rather than awaited here.
+    //
+    // A router that does not speak NAT-PMP never replies, and asking costs the
+    // full retry budget — six seconds — before it fails. Awaited inside the
+    // select arm below, that six seconds is six seconds in which this node
+    // sends no heartbeat and reads none, which is twice the detection window:
+    // every peer concludes it died, and it concludes every peer died. Measured
+    // on a laptop tethered to a phone, this fired every fifteen minutes for two
+    // days and cost 94 needless job takeovers, each one immediately undone.
+    //
+    // So the ask happens elsewhere and the answer arrives as a message. The
+    // loop keeps turning while the router is being waited on.
+    let (mapping_tx, mut mapping_rx) =
+        tokio::sync::mpsc::channel::<std::result::Result<portmap::Mapping, String>>(1);
+    // One outstanding request at a time. The renewal interval is fifteen
+    // minutes and a request gives up after six seconds, so this should never
+    // engage — but if a router ever holds the socket open longer than the
+    // interval, requests would otherwise pile up unboundedly.
+    let mut renewing = false;
 
     let me = *swarm.local_peer_id();
     emit(
@@ -767,8 +786,25 @@ async fn run(config: Config) -> Result<()> {
             // that asks at startup and forgets stops being reachable an hour
             // later while appearing perfectly healthy — which is the kind of
             // failure that gets diagnosed as something else entirely.
-            _ = renew_mapping.tick(), if config.map_port => {
-                match portmap::request(config.port, portmap::LIFETIME_SECS).await {
+            _ = renew_mapping.tick(), if config.map_port && !renewing => {
+                // Spawned, not awaited. See `mapping_rx` above for why.
+                renewing = true;
+                let port = config.port;
+                let tx = mapping_tx.clone();
+                tokio::spawn(async move {
+                    let answer = portmap::request(port, portmap::LIFETIME_SECS)
+                        .await
+                        .map_err(|error| error.to_string());
+                    // The receiver lives as long as the loop, and the loop
+                    // outlives this task in every case that matters. If it has
+                    // gone, the node is shutting down and the answer is moot.
+                    let _ = tx.send(answer).await;
+                });
+            }
+
+            Some(answer) = mapping_rx.recv() => {
+                renewing = false;
+                match answer {
                     Ok(now) => {
                         if mapping != Some(now) {
                             emit(&config, "port-mapped",
@@ -784,8 +820,8 @@ async fn run(config: Config) -> Result<()> {
                         // Reported every time rather than once. If a router
                         // stops renewing, reachability is being lost right now,
                         // and a single line an hour ago would not say so.
-                        emit(&config, "port-map-failed", &format!("{error}"),
-                             &[("error", &error.to_string()),
+                        emit(&config, "port-map-failed", &error,
+                             &[("error", &error),
                                ("was_mapped", if mapping.is_some() { "true" } else { "false" })]);
                         mapping = None;
                     }
@@ -1382,8 +1418,13 @@ async fn depart(
     // Give the port back. It would lapse on its own, but leaving a door open in
     // somebody's router after leaving is untidy in the same way as vanishing
     // without saying goodbye.
+    //
+    // Bounded, because a router that does not answer would otherwise hold the
+    // shutdown for the full six-second retry budget — delaying the goodbye this
+    // function exists to deliver, and every restart along with it. The mapping
+    // expires by itself within the hour, so the courtesy is not worth waiting on.
     if config.map_port {
-        let _ = portmap::release(config.port).await;
+        let _ = tokio::time::timeout(Duration::from_secs(1), portmap::release(config.port)).await;
     }
 
     let deadline = tokio::time::Instant::now() + Duration::from_millis(500);
@@ -1601,6 +1642,29 @@ mod tests {
     fn escapes_json_strings() {
         assert_eq!(json_string("a\"b"), "\"a\\\"b\"");
         assert_eq!(json_string("tab\there"), "\"tab\\u0009here\"");
+    }
+
+    #[test]
+    fn asking_the_router_takes_longer_than_a_peer_takes_to_be_declared_dead() {
+        // The reason the renewal is spawned rather than awaited in the select
+        // loop, recorded as an assertion so that it cannot quietly stop being
+        // true. A router that never answers costs the full retry budget, and
+        // that budget is longer than the detection window — so awaiting it
+        // inline makes the node miss enough heartbeats to be declared dead by
+        // every peer, and to declare every peer dead in turn.
+        //
+        // Measured, not theorised: on a laptop tethered to a phone this fired
+        // every fifteen minutes for two days, producing 96 false departures and
+        // 94 needless job takeovers, none of which were real.
+        let detect = Duration::from_millis(DEFAULT_DETECT_MS);
+        assert!(
+            portmap::WORST_CASE > detect,
+            "a failing renewal ({:?}) now fits inside the detection window ({:?}); \
+             if that is genuinely true the spawn is no longer load-bearing, but \
+             check why before deleting it",
+            portmap::WORST_CASE,
+            detect
+        );
     }
 
     #[test]
