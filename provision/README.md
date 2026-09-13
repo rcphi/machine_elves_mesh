@@ -139,6 +139,59 @@ Both report the same events; the summary counts them and the watcher narrates
 them as they arrive. The watcher is for the minutes when something is being
 deliberately broken and the question is what the node makes of it.
 
+## Timing takeovers
+
+`chaos.py` takes a box's node away at random so takeovers can be measured
+against the thresholds fixed in `../docs/phase-0-plan.md`: 2–3 s detection and
+500 ms resume, at p95.
+
+On each box in the run, once:
+
+```
+sudo ./chaos.py install
+```
+
+Then, to start a run — on every box, at roughly the same time:
+
+```
+sudo mesh-chaos arm 8          # fires every 3–7 minutes for eight hours
+mesh-chaos status              # armed or not, and what it has done
+sudo mesh-chaos disarm         # stop early
+```
+
+**It acts only when this node is running the job and has a peer present**,
+and only once the last disruption has settled for a minute. Each fire picks
+kill (60%), term (20%) or a 20–60 s partition (20%), and logs to
+`/var/log/mesh-node/chaos.jsonl`. **It disarms itself** when the hours are up.
+
+**Nothing needs to reach a box while a run is armed.** That is the point of it
+running locally. Looking at a home box from another machine on the same LAN
+is harmless, because LAN traffic never crosses the router being measured. A box
+on another network — a laptop on a hotspot — is left alone until the run ends.
+
+A partition drops every packet of the `mesh-node` unit's control group and
+nothing else, so SSH to a partitioned box still works.
+
+Afterwards, gather both logs from every box and read them together:
+
+```
+scp diamond:/var/log/mesh-node/{events,chaos}.jsonl run-a/diamond/
+scp riverboat:/var/log/mesh-node/{events,chaos}.jsonl run-a/riverboat/
+./takeover-summary.py run-a/*/*.jsonl
+```
+
+It reads only the armed period, reports p50/p95/p99 for detection, resume and
+the visible gap by cause and direction, gives the verdict against the
+thresholds, and counts what should not happen: orphaned jobs, double
+takeovers, false alarms, restarts nobody noticed.
+
+**Every duration is measured on a single machine's clock.** Clocks between boxes
+are used only to match an action to its takeover, to within seconds.
+
+Before any of this reaches a box, `../node/chaos-rig.sh` plays two boxes on
+one machine with compressed timings. It found the one-way gossip fault on its
+first run.
+
 ## Collecting results
 
 From the operator's machine:

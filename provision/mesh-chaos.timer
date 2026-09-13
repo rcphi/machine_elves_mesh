@@ -1,0 +1,14 @@
+[Unit]
+Description=Fire mesh-chaos every 3–7 minutes
+
+[Timer]
+# Three minutes after each fire finishes, plus up to four more at random,
+# re-drawn every time. Random so that disruptions do not line up with anything
+# periodic in the node — the minute summary, the digest, the mapping renewal.
+OnActiveSec=3min
+OnUnitInactiveSec=3min
+RandomizedDelaySec=4min
+AccuracySec=1s
+
+[Install]
+WantedBy=timers.target

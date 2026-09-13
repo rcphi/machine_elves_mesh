@@ -601,6 +601,39 @@ Five faults, none of which any rig here had caught. Every one needed two machine
 
 **The lesson is about testing rather than about any of the bugs.** All six live in the same place: what happens *after* something goes wrong and then comes back. A rig that starts a connection and tears it down never visits there. A person turning a phone off and on visits immediately.
 
+## The timing criterion was never measured — 2026-09-12
+
+**"Phase 0's question, answered" rests on one takeover.** The thresholds fixed on 2026-08-21 are distributions evaluated at p95, and a single run has no p95. It showed that work *can* move between carriers, not that it moves fast enough. The second stop criterion — a stall long enough to read as broken software — is open until it is measured.
+
+**The node could not have met the detection threshold.** Detection was set to 3 s, and the sweep that notices silence runs every quarter window, so a loss was noticed 3.0–3.75 s after the last word: over 2–3 s by construction. It is now 2 s, landing at 2.0–2.5 s. **Changed before the timed runs, not after them** — the threshold stayed fixed and only the setting moved. The cost of a shorter window is false alarms on a jittery link, and the runs count them rather than assume there are none.
+
+**Meeting 500 ms resume as written will still leave a player waiting ~2.5 s.** The node takes over only after detection. The 500 ms budget was premised on speculative resume from a warm standby (above, "Two consequences of choosing 500 ms"), which is not built. So the runs report the **visible gap** — last state heard to first state produced — beside the thresholds, and the baseline is taken before speculation is built, so the difference it makes is measured rather than assumed.
+
+**How:** `provision/chaos.py` runs on each box and, every 3–7 minutes, takes the node away if and only if it is running the job with a peer present — kill (60%), announced stop (20%), or a 20–60 s partition (20%). It needs nothing from outside the box once armed. Every duration is measured on the survivor's own clock; clocks between machines are used only to pair an action with its takeover. Two runs, so the network's contribution can be separated from the node's:
+
+| Run | Mesh | Isolates |
+|---|---|---|
+| A | diamond + riverboat, same LAN | the node's own takeover logic |
+| B | diamond + yoinkerz on the phone hotspot | the same, plus a real internet path |
+
+### A returning node was never heard again
+
+**Found by the local chaos rig on its first run, before anything touched a box.** A node killed and restarted within ten seconds was connected to, and then never heard from: the survivor logged no `joined`, and would have held the job alone indefinitely while the returned node stood by believing all was well.
+
+The survivor had declared the node gone but kept its QUIC connection, which the transport holds until its own 10 s idle timeout. The restarted node's connection therefore arrived as a *second* connection to a peer already connected, and gossipsub exchanges topic subscriptions only on the first. The returning node never learned the survivor was subscribed, and published into nothing.
+
+**A box restarts its node after exactly ten seconds**, so this was not an edge case: it was a race the ordinary restart path runs every time, and would have corrupted every takeover after the first in a timed run.
+
+**The first fix was incomplete, and the second dry run said so.** Dropping a peer's connections when declaring it gone fixed the unannounced case. An announced departure reopened it by a different route: the survivor, having dropped the connection, redialled at once — and reached the departing node during the half second it spends making sure its goodbye is delivered. The node then exited without closing that brand-new connection, and the stale connection was back.
+
+So there are three layers now, each covering what the one above can miss:
+
+- A node drops a peer's connections when it declares the peer gone, whether by silence or by announcement.
+- A departing node closes its own connections before it exits.
+- **Whatever the route, a stale connection has one signature** — a former member connected at the transport and silent in gossip. Two detection windows of that, and the connection is dropped so a fresh one can form.
+
+`node/migration-rig.sh` checks both kill and announced return inside the idle timeout. It failed one run in three with only the first layer; twenty of twenty with all three.
+
 ## Volunteer machines and remote management
 
 Volunteers are not technically inclined. Machines are prepared centrally — Ubuntu 26.04, Rust and dependencies preinstalled — and shipped ready to plug in.
@@ -655,5 +688,5 @@ Household isolation (`--isolate-lan`) is opt-in, verifies internet reachability 
 ## Open decisions
 
 - **The rendezvous fallback**, if no volunteer turns out to be directly reachable. Manual invite exchange covers address distribution but not simultaneous-transmission timing.
-- **The threshold for an acceptable stall**, in milliseconds, written down before step 5.
+- ~~**The threshold for an acceptable stall**~~ — settled 2026-08-21: 2–3 s detection, 500 ms resume, at p95.
 - **How many volunteers** the go/no-go can honestly rest on, given three is enough to detect a problem class but not to estimate its frequency.

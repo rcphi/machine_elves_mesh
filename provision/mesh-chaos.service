@@ -1,0 +1,12 @@
+[Unit]
+Description=Take the mesh node away at random, to time takeovers
+Documentation=file:/usr/local/sbin/mesh-chaos
+
+[Service]
+Type=oneshot
+ExecStart=/usr/local/sbin/mesh-chaos fire
+# A partition interrupted mid-sleep must not leave the node cut off.
+ExecStopPost=-/usr/sbin/nft delete table inet mesh_chaos
+# Longest partition plus margin. A fire that hangs past this is a bug, and
+# should end rather than hold the node's packets indefinitely.
+TimeoutStartSec=120
