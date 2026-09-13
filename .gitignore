@@ -3,3 +3,4 @@ provision/results/
 dist/
 machine-elves-*.tar.gz
 spikes/*/target/
+__pycache__/
