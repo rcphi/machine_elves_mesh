@@ -20,8 +20,8 @@ OUT="$(mktemp -d)"
 ANNOUNCED_BUDGET_MS=500
 # An unannounced loss cannot beat the detection window, and the sweep that
 # notices it runs periodically.
-DETECT_MS=3000
-UNANNOUNCED_BUDGET_MS=4500
+DETECT_MS=2000
+UNANNOUNCED_BUDGET_MS=3500
 
 [[ -x "$BIN" ]] || { echo "build first: cargo build --release" >&2; exit 1; }
 [[ -f "$JOB" ]] || { echo "build the jobs first: ../jobs/build.sh" >&2; exit 1; }
@@ -53,13 +53,25 @@ run_case() {
     local mesh="rig-$$-$RANDOM-$name"
     mesh="${mesh// /-}"
 
-    "$BIN" --label owner --mesh "$mesh" --job "$JOB" --own --detect-ms "$DETECT_MS" --json > "$OUT/owner.log" 2>&1 &
+    # Each node needs a port, an identity and an inventory of its own. The
+    # defaults suit one node per machine; on one host, every node would share
+    # port 4001 and all but the first would fail to start.
+    own_files() { echo --port "$1" --no-map-port --identity "$OUT/$2.identity" --ledger "$OUT/$2.ledger"; }
+    rm -f "$OUT"/*.identity "$OUT"/*.ledger
+
+    # shellcheck disable=SC2046
+    "$BIN" --label owner --mesh "$mesh" --job "$JOB" --own --detect-ms "$DETECT_MS" --json \
+        $(own_files 4201 owner) > "$OUT/owner.log" 2>&1 &
     local owner=$!
     pids+=($owner)
     sleep 1
+    local port=4202
     for s in a b; do
-        "$BIN" --label "standby-$s" --mesh "$mesh" --job "$JOB" --detect-ms "$DETECT_MS" --json > "$OUT/$s.log" 2>&1 &
+        # shellcheck disable=SC2046
+        "$BIN" --label "standby-$s" --mesh "$mesh" --job "$JOB" --detect-ms "$DETECT_MS" --json \
+            $(own_files "$port" "$s") > "$OUT/$s.log" 2>&1 &
         pids+=($!)
+        port=$((port + 1))
     done
 
     # Readiness is not "the job started" — it is "both standbys are following
@@ -76,8 +88,10 @@ run_case() {
             grep -q '"event":"job-owner"' "$OUT/$s.log" 2>/dev/null || continue
             grep -q '"label":"standby-' "$OUT/$s.log" 2>/dev/null && following=$((following+1))
         done
+        # The owner no longer logs every tick, only a summary a minute, so
+        # "it has claimed the job" is the earliest sign it is running.
         local effects
-        effects=$(grep -c '"event":"effect"' "$OUT/owner.log" 2>/dev/null) || effects=0
+        effects=$(grep -c '"event":"claimed"' "$OUT/owner.log" 2>/dev/null) || effects=0
         if (( following == 2 && effects > 0 )); then ready=1; break; fi
         sleep 0.5
     done
@@ -121,9 +135,64 @@ run_case() {
     sleep 1
 }
 
+# A node killed and started again before the survivor's transport has noticed
+# the old connection is dead. Found by node/chaos-rig.sh: the survivor held the
+# dead QUIC connection for its 10 s idle timeout, the returning node's
+# connection arrived as a *second* connection to the same peer, and gossipsub
+# exchanges subscriptions only on the first. The survivor then heard nothing
+# from it — for as long as that run lasted. A box restarts its node after 10 s,
+# so this is the ordinary case, not a contrived one.
+return_case() {
+    local signal="$1" name="$2" budget_ms=8000
+    rm -f "$OUT"/*.log "$OUT"/*.identity "$OUT"/*.ledger
+    cleanup
+    local mesh="rig-$$-$RANDOM-return"
+
+    start_node() {
+        "$BIN" --label "$1" --mesh "$mesh" --json --detect-ms "$DETECT_MS" \
+            --port "$2" --no-map-port --no-mdns --peer "/ip4/127.0.0.1/udp/$3/quic-v1" \
+            --identity "$OUT/$1.identity" --ledger "$OUT/$1.ledger" >> "$OUT/$1.log" 2>&1 &
+        pids+=($!)
+    }
+    start_node stays 4301 4302
+    start_node returns 4302 4301
+    local returner=$!
+
+    local deadline=$((SECONDS + 15))
+    until grep -q '"event":"joined"' "$OUT/stays.log" 2>/dev/null; do
+        (( SECONDS < deadline )) || { echo "  FAIL  $name: never met"; fails=$((fails+1)); cleanup; return; }
+        sleep 0.5
+    done
+
+    kill "-$signal" "$returner"
+    # Past detection, well inside the transport's idle timeout. An announced
+    # departure is no different here: the process exits without closing its
+    # connection, so the survivor holds it just as long.
+    sleep 4
+    local before
+    before=$(grep -c '"event":"joined"' "$OUT/stays.log") || before=0
+    start_node returns 4302 4301
+    sleep $(( budget_ms / 1000 ))
+
+    local after
+    after=$(grep -c '"event":"joined"' "$OUT/stays.log") || after=0
+    if (( after > before )); then
+        printf '  ok    %-44s heard again within %d ms\n' "$name" "$budget_ms"
+    else
+        printf '  FAIL  %-44s the survivor never heard it again\n' "$name"
+        fails=$((fails+1))
+    fi
+    cleanup
+    sleep 1
+}
+
 echo "migrating a running job away from a node that goes away:"
 run_case "announced departure" TERM "$ANNOUNCED_BUDGET_MS"
 run_case "unannounced loss"    KILL "$UNANNOUNCED_BUDGET_MS"
+echo
+echo "a node that comes back before the old connection times out:"
+return_case KILL "after vanishing"
+return_case TERM "after leaving, announced"
 
 echo
 if (( fails )); then

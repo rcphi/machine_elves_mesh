@@ -14,11 +14,11 @@ COUNT="${1:-3}"
 DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 BIN="$DIR/target/release/mesh-node"
 OUT="$(mktemp -d)"
-DETECT_MS=3000
+DETECT_MS=2000
 
 # The threshold this is judged against, from docs/phase-0-plan.md. Detection may
 # take a little longer than the window itself, since the check is periodic.
-DETECT_BUDGET_MS=4000
+DETECT_BUDGET_MS=3000
 # An announced departure travels as a message and should be near-instant. This
 # is generous by a wide margin; the point is that it is a different order of
 # magnitude from the timeout path, not that it hits a precise number.
@@ -39,9 +39,17 @@ cleanup() {
 trap cleanup EXIT
 
 echo "starting $COUNT nodes…"
+port=4101
 for name in "${names[@]}"; do
-    "$BIN" --label "$name" --detect-ms "$DETECT_MS" --json > "$OUT/$name.log" 2>&1 &
+    # Each node needs a port, an identity and an inventory of its own. The
+    # defaults suit one node per machine; on one host, every node would share
+    # port 4001 and all but the first would fail to start.
+    "$BIN" --label "$name" --detect-ms "$DETECT_MS" --json \
+        --port "$port" --no-map-port \
+        --identity "$OUT/$name.identity" --ledger "$OUT/$name.ledger" \
+        > "$OUT/$name.log" 2>&1 &
     pids+=($!)
+    port=$((port + 1))
 done
 
 # Every node must have seen every other before anything is taken away, or a

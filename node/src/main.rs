@@ -11,7 +11,7 @@ mod job;
 mod ledger;
 mod portmap;
 
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 use std::time::{Duration, Instant, SystemTime};
 
 use anyhow::{Context, Result};
@@ -176,7 +176,12 @@ const DEFAULT_KEEPALIVE_MS: u64 = 55_000;
 
 #[derive(Debug, PartialEq)]
 enum Message {
-    Heartbeat { label: String },
+    /// `run` identifies one start of a node's process. The identity survives a
+    /// restart by design (§8.1), which is exactly why it cannot say whether a
+    /// peer that went silent and came back had restarted or had merely been
+    /// unreachable — and those are different failures that must not be counted
+    /// together.
+    Heartbeat { label: String, run: Option<u64> },
     Departing { label: String },
     Checkpoint { label: String, tick: u64, state: Vec<u8> },
     Observed { label: String, peer: PeerId, addr: Multiaddr },
@@ -211,10 +216,11 @@ fn take_bytes(bytes: &[u8], at: &mut usize) -> Option<Vec<u8>> {
     Some(value)
 }
 
-fn encode_heartbeat(label: &str, counter: u64) -> Vec<u8> {
+fn encode_heartbeat(label: &str, counter: u64, run: u64) -> Vec<u8> {
     let mut out = vec![KIND_HEARTBEAT];
     put_str(&mut out, label);
     out.extend_from_slice(&counter.to_le_bytes());
+    out.extend_from_slice(&run.to_le_bytes());
     out
 }
 
@@ -273,7 +279,13 @@ fn parse_message(bytes: &[u8]) -> Option<Message> {
         return None;
     }
     match kind {
-        KIND_HEARTBEAT => Some(Message::Heartbeat { label }),
+        KIND_HEARTBEAT => {
+            // The counter is stepped over, not used. The run after it is
+            // optional, so a node built before runs existed is still heard as
+            // alive rather than dropped as malformed.
+            let run = take_u64(bytes, &mut at).and_then(|_| take_u64(bytes, &mut at));
+            Some(Message::Heartbeat { label, run })
+        }
         KIND_DEPARTING => Some(Message::Departing { label }),
         KIND_CHECKPOINT => {
             let tick = take_u64(bytes, &mut at)?;
@@ -314,10 +326,16 @@ const DEFAULT_HEARTBEAT_MS: u64 = 1_000;
 
 /// How long a node may go silent before it is presumed gone.
 ///
-/// Fixed at three seconds in `docs/phase-0-plan.md` before any measurement, and
-/// deliberately generous: the cost of deciding too early is that the mesh
-/// migrates work every time a wifi link stutters.
-const DEFAULT_DETECT_MS: u64 = 3_000;
+/// `docs/phase-0-plan.md` fixed detection at 2–3 s before any measurement.
+/// This was three seconds, which could not meet that: the sweep runs every
+/// quarter window, so a loss is noticed between 1.0 and 1.25 windows after the
+/// last word — 3.0 to 3.75 s, over the threshold by construction. Two seconds
+/// lands at 2.0 to 2.5 s. Changed before the timed runs, not after them, so the
+/// threshold stayed fixed and only the setting moved.
+///
+/// The cost of deciding early is migrating work every time a link stutters.
+/// The timed runs count those false alarms rather than assuming there are none.
+const DEFAULT_DETECT_MS: u64 = 2_000;
 
 #[derive(libp2p::swarm::NetworkBehaviour)]
 struct MeshBehaviour {
@@ -395,6 +413,10 @@ struct Work {
     /// When this node noticed the owner disappear. Only set between the
     /// disappearance and the takeover, and used to measure the gap.
     owner_lost_at: Option<Instant>,
+    /// When the last checkpoint arrived from whoever was running the job.
+    last_checkpoint_at: Option<Instant>,
+    /// Set by a takeover, cleared by the first tick after it.
+    resuming: Option<Resuming>,
     /// When this node may claim work nobody has answered for.
     ///
     /// A node told to run a job listens before doing so. Claiming immediately
@@ -446,6 +468,67 @@ struct Member {
     /// hint that something changed, and deliberately *not* used to decide
     /// whether a departure was orderly — see [`MSG_DEPARTING`].
     disconnected: bool,
+    /// Which start of the peer's process has been heard from, once a heartbeat
+    /// has said. See [`Message::Heartbeat`].
+    run: Option<u64>,
+}
+
+/// Peers declared gone, remembered so their return can be classified.
+///
+/// A peer that comes back after being declared gone either restarted — the
+/// takeover was needed — or never stopped, and was only unreachable for longer
+/// than the detection window. The second is a false alarm: work migrated that
+/// did not have to. Counting both as "vanished" would hide the cost of setting
+/// detection short, which is the exact trade the timed runs exist to measure.
+#[derive(Default)]
+struct Absences {
+    gone: HashMap<PeerId, (u64, Instant)>,
+}
+
+#[derive(Debug, PartialEq)]
+struct Return {
+    restarted: bool,
+    away: Duration,
+}
+
+impl Absences {
+    /// Only a peer whose run is known can be judged on return; one that
+    /// vanished before its first heartbeat arrived is simply not remembered.
+    fn vanished(&mut self, peer: PeerId, run: Option<u64>, at: Instant) {
+        if let Some(run) = run {
+            self.gone.insert(peer, (run, at));
+        }
+    }
+
+    /// Reports a return once, on the first heartbeat after it.
+    fn heard(&mut self, peer: &PeerId, run: u64, now: Instant) -> Option<Return> {
+        let (before, at) = self.gone.remove(peer)?;
+        Some(Return { restarted: before != run, away: now.duration_since(at) })
+    }
+}
+
+/// A takeover between its decision and the first tick run after it.
+///
+/// The decision is not the recovery. What a player sees is the gap between the
+/// last state that reached this node and the first state it produces, and that
+/// spans detection, the decision, and waiting for the next tick. Every instant
+/// here is on this node's clock, so no measurement subtracts one machine's time
+/// from another's — a laptop on a phone hotspot and a box on home broadband do
+/// not agree to the millisecond, and the thresholds are in milliseconds.
+struct Resuming {
+    cause: &'static str,
+    decided: Instant,
+    last_checkpoint: Option<Instant>,
+}
+
+impl Resuming {
+    /// (decision to first tick, last checkpoint heard to first tick)
+    fn timings(&self, now: Instant) -> (Duration, Option<Duration>) {
+        (
+            now.duration_since(self.decided),
+            self.last_checkpoint.map(|at| now.duration_since(at)),
+        )
+    }
 }
 
 fn main() -> Result<()> {
@@ -815,11 +898,14 @@ async fn run(config: Config) -> Result<()> {
     let mut renewing = false;
 
     let me = *swarm.local_peer_id();
+    // Needs only to differ between two starts of the same node, never to be
+    // secret, so the clock and the process id are enough.
+    let run: u64 = (now_millis() as u64).wrapping_mul(1_000_003) ^ u64::from(std::process::id());
     emit(
         &config,
         "started",
         &format!("node {} is {} on mesh \"{}\"", config.label, me, config.mesh),
-        &[("peer_id", &me.to_string()), ("mesh", &config.mesh)],
+        &[("peer_id", &me.to_string()), ("mesh", &config.mesh), ("run", &run.to_string())],
     );
 
     let mut work = match &config.job {
@@ -862,6 +948,8 @@ async fn run(config: Config) -> Result<()> {
                 state: Vec::new(),
                 tick: 0,
                 owner_lost_at: None,
+                last_checkpoint_at: None,
+                resuming: None,
                 claim_after: config
                     .own
                     .then(|| Instant::now() + config.detect * 3),
@@ -871,6 +959,12 @@ async fn run(config: Config) -> Result<()> {
     };
 
     let mut members: HashMap<PeerId, Member> = HashMap::new();
+    let mut absences = Absences::default();
+    // When each connected peer's current connection began, and which peers have
+    // ever been members. Together they catch a connection to a known peer that
+    // never carries a word — see `silent_connections`.
+    let mut connected_at: HashMap<PeerId, Instant> = HashMap::new();
+    let mut once_members: HashSet<PeerId> = HashSet::new();
     let mut heartbeat = tokio::time::interval(config.heartbeat);
     let mut job_tick = tokio::time::interval(config.job_tick);
     let mut terminate = tokio::signal::unix::signal(tokio::signal::unix::SignalKind::terminate())?;
@@ -1016,7 +1110,7 @@ async fn run(config: Config) -> Result<()> {
                 // Failing to publish is normal and uninteresting while this node
                 // is the only one subscribed to the topic.
                 let _ = swarm.behaviour_mut().gossipsub
-                    .publish(topic.clone(), encode_heartbeat(&config.label, counter));
+                    .publish(topic.clone(), encode_heartbeat(&config.label, counter, run));
             }
 
             _ = job_tick.tick() => {
@@ -1046,6 +1140,19 @@ async fn run(config: Config) -> Result<()> {
                     Ok(outcome) => {
                         work.state = outcome.state;
                         work.tick += 1;
+                        if let Some(resuming) = work.resuming.take() {
+                            let (resume, gap) = resuming.timings(Instant::now());
+                            let gap_ms = gap.map(|g| g.as_millis().to_string())
+                                .unwrap_or_else(|| "unknown".into());
+                            emit(&config, "resumed",
+                                 &format!("first tick after taking over: {} ms after deciding, \
+                                           {gap_ms} ms since the last checkpoint",
+                                          resume.as_millis()),
+                                 &[("tick", &work.tick.to_string()),
+                                   ("cause", resuming.cause),
+                                   ("resume_ms", &resume.as_millis().to_string()),
+                                   ("gap_ms", &gap_ms)]);
+                        }
                         // Effects are reported with the tick that produced
                         // them, and that pairing is load-bearing rather than
                         // decorative. Two nodes may briefly continue the same
@@ -1106,6 +1213,25 @@ async fn run(config: Config) -> Result<()> {
                 for peer in gone {
                     if let Some(member) = members.remove(&peer) {
                         let silent_for = now.duration_since(member.last_heard);
+                        absences.vanished(peer, member.run, now);
+                        // Let go of its connections as well as its membership.
+                        // The transport keeps a dead QUIC connection until its
+                        // own idle timeout, ten seconds — and a machine that
+                        // restarts inside that arrives as a *second* connection
+                        // to a peer already connected. gossipsub exchanges
+                        // subscriptions only on the first, so the returning
+                        // node never learns this one is listening and is never
+                        // heard again. A box restarts its node after ten
+                        // seconds, which made this the ordinary case: found by
+                        // node/chaos-rig.sh, and checked by migration-rig.sh.
+                        //
+                        // Dropping a connection that was in fact still alive
+                        // costs one redial, which silence has already started.
+                        let _ = swarm.disconnect_peer_id(peer);
+                        // Forgotten now rather than when the close completes, or the
+                        // safety net below finds the connection in this same sweep and
+                        // reports a stale connection that is already being dropped.
+                        connected_at.remove(&peer);
                         // Reaching this point means no goodbye ever arrived: the
                         // machine was unplugged, lost power, lost its network, or
                         // hung. This is the case recovery has to be fast enough
@@ -1147,13 +1273,24 @@ async fn run(config: Config) -> Result<()> {
                 // being emptied.
                 if let Some(w) = work.as_mut() {
                     if w.owner.is_none() && w.owner_lost_at.is_some() {
-                        take_over_if_ours(&config, me, w, &members);
+                        take_over_if_ours(&config, me, w, &members, "vanished");
                     }
+                }
+
+                for peer in silent_connections(&connected_at, &members, &once_members,
+                                               now, config.detect * 2) {
+                    connected_at.remove(&peer);
+                    let _ = swarm.disconnect_peer_id(peer);
+                    redial_lost_peer(&config, &peer, &reached_by, &mut pending, &mut dial_attempts);
+                    emit(&config, "silent-connection",
+                         "connected to a former member that has said nothing — reconnecting",
+                         &[("peer_id", &peer.to_string())]);
                 }
             }
 
             event = swarm.select_next_some() => match event {
                 SwarmEvent::ConnectionEstablished { peer_id, endpoint, .. } => {
+                    connected_at.entry(peer_id).or_insert_with(Instant::now);
                     // Stop dialling this one. The address matched must be the
                     // address *we asked for*, not the one the connection ended
                     // up on: a peer dialled at one address commonly answers
@@ -1277,7 +1414,7 @@ async fn run(config: Config) -> Result<()> {
                     // had to say. Counting only heartbeats would let a node
                     // sending a steady stream of checkpoints be declared dead.
                     let label = match &parsed {
-                        Message::Heartbeat { label }
+                        Message::Heartbeat { label, .. }
                         | Message::Departing { label }
                         | Message::Checkpoint { label, .. }
                         | Message::Observed { label, .. }
@@ -1291,7 +1428,9 @@ async fn run(config: Config) -> Result<()> {
                             joined: Instant::now(),
                             last_heard: Instant::now(),
                             disconnected: false,
+                            run: None,
                         });
+                        once_members.insert(source);
                         emit(&config, "joined", &format!("{label} joined"),
                              &[("peer_id", &source.to_string()), ("label", &label)]);
                         // Answer immediately rather than waiting for the next
@@ -1301,7 +1440,7 @@ async fn run(config: Config) -> Result<()> {
                         // else is also continuing.
                         counter += 1;
                         let _ = swarm.behaviour_mut().gossipsub
-                            .publish(topic.clone(), encode_heartbeat(&config.label, counter));
+                            .publish(topic.clone(), encode_heartbeat(&config.label, counter, run));
                         // And say what we hold, for the same reason. A node
                         // that has just arrived has missed everything made
                         // before it did, and waiting for the periodic digest
@@ -1322,7 +1461,30 @@ async fn run(config: Config) -> Result<()> {
                     }
 
                     match parsed {
-                        Message::Heartbeat { .. } => {}
+                        Message::Heartbeat { run: Some(their_run), .. } => {
+                            if let Some(member) = members.get_mut(&source) {
+                                if member.run.is_some_and(|known| known != their_run) {
+                                    // Restarted and back inside one detection
+                                    // window, so it was never declared gone.
+                                    // Nothing was taken over, and nothing here
+                                    // would otherwise record that it happened.
+                                    emit(&config, "restarted-unnoticed",
+                                         &format!("{label} restarted without ever being missed"),
+                                         &[("peer_id", &source.to_string()), ("label", &label)]);
+                                }
+                                member.run = Some(their_run);
+                            }
+                            if let Some(back) = absences.heard(&source, their_run, Instant::now()) {
+                                emit(&config, "returned",
+                                     &format!("{label} is back after {:.1}s — {}", back.away.as_secs_f64(),
+                                              if back.restarted { "it had restarted" }
+                                              else { "it never stopped: a FALSE ALARM" }),
+                                     &[("peer_id", &source.to_string()), ("label", &label),
+                                       ("restarted", if back.restarted { "true" } else { "false" }),
+                                       ("away_ms", &back.away.as_millis().to_string())]);
+                            }
+                        }
+                        Message::Heartbeat { run: None, .. } => {}
 
                         Message::Produced { items, .. } => {
                             // Merged whether or not this node runs the job. A
@@ -1376,6 +1538,13 @@ async fn run(config: Config) -> Result<()> {
                         }
 
                         Message::Departing { .. } => {
+                            // Dropped for the same reason as a vanished peer's
+                            // (see the sweep): the departing process exits
+                            // without closing its connection, so it lingers
+                            // for the transport's idle timeout, and a node that
+                            // restarts inside that is never heard again.
+                            let _ = swarm.disconnect_peer_id(source);
+                            connected_at.remove(&source);
                             if let Some(member) = members.remove(&source) {
                                 // An announced departure needs no detection
                                 // window: the mesh knows at once and can hand
@@ -1392,7 +1561,7 @@ async fn run(config: Config) -> Result<()> {
                                 if w.owner == Some(source) {
                                     w.owner = None;
                                     w.owner_lost_at = Some(Instant::now());
-                                    take_over_if_ours(&config, me, w, &members);
+                                    take_over_if_ours(&config, me, w, &members, "announced");
                                 }
                             }
                         }
@@ -1464,6 +1633,10 @@ async fn run(config: Config) -> Result<()> {
 
                             w.owner = Some(source);
                             w.owner_lost_at = None;
+                            w.last_checkpoint_at = Some(Instant::now());
+                            // Someone else is running it after all; a takeover
+                            // still waiting for its first tick never got one.
+                            w.resuming = None;
                             // Older checkpoints can arrive late; taking one
                             // would silently undo completed work.
                             if tick >= w.tick {
@@ -1479,6 +1652,7 @@ async fn run(config: Config) -> Result<()> {
                     // fully gone; a node may hold several at once, commonly one
                     // over QUIC and one over TCP.
                     if num_established == 0 {
+                        connected_at.remove(&peer_id);
                         if let Some(member) = members.get_mut(&peer_id) {
                             member.disconnected = true;
                         }
@@ -1611,6 +1785,34 @@ fn redial_lost_peer(
     }
 }
 
+/// Connections to former members that have carried nothing for too long.
+///
+/// The safety net under the two disconnects that fix the restart race. However
+/// a stale connection comes about, its signature is the same: the transport
+/// says a peer that was once a member is connected, and gossip has not heard a
+/// word from it. Dropping the connection lets a fresh one form, and on a fresh
+/// first connection gossipsub exchanges subscriptions again.
+///
+/// Only former members, because a connection to a node of another mesh is
+/// silent forever by design, and reconnecting to it would never end.
+fn silent_connections(
+    connected_at: &HashMap<PeerId, Instant>,
+    members: &HashMap<PeerId, Member>,
+    once_members: &HashSet<PeerId>,
+    now: Instant,
+    limit: Duration,
+) -> Vec<PeerId> {
+    connected_at
+        .iter()
+        .filter(|(peer, since)| {
+            !members.contains_key(*peer)
+                && once_members.contains(*peer)
+                && now.duration_since(**since) > limit
+        })
+        .map(|(peer, _)| *peer)
+        .collect()
+}
+
 /// Continues a job whose owner has gone, if this node is the one that should.
 ///
 /// No handshake and no agreement: every survivor holds the same membership and
@@ -1623,17 +1825,20 @@ fn take_over_if_ours(
     me: PeerId,
     work: &mut Work,
     members: &HashMap<PeerId, Member>,
+    cause: &'static str,
 ) {
     if !Work::should_take_over(&me, members) {
         return;
     }
+    let now = Instant::now();
     let gap = work
         .owner_lost_at
-        .map(|at| Instant::now().duration_since(at))
+        .map(|at| now.duration_since(at))
         .unwrap_or_default();
 
     work.owner = Some(me);
     work.owner_lost_at = None;
+    work.resuming = Some(Resuming { cause, decided: now, last_checkpoint: work.last_checkpoint_at });
 
     emit(
         config,
@@ -1645,6 +1850,7 @@ fn take_over_if_ours(
         ),
         &[
             ("tick", &work.tick.to_string()),
+            ("cause", cause),
             ("decision_ms", &gap.as_millis().to_string()),
             ("state_bytes", &work.state.len().to_string()),
             ("survivors", &(members.len() + 1).to_string()),
@@ -1693,6 +1899,24 @@ async fn depart(
 
     let deadline = tokio::time::Instant::now() + Duration::from_millis(500);
     while tokio::time::Instant::now() < deadline {
+        tokio::select! {
+            _ = swarm.select_next_some() => {}
+            _ = tokio::time::sleep_until(deadline) => break,
+        }
+    }
+
+    // Then close every connection, and wait briefly for the closes to go out.
+    // Exiting with them open leaves each peer holding a dead connection for the
+    // transport's idle timeout — and a peer redialling during the drain above
+    // gets a brand new one, which dies the same way a moment later. A node
+    // that restarts inside that window is then never heard by that peer again.
+    // Found by node/chaos-rig.sh; checked by migration-rig.sh.
+    let peers: Vec<PeerId> = swarm.connected_peers().copied().collect();
+    for peer in peers {
+        let _ = swarm.disconnect_peer_id(peer);
+    }
+    let deadline = tokio::time::Instant::now() + Duration::from_millis(300);
+    while swarm.connected_peers().next().is_some() && tokio::time::Instant::now() < deadline {
         tokio::select! {
             _ = swarm.select_next_some() => {}
             _ = tokio::time::sleep_until(deadline) => break,
@@ -1778,8 +2002,8 @@ mod tests {
     #[test]
     fn messages_survive_a_round_trip() {
         assert_eq!(
-            parse_message(&encode_heartbeat("diamond", 42)),
-            Some(Message::Heartbeat { label: "diamond".into() })
+            parse_message(&encode_heartbeat("diamond", 42, 9)),
+            Some(Message::Heartbeat { label: "diamond".into(), run: Some(9) })
         );
         assert_eq!(
             parse_message(&encode_departing("diamond")),
@@ -1793,6 +2017,92 @@ mod tests {
                 state: b"opaque".to_vec()
             })
         );
+    }
+
+    #[test]
+    fn a_silent_connection_to_a_former_member_is_dropped_and_only_that() {
+        let now = Instant::now();
+        let limit = Duration::from_secs(4);
+        let long_ago = now - Duration::from_secs(10);
+        let (stale, fresh, stranger, present) =
+            (PeerId::random(), PeerId::random(), PeerId::random(), PeerId::random());
+
+        let connected_at: HashMap<PeerId, Instant> = [
+            (stale, long_ago),
+            (fresh, now - Duration::from_secs(1)),
+            (stranger, long_ago),
+            (present, long_ago),
+        ].into_iter().collect();
+        let once: HashSet<PeerId> = [stale, fresh, present].into_iter().collect();
+        let mut members = HashMap::new();
+        members.insert(present, Member {
+            label: "present".into(), joined: long_ago, last_heard: now,
+            disconnected: false, run: None,
+        });
+
+        // A connection just made has not had time to speak; one to a node of
+        // another mesh never will; one to a present member is speaking.
+        assert_eq!(silent_connections(&connected_at, &members, &once, now, limit), vec![stale]);
+    }
+
+    #[test]
+    fn a_heartbeat_from_before_runs_existed_still_counts() {
+        // The boxes in the field run the older build until each is redeployed.
+        // Rejecting its heartbeat as malformed would declare a live node dead.
+        let mut old = vec![KIND_HEARTBEAT];
+        put_str(&mut old, "diamond");
+        old.extend_from_slice(&42u64.to_le_bytes());
+        assert_eq!(
+            parse_message(&old),
+            Some(Message::Heartbeat { label: "diamond".into(), run: None })
+        );
+    }
+
+    #[test]
+    fn a_return_after_a_restart_is_not_a_false_alarm() {
+        let peer = PeerId::random();
+        let at = Instant::now();
+        let mut absences = Absences::default();
+        absences.vanished(peer, Some(1), at);
+        let back = absences.heard(&peer, 2, at + Duration::from_secs(12)).unwrap();
+        assert_eq!(back, Return { restarted: true, away: Duration::from_secs(12) });
+    }
+
+    #[test]
+    fn a_return_without_a_restart_is_a_false_alarm() {
+        // Same run: the process never stopped, so the takeover it caused was
+        // work migrated for nothing.
+        let peer = PeerId::random();
+        let at = Instant::now();
+        let mut absences = Absences::default();
+        absences.vanished(peer, Some(7), at);
+        assert!(!absences.heard(&peer, 7, at + Duration::from_secs(30)).unwrap().restarted);
+    }
+
+    #[test]
+    fn a_return_is_reported_once_and_only_for_the_absent() {
+        let peer = PeerId::random();
+        let at = Instant::now();
+        let mut absences = Absences::default();
+        assert_eq!(absences.heard(&peer, 7, at), None, "never gone, so never back");
+        absences.vanished(peer, Some(7), at);
+        assert!(absences.heard(&peer, 7, at).is_some());
+        assert_eq!(absences.heard(&peer, 7, at), None, "every later heartbeat would repeat it");
+    }
+
+    #[test]
+    fn the_visible_gap_runs_from_the_last_checkpoint_not_the_decision() {
+        // Measuring from the decision would leave out detection, which is most
+        // of what a player waits through.
+        let checkpoint = Instant::now();
+        let resuming = Resuming {
+            cause: "vanished",
+            decided: checkpoint + Duration::from_millis(2_300),
+            last_checkpoint: Some(checkpoint),
+        };
+        let (resume, gap) = resuming.timings(checkpoint + Duration::from_millis(2_450));
+        assert_eq!(resume, Duration::from_millis(150));
+        assert_eq!(gap, Some(Duration::from_millis(2_450)));
     }
 
     fn serials(ticks: &[u64]) -> Vec<(String, ledger::Serial)> {
@@ -1943,6 +2253,7 @@ mod tests {
             joined: Instant::now(),
             last_heard: Instant::now(),
             disconnected: false,
+            run: None,
         };
 
         let mut winners = 0;
@@ -1994,6 +2305,7 @@ mod tests {
             joined: Instant::now(),
             last_heard: Instant::now(),
             disconnected: false,
+            run: None,
         });
         assert!(Work::should_take_over(&me, &members));
     }
