@@ -133,6 +133,13 @@ def main():
         return 1
 
     events = load(path)
+    # The log is rotated daily with copytruncate, so a run that has lasted past
+    # a rotation has its start in yesterday's file and none in today's. Reading
+    # only today's then reports a node that has been connected for days as one
+    # that never connected — which is exactly what it did on riverboat.
+    rotated = path + ".1"
+    if os.path.exists(rotated) and not any(e.get("event") == "started" for e in events):
+        events = load(rotated) + events
     if not events:
         print("the log is empty — the node may never have started, which is the finding")
         return 1
@@ -142,10 +149,15 @@ def main():
 
     # The current run is everything since the node last started, which is the
     # only boundary the log actually marks.
+    partial = False
     if scope == "run":
         starts = [i for i, e in enumerate(events) if e.get("event") == "started"]
         if starts:
             events = events[starts[-1]:]
+        else:
+            # Said out loud rather than presented as the whole run. Every count
+            # below is then a floor, and "never connected" cannot be concluded.
+            partial = True
     elif scope == "since":
         cutoff = now_ms - since_minutes * 60_000
         events = [e for e in events if e.get("ts_unix_ms", 0) >= cutoff]
@@ -159,7 +171,7 @@ def main():
     # Chosen with branches rather than a lookup: a dict evaluates every value,
     # including the one describing a window that was never asked for.
     if scope == "run":
-        window = "this run"
+        window = "this run (PARTIAL — it began before the oldest event kept)" if partial else "this run"
     elif scope == "all":
         window = "the whole log"
     else:
@@ -214,7 +226,7 @@ def main():
     if scope == "run" and total > len(events):
         print(f"\n  {total - len(events)} earlier events are in the log. --all to see them.")
 
-    if kinds.get("dialling") and not kinds.get("connected"):
+    if kinds.get("dialling") and not kinds.get("connected") and not partial:
         print("\n  Dialled and never connected. Either no peer was reachable, or the")
         print("  address given is stale — one behind a carrier is only good until")
         print("  that connection cycles.")
