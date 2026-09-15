@@ -3,8 +3,8 @@
 # Switches a box to a named mesh and starts a timed takeover run on it, in one
 # command, because nothing else about a run should depend on remembering steps.
 #
-#   sudo ./timed-run.sh --label diamond   --mesh night-a --peer 192.168.50.128 --own --hours 8
-#   sudo ./timed-run.sh --label riverboat --mesh night-a --peer 192.168.50.48         --hours 8
+#   sudo ./timed-run.sh --label diamond   --mesh night-a --peer 192.168.50.128 --own --hours 8 --not-a-hotspot
+#   sudo ./timed-run.sh --label riverboat --mesh night-a --peer 192.168.50.48 --hours 8 --not-a-hotspot
 #   sudo ./timed-run.sh --revert
 #
 # Expects, beside itself: mesh-node (the build to run), chaos.py,
