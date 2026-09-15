@@ -83,12 +83,46 @@ const KIND_PRODUCED: u8 = 5;
 ///
 /// Deltas alone converge only for nodes that were listening. Anyone offline
 /// when an item was announced never hears of it again, because gossip does not
-/// retain. So nodes periodically publish a hash of their whole set: agreement
-/// costs 32 bytes to confirm, and disagreement is what triggers a repair.
+/// retain. So nodes periodically publish a summary of their set, and a
+/// disagreement is what starts a repair.
 ///
-/// It says *that* two nodes differ, never *how*. That is the cheap half of
-/// reconciliation, and it is the half that runs constantly.
-const KIND_LEDGER_DIGEST: u8 = 6;
+/// Kind 6 was a single hash of the whole set. It could say only *that* two
+/// nodes differed, so every difference was answered by sending everything —
+/// and on a set that grows every tick, two healthy nodes always differ by
+/// whatever is in flight. On 2026-09-13 diamond offered yoinkerz its entire
+/// inventory 537 times in nine hours, to fix a gap of 88 items that the repair
+/// never delivered, and the phone hotspot carried 7.54 GB. Kind 6 is retired
+/// and ignored; the number is not reused.
+///
+/// A summary is 256 cells — count and XOR — one per bucket of the set by
+/// serial. About 3 KB.
+const KIND_LEDGER_SUMMARY: u8 = 7;
+
+/// The 256 cells inside one bucket, addressed to one peer.
+///
+/// Sent by a node that saw that bucket differ in a peer's summary. The peer
+/// answers with the items in the cells that differ, and — if this was not
+/// itself an answer — its own cells for the bucket, so the first node can send
+/// what the peer lacks. Two messages each way at most; no conversation.
+const KIND_LEDGER_BUCKET: u8 = 8;
+
+/// Buckets examined per repair round.
+///
+/// The bound on how much one round can cost. A bucket differing by a few items
+/// costs a few kilobytes, so this is really the bound on catching up from
+/// nothing: 32 buckets of up to 4,096 items is about 5 MB a round, and an empty
+/// node is full after eight. Replayed on diamond's 1.7-million-item ledger with
+/// 88 items missing — spread, being hashes, across 74 buckets — eight a round
+/// took ten minutes to repair what 32 repairs in three.
+const REPAIR_BUCKETS_PER_ROUND: usize = 32;
+
+/// Items sent for one bucket in one answer.
+///
+/// Whole cells are sent or not at all, so a cell that did not fit is still
+/// different next round and is sent then. The old repair published one burst
+/// of 2,600 messages; the queue dropped the same tail every time, which is how
+/// 88 items stayed missing through 537 attempts.
+const REPAIR_ITEMS_PER_BUCKET: usize = 4_096;
 
 /// How many items to put in one message.
 ///
@@ -97,23 +131,24 @@ const KIND_LEDGER_DIGEST: u8 = 6;
 /// default cap so that a long kind name cannot push a chunk over it.
 const LEDGER_CHUNK: usize = 512;
 
-/// How often nodes say what they hold.
+/// How often nodes summarise what they hold.
 ///
 /// Rarely, because agreement is the normal case and this is the message that
 /// confirms it. The deltas do the actual replicating; this only catches what
 /// they missed.
 const DIGEST_EVERY: Duration = Duration::from_secs(60);
 
-/// The least time between two repairs.
+/// The least time between starting two repairs.
 ///
-/// A repair sends an entire ledger, and every node that hears a digest it
-/// disagrees with wants to send one. Without a floor, a single node joining an
-/// established mesh would draw a simultaneous full dump from everybody, which
-/// is the connection storm again wearing different clothes. One repair, then
-/// quiet long enough to find out whether it worked.
+/// Every node that hears a summary it disagrees with wants to start one.
+/// Without a floor, a node joining an established mesh would draw a round from
+/// everybody at once — the connection storm again, in different clothes. One
+/// round, then quiet long enough to find out whether it worked. Only starting
+/// is limited: answering a bucket someone asked about is the second half of a
+/// round already paid for.
 const REPAIR_NO_SOONER_THAN: Duration = Duration::from_secs(30);
 
-/// Whether enough time has passed to send another full ledger.
+/// Whether enough time has passed to start another repair round.
 fn repair_allowed(last: &mut Option<Instant>) -> bool {
     let now = Instant::now();
     if last.is_none_or(|when| now.duration_since(when) >= REPAIR_NO_SOONER_THAN) {
@@ -186,7 +221,8 @@ enum Message {
     Checkpoint { label: String, tick: u64, state: Vec<u8> },
     Observed { label: String, peer: PeerId, addr: Multiaddr },
     Produced { label: String, items: Vec<(String, ledger::Serial)> },
-    LedgerDigest { label: String, held: u64, digest: [u8; 32] },
+    LedgerSummary { label: String, held: u64, cells: Vec<ledger::Cell> },
+    LedgerBucket { label: String, to: PeerId, bucket: u8, answer: bool, cells: Vec<ledger::Cell> },
 }
 
 fn put_str(out: &mut Vec<u8>, text: &str) {
@@ -258,11 +294,38 @@ fn encode_produced(label: &str, items: &[(String, ledger::Serial)]) -> Vec<u8> {
     out
 }
 
-fn encode_ledger_digest(label: &str, held: u64, digest: &[u8; 32]) -> Vec<u8> {
-    let mut out = vec![KIND_LEDGER_DIGEST];
+fn put_cells(out: &mut Vec<u8>, cells: &[ledger::Cell]) {
+    for cell in cells {
+        out.extend_from_slice(&cell.count.to_le_bytes());
+        out.extend_from_slice(&cell.xor.to_le_bytes());
+    }
+}
+
+/// Exactly FANOUT cells, or nothing: a short summary compared against a full
+/// one would report every missing position as a difference.
+fn take_cells(bytes: &[u8], at: &mut usize) -> Option<Vec<ledger::Cell>> {
+    (0..ledger::FANOUT)
+        .map(|_| Some(ledger::Cell { count: take_u32(bytes, at)?, xor: take_u64(bytes, at)? }))
+        .collect()
+}
+
+fn encode_ledger_summary(label: &str, held: u64, cells: &[ledger::Cell]) -> Vec<u8> {
+    let mut out = vec![KIND_LEDGER_SUMMARY];
     put_str(&mut out, label);
     out.extend_from_slice(&held.to_le_bytes());
-    out.extend_from_slice(digest);
+    put_cells(&mut out, cells);
+    out
+}
+
+fn encode_ledger_bucket(label: &str, to: &PeerId, bucket: u8, answer: bool, cells: &[ledger::Cell]) -> Vec<u8> {
+    let mut out = vec![KIND_LEDGER_BUCKET];
+    put_str(&mut out, label);
+    let id = to.to_bytes();
+    out.extend_from_slice(&(id.len() as u32).to_le_bytes());
+    out.extend_from_slice(&id);
+    out.push(bucket);
+    out.push(answer as u8);
+    put_cells(&mut out, cells);
     out
 }
 
@@ -309,10 +372,18 @@ fn parse_message(bytes: &[u8]) -> Option<Message> {
             }
             Some(Message::Produced { label, items })
         }
-        KIND_LEDGER_DIGEST => {
+        KIND_LEDGER_SUMMARY => {
             let held = take_u64(bytes, &mut at)?;
-            let digest: [u8; 32] = bytes.get(at..at + 32)?.try_into().ok()?;
-            Some(Message::LedgerDigest { label, held, digest })
+            let cells = take_cells(bytes, &mut at)?;
+            Some(Message::LedgerSummary { label, held, cells })
+        }
+        KIND_LEDGER_BUCKET => {
+            let to = PeerId::from_bytes(&take_bytes(bytes, &mut at)?).ok()?;
+            let bucket = *bytes.get(at)?;
+            let answer = *bytes.get(at + 1)? != 0;
+            at += 2;
+            let cells = take_cells(bytes, &mut at)?;
+            Some(Message::LedgerBucket { label, to, bucket, answer, cells })
         }
         _ => None,
     }
@@ -1067,9 +1138,9 @@ async fn run(config: Config) -> Result<()> {
                     // that disagrees with its own.
                     let _ = swarm.behaviour_mut().gossipsub.publish(
                         topic.clone(),
-                        encode_ledger_digest(&config.label,
-                                             w.ledger.len() as u64,
-                                             &w.ledger.digest()));
+                        encode_ledger_summary(&config.label,
+                                              w.ledger.len() as u64,
+                                              &w.ledger.summary()));
                 }
             }
 
@@ -1419,7 +1490,8 @@ async fn run(config: Config) -> Result<()> {
                         | Message::Checkpoint { label, .. }
                         | Message::Observed { label, .. }
                         | Message::Produced { label, .. }
-                        | Message::LedgerDigest { label, .. } => label.clone(),
+                        | Message::LedgerSummary { label, .. }
+                        | Message::LedgerBucket { label, .. } => label.clone(),
                     };
                     let known = members.contains_key(&source);
                     if !known && !matches!(parsed, Message::Departing { .. }) {
@@ -1451,9 +1523,9 @@ async fn run(config: Config) -> Result<()> {
                         if let Some(w) = work.as_ref() {
                             let _ = swarm.behaviour_mut().gossipsub.publish(
                                 topic.clone(),
-                                encode_ledger_digest(&config.label,
-                                                     w.ledger.len() as u64,
-                                                     &w.ledger.digest()));
+                                encode_ledger_summary(&config.label,
+                                                      w.ledger.len() as u64,
+                                                      &w.ledger.summary()));
                         }
                     } else if let Some(member) = members.get_mut(&source) {
                         member.last_heard = Instant::now();
@@ -1504,36 +1576,62 @@ async fn run(config: Config) -> Result<()> {
                             }
                         }
 
-                        Message::LedgerDigest { held, digest, .. } => {
-                            if let Some(w) = work.as_ref() {
-                                let ours = w.ledger.digest();
-                                if ours != digest {
-                                    // Somebody is missing something. Whoever
-                                    // holds more sends; on a tie the lower
-                                    // identifier does, which is the same rule
-                                    // that settles job ownership — one rule
-                                    // fewer to get wrong, and both sides reach
-                                    // the same answer without discussing it.
-                                    let mine = w.ledger.len() as u64;
-                                    let ours_to_send = mine > held
-                                        || (mine == held && me < source);
-                                    if ours_to_send && repair_allowed(&mut last_repair) {
-                                        emit(&config, "ledger-repairing",
-                                             &format!("{label} holds {held} against this node's {mine} \
-                                                       — sending what is here"),
-                                             &[("their_held", &held.to_string()),
-                                               ("our_held", &mine.to_string()),
-                                               ("label", &label)]);
-                                        let all: Vec<_> = w.ledger.iter()
-                                            .map(|(kind, serial)| (kind.to_string(), *serial))
-                                            .collect();
-                                        for chunk in all.chunks(LEDGER_CHUNK) {
-                                            let _ = swarm.behaviour_mut().gossipsub.publish(
-                                                topic.clone(),
-                                                encode_produced(&config.label, chunk));
-                                        }
-                                    }
+                        Message::LedgerSummary { held, cells, .. } => {
+                            let Some(w) = work.as_ref() else { continue };
+                            let buckets = ledger::differing(&w.ledger.summary(), &cells);
+                            // Both sides of a disagreement see it, and both
+                            // would start a round. That is fine rather than
+                            // wasteful: each sends only its own side of each
+                            // differing cell, and union makes a repeat free.
+                            if buckets.is_empty() || !repair_allowed(&mut last_repair) { continue }
+                            emit(&config, "ledger-comparing",
+                                 &format!("{label} holds {held} against this node's {} — \
+                                           {} of {} buckets differ",
+                                          w.ledger.len(), buckets.len(), ledger::FANOUT),
+                                 &[("label", &label), ("their_held", &held.to_string()),
+                                   ("our_held", &w.ledger.len().to_string()),
+                                   ("buckets", &buckets.len().to_string())]);
+                            for bucket in buckets.into_iter().take(REPAIR_BUCKETS_PER_ROUND) {
+                                let _ = swarm.behaviour_mut().gossipsub.publish(
+                                    topic.clone(),
+                                    encode_ledger_bucket(&config.label, &source, bucket, false,
+                                                         &w.ledger.bucket(bucket)));
+                            }
+                        }
+
+                        Message::LedgerBucket { to, bucket, answer, cells, .. } => {
+                            // Gossip reaches everyone; only the addressee acts.
+                            if to != me { continue }
+                            let Some(w) = work.as_ref() else { continue };
+                            let ours = w.ledger.bucket(bucket);
+                            let differ = ledger::differing(&ours, &cells);
+                            if differ.is_empty() { continue }
+
+                            let mut items = Vec::new();
+                            for cell in &differ {
+                                let found = w.ledger.items_in(bucket, *cell);
+                                if !items.is_empty() && items.len() + found.len() > REPAIR_ITEMS_PER_BUCKET {
+                                    break;
                                 }
+                                items.extend(found);
+                            }
+                            emit(&config, "ledger-repairing",
+                                 &format!("sending {label} {} items from {} differing cells of bucket {bucket}",
+                                          items.len(), differ.len()),
+                                 &[("label", &label), ("bucket", &bucket.to_string()),
+                                   ("cells", &differ.len().to_string()),
+                                   ("items", &items.len().to_string())]);
+                            for chunk in items.chunks(LEDGER_CHUNK) {
+                                let _ = swarm.behaviour_mut().gossipsub.publish(
+                                    topic.clone(), encode_produced(&config.label, chunk));
+                            }
+                            // The asker has sent its cells but not its items —
+                            // it cannot know which of ours we lack until it
+                            // sees our cells. An answer is not answered again.
+                            if !answer {
+                                let _ = swarm.behaviour_mut().gossipsub.publish(
+                                    topic.clone(),
+                                    encode_ledger_bucket(&config.label, &source, bucket, true, &ours));
                             }
                         }
 
@@ -2122,11 +2220,43 @@ mod tests {
             Some(Message::Produced { label: "diamond".into(), items })
         );
 
-        let digest = [9u8; 32];
+        let mut cells = vec![ledger::Cell::default(); ledger::FANOUT];
+        cells[3] = ledger::Cell { count: 9, xor: 0xdead_beef };
         assert_eq!(
-            parse_message(&encode_ledger_digest("diamond", 1234, &digest)),
-            Some(Message::LedgerDigest { label: "diamond".into(), held: 1234, digest })
+            parse_message(&encode_ledger_summary("diamond", 1234, &cells)),
+            Some(Message::LedgerSummary { label: "diamond".into(), held: 1234, cells: cells.clone() })
         );
+        let to = PeerId::random();
+        assert_eq!(
+            parse_message(&encode_ledger_bucket("diamond", &to, 200, true, &cells)),
+            Some(Message::LedgerBucket { label: "diamond".into(), to, bucket: 200, answer: true, cells })
+        );
+    }
+
+    #[test]
+    fn a_summary_cut_short_is_not_a_message() {
+        // Compared against a full one, a truncated summary would report every
+        // missing position as a difference and start repairs for all of them.
+        let summary = encode_ledger_summary("diamond", 1, &vec![ledger::Cell::default(); ledger::FANOUT]);
+        assert_eq!(parse_message(&summary[..summary.len() - 1]), None);
+    }
+
+    #[test]
+    fn the_retired_whole_set_digest_is_ignored() {
+        // Kind 6, from nodes not yet redeployed. Acting on it would mean
+        // guessing at a format this build no longer understands.
+        let mut old = vec![6u8];
+        put_str(&mut old, "diamond");
+        old.extend_from_slice(&1u64.to_le_bytes());
+        old.extend_from_slice(&[0u8; 32]);
+        assert_eq!(parse_message(&old), None);
+    }
+
+    #[test]
+    fn a_summary_fits_comfortably_in_one_gossip_message() {
+        let summary = encode_ledger_summary("a-long-node-label", u64::MAX,
+                                            &vec![ledger::Cell::default(); ledger::FANOUT]);
+        assert!(summary.len() < 4_096, "summary is {} bytes", summary.len());
     }
 
     #[test]
@@ -2143,8 +2273,9 @@ mod tests {
         // inventory would make a departed node look present.
         let produced = encode_produced("diamond", &serials(&[1]));
         assert!(matches!(parse_message(&produced), Some(Message::Produced { .. })));
-        let digest = encode_ledger_digest("diamond", 1, &[0; 32]);
-        assert!(matches!(parse_message(&digest), Some(Message::LedgerDigest { .. })));
+        let cells = vec![ledger::Cell::default(); ledger::FANOUT];
+        let summary = encode_ledger_summary("diamond", 1, &cells);
+        assert!(matches!(parse_message(&summary), Some(Message::LedgerSummary { .. })));
     }
 
     #[test]
@@ -2160,10 +2291,11 @@ mod tests {
         for (kind, serial) in serials(&[3, 4, 5]) {
             apart.record(&kind, serial);
         }
-        assert_ne!(alone.digest(), apart.digest(), "should start disagreeing");
+        assert_ne!(alone.summary(), apart.summary(), "should start disagreeing");
 
-        // Each sends everything it holds, exactly as a repair does, and each
-        // absorbs the other's. Tick 3 was made by both and is one item.
+        // Each sends everything it holds — what a repair does for every cell
+        // that differs, and here every cell does — and each absorbs the
+        // other's. Tick 3 was made by both and is one item.
         let from_alone = encode_produced("alone", &alone.iter()
             .map(|(k, s)| (k.to_string(), *s)).collect::<Vec<_>>());
         let from_apart = encode_produced("apart", &apart.iter()
@@ -2177,7 +2309,7 @@ mod tests {
         alone.absorb(theirs);
         apart.absorb(ours);
 
-        assert_eq!(alone.digest(), apart.digest(), "should have converged");
+        assert_eq!(alone.summary(), apart.summary(), "should have converged");
         assert_eq!(alone.len(), 5, "tick 3 was made twice and exists once");
     }
 

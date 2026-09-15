@@ -41,7 +41,8 @@ NOTABLE = {
     "ledger-loaded": "remembered {held} things that already existed",
     "ledger-unreadable": "LEDGER UNREADABLE — the inventory started from nothing",
     "ledger-not-saved": "could not write the inventory down — it will not survive a restart",
-    "ledger-repairing": "sent {label} the inventory it was missing ({their_held} against {our_held})",
+    "ledger-comparing": "found {buckets} of 256 inventory buckets differing from {label}'s",
+    "ledger-repairing": "sent {label} {items} items from {cells} differing cells of bucket {bucket}",
     "job-failed": "the job failed",
     "listen-failed": "could not listen on an address",
 }

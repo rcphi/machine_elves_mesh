@@ -634,6 +634,25 @@ So there are three layers now, each covering what the one above can miss:
 
 `node/migration-rig.sh` checks both kill and announced return inside the idle timeout. It failed one run in three with only the first layer; twenty of twenty with all three.
 
+## A night on a phone hotspot cost 7.54 GB — 2026-09-15
+
+`yoinkerz` spent 2026-09-13 01:00–10:00 UTC on the phone hotspot, connected to `diamond`'s forwarded port. **The connection itself held for 8.7 hours** across carriers, which is the good news. The first twenty minutes were not the mesh flapping but the laptop itself, rejoining the home wifi and returning to the hotspot six times; each switch was a clean lose-both-peers, take over alone, yield on return.
+
+**The bad news was the bill.** The phone recorded 7.54 GB. diamond's log accounts for it: inventory repair ran **537 times in nine hours**, once a minute, each time offering the entire ledger — about 1.3 million items — to fix a gap that sat at **exactly 88 items for the whole night**.
+
+Two faults, compounding:
+
+- **A whole-set digest can only say "different".** So every difference, however small, was answered with everything.
+- **The repair never delivered.** Each one published ~2,600 messages in one burst. The gap never moved, so the same 88 were lost every time — consistent with a send queue dropping the same tail of a sorted set, though that mechanism is inferred, not observed.
+
+For a player on mobile data this is not a performance problem, it is a reason to uninstall. It also sits on the same gossip channel as heartbeats: in the first twenty minutes yoinkerz declared `riverboat` gone 34 times at 51 seconds past the minute, which is when diamond's digest landed. That did not persist all night, so the claim is that repair *can* starve detection, not that it did throughout.
+
+**Repair now sends what differs.** Each node keeps 65,536 cells — count and XOR, updated as items arrive — addressed by a serial's first two bytes. A summary of 256 buckets (3 KB) goes out each minute; a differing bucket draws that bucket's 256 cells; only the items in differing cells cross, both ways, 32 buckets and 4,096 items a bucket per round at most. Whole cells or nothing, so a round that does not finish makes progress anyway.
+
+**Replayed on diamond's real ledger** — 1,733,312 items, one copy missing the newest 88: converged in three rounds (88 → 48 → 13 → 0), about 1.6 MB in all, against 218 MB the old scheme would have offered in the same three minutes and never finished. At rest the cost is one 3 KB summary a minute per node.
+
+**Hotspot runs are now time-boxed**, never overnight, and their data use estimated before they start.
+
 ## Volunteer machines and remote management
 
 Volunteers are not technically inclined. Machines are prepared centrally — Ubuntu 26.04, Rust and dependencies preinstalled — and shipped ready to plug in.

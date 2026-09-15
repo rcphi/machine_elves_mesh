@@ -99,14 +99,72 @@ impl Serial {
     }
 }
 
+/// How many buckets a summary has, and how many cells each bucket has.
+///
+/// 256 × 256 = 65,536 cells, addressed by a serial's first two bytes. Serials
+/// are hashes, so items spread evenly: 1.7 million items is about 26 a cell.
+pub const FANOUT: usize = 256;
+
+/// What a peer needs to know about one part of the set to tell whether it
+/// holds the same part: how many items, and the XOR of a slice of each serial.
+///
+/// XOR because it can be kept up to date one item at a time and needs no
+/// ordering. A digest of the whole set had to be recomputed over every item —
+/// 1.7 million SHA-256 updates a minute on diamond — and could only say
+/// "something differs", so the answer to any difference was to send everything.
+#[derive(Clone, Copy, Default, PartialEq, Eq, Debug)]
+pub struct Cell {
+    pub count: u32,
+    pub xor: u64,
+}
+
+impl Cell {
+    fn add(&mut self, serial: &Serial) {
+        self.count += 1;
+        // Bytes 8..16, not 0..2: those two address the cell, and are the same
+        // for everything in it.
+        self.xor ^= u64::from_le_bytes(serial.0[8..16].try_into().expect("8 bytes"));
+    }
+
+    fn fold(&mut self, other: &Cell) {
+        self.count += other.count;
+        self.xor ^= other.xor;
+    }
+}
+
+/// Which positions differ between two summaries of the same shape.
+pub fn differing(ours: &[Cell], theirs: &[Cell]) -> Vec<u8> {
+    ours.iter()
+        .zip(theirs)
+        .enumerate()
+        .filter(|(_, (a, b))| a != b)
+        .map(|(index, _)| index as u8)
+        .collect()
+}
+
 /// Everything known to exist.
 ///
 /// A set rather than a count. Counting would make "add this widget" an
 /// operation whose result depends on how many times it happened; membership
 /// does not.
-#[derive(Default, Debug, Clone)]
+#[derive(Debug, Clone)]
 pub struct Ledger {
     items: BTreeSet<(String, Serial)>,
+    /// Every kind held, so a cell's items can be found by range per kind —
+    /// the set is ordered by kind first, then serial.
+    kinds: BTreeSet<String>,
+    /// FANOUT × FANOUT cells, maintained as items arrive.
+    cells: Vec<Cell>,
+}
+
+impl Default for Ledger {
+    fn default() -> Self {
+        Self {
+            items: BTreeSet::new(),
+            kinds: BTreeSet::new(),
+            cells: vec![Cell::default(); FANOUT * FANOUT],
+        }
+    }
 }
 
 impl Ledger {
@@ -114,12 +172,60 @@ impl Ledger {
         Self::default()
     }
 
+    /// The only way anything enters the set, so the cells cannot drift from it.
+    fn insert(&mut self, kind: &str, serial: Serial) -> bool {
+        if !self.items.insert((kind.to_string(), serial)) {
+            return false;
+        }
+        if !self.kinds.contains(kind) {
+            self.kinds.insert(kind.to_string());
+        }
+        let index = serial.0[0] as usize * FANOUT + serial.0[1] as usize;
+        self.cells[index].add(&serial);
+        true
+    }
+
     /// Records a production. Returns whether this was genuinely new.
     ///
     /// A repeat is not an error and not a special case; it simply does not
     /// change anything.
     pub fn record(&mut self, kind: &str, serial: Serial) -> bool {
-        self.items.insert((kind.to_string(), serial))
+        self.insert(kind, serial)
+    }
+
+    /// One cell per bucket: the whole set in 256 parts, about 3 KB on the wire.
+    pub fn summary(&self) -> Vec<Cell> {
+        self.cells
+            .chunks(FANOUT)
+            .map(|bucket| {
+                let mut total = Cell::default();
+                bucket.iter().for_each(|cell| total.fold(cell));
+                total
+            })
+            .collect()
+    }
+
+    /// The cells inside one bucket.
+    pub fn bucket(&self, bucket: u8) -> Vec<Cell> {
+        let start = bucket as usize * FANOUT;
+        self.cells[start..start + FANOUT].to_vec()
+    }
+
+    /// The items in one cell.
+    pub fn items_in(&self, bucket: u8, cell: u8) -> Vec<(String, Serial)> {
+        let mut low = [0u8; 32];
+        low[0] = bucket;
+        low[1] = cell;
+        let mut high = [0xffu8; 32];
+        high[0] = bucket;
+        high[1] = cell;
+        let mut found = Vec::new();
+        for kind in &self.kinds {
+            let from = (kind.clone(), Serial(low));
+            let to = (kind.clone(), Serial(high));
+            found.extend(self.items.range(from..=to).cloned());
+        }
+        found
     }
 
     /// Absorbs another node's view of the world.
@@ -127,10 +233,12 @@ impl Ledger {
     /// Union is commutative, associative, and idempotent, so nodes converge
     /// whatever order they hear things in and however often — which is why no
     /// node ever has to ask another what it has already seen.
+    #[cfg(test)]
     pub fn merge(&mut self, other: &Ledger) {
         self.absorb(other.items.iter().cloned().collect());
     }
 
+    #[cfg(test)]
     pub fn count(&self, kind: &str) -> usize {
         self.items.iter().filter(|(k, _)| k == kind).count()
     }
@@ -149,24 +257,9 @@ impl Ledger {
     /// identically no matter what order they arrived in. Everything below
     /// depends on that: a digest computed from this is comparable between
     /// machines, and a file written from it can be read back into the same set.
+    #[cfg(test)]
     pub fn iter(&self) -> impl Iterator<Item = (&str, &Serial)> {
         self.items.iter().map(|(kind, serial)| (kind.as_str(), serial))
-    }
-
-    /// A short stand-in for the whole set, for asking "do we agree?" cheaply.
-    ///
-    /// Two nodes exchange 32 bytes instead of megabytes, and learn whether
-    /// they hold the same things. It says nothing about *what* differs — only
-    /// that something does, which is enough to decide whether to look.
-    pub fn digest(&self) -> [u8; 32] {
-        let mut hasher = Sha256::new();
-        hasher.update(b"machine-elves/ledger-digest/1");
-        for (kind, serial) in self.iter() {
-            hasher.update((kind.len() as u32).to_le_bytes());
-            hasher.update(kind.as_bytes());
-            hasher.update(serial.as_bytes());
-        }
-        hasher.finalize().into()
     }
 
     /// Absorbs items from a peer or a file, returning those that were new.
@@ -178,7 +271,7 @@ impl Ledger {
     pub fn absorb(&mut self, items: Vec<(String, Serial)>) -> Vec<(String, Serial)> {
         items
             .into_iter()
-            .filter(|(kind, serial)| self.items.insert((kind.clone(), *serial)))
+            .filter(|(kind, serial)| self.insert(kind, *serial))
             .collect()
     }
 
@@ -242,12 +335,92 @@ mod tests {
         // them notice they nonetheless match, without shipping the contents.
         let forwards = ledger_of(&[1, 2, 3, 4, 5]);
         let backwards = ledger_of(&[5, 4, 3, 2, 1]);
-        assert_eq!(forwards.digest(), backwards.digest());
+        assert_eq!(forwards.summary(), backwards.summary());
+    }
+
+    /// Runs the repair exchange between two ledgers to completion, the way two
+    /// nodes would, and returns how many items crossed. Mirrors main.rs: a
+    /// summary picks buckets, a bucket's cells pick cells, and both sides send
+    /// what they hold in the cells that differ.
+    fn reconcile(a: &mut Ledger, b: &mut Ledger, buckets_per_round: usize) -> (usize, usize) {
+        let mut sent = 0;
+        let mut rounds = 0;
+        while differing(&a.summary(), &b.summary()).len() > 0 {
+            rounds += 1;
+            assert!(rounds < 1000, "repair did not converge");
+            let buckets = differing(&a.summary(), &b.summary());
+            for bucket in buckets.into_iter().take(buckets_per_round) {
+                for cell in differing(&a.bucket(bucket), &b.bucket(bucket)) {
+                    let from_a = a.items_in(bucket, cell);
+                    let from_b = b.items_in(bucket, cell);
+                    sent += from_a.len() + from_b.len();
+                    b.absorb(from_a);
+                    a.absorb(from_b);
+                }
+            }
+        }
+        (sent, rounds)
+    }
+
+    #[test]
+    fn repair_sends_what_differs_not_everything() {
+        // The night yoinkerz spent on a hotspot: 1.3 million items in common,
+        // 88 missing, and every minute all 1.3 million were offered. 537 times,
+        // 7.54 GB. Here the common part is smaller, the principle the same.
+        let mut a = ledger_of(&(0..50_000).collect::<Vec<_>>());
+        let mut b = a.clone();
+        for tick in 50_000..50_088 {
+            a.record("widget", Serial::derive(&JOB, tick, "widget", 0));
+        }
+        let (sent, _) = reconcile(&mut a, &mut b, 8);
+        assert_eq!(a.len(), b.len());
+        assert_eq!(a.summary(), b.summary());
+        // Each missing item brings its cell-mates (under one each at this size),
+        // and each side sends its own copy of the cell: a small multiple of 88,
+        // never a fraction of 50,000.
+        assert!(sent < 88 * 8, "sent {sent} items to repair 88");
+    }
+
+    #[test]
+    fn repair_fills_an_empty_node_in_bounded_rounds() {
+        // A node arriving with nothing still gets everything — just not all at
+        // once, which is what overflowed the send queue before.
+        let mut full = ledger_of(&(0..20_000).collect::<Vec<_>>());
+        let mut empty = Ledger::new();
+        let (_, rounds) = reconcile(&mut full, &mut empty, 8);
+        assert_eq!(empty.len(), 20_000);
+        assert_eq!(rounds, FANOUT.div_ceil(8), "eight buckets a round");
+    }
+
+    #[test]
+    fn items_differing_on_both_sides_reach_both_sides() {
+        let mut a = ledger_of(&(0..1_000).collect::<Vec<_>>());
+        let mut b = a.clone();
+        a.record("widget", Serial::derive(&JOB, 5_000, "widget", 0));
+        b.record("gear", Serial::derive(&JOB, 6_000, "gear", 0));
+        reconcile(&mut a, &mut b, 8);
+        assert_eq!(a.len(), 1_002);
+        assert_eq!(b.len(), 1_002);
+    }
+
+    #[test]
+    fn a_cell_holds_exactly_the_items_addressed_to_it() {
+        let ledger = ledger_of(&(0..5_000).collect::<Vec<_>>());
+        let mut total = 0;
+        for bucket in 0..=255u8 {
+            let cells = ledger.bucket(bucket);
+            for cell in 0..=255u8 {
+                let items = ledger.items_in(bucket, cell);
+                assert_eq!(items.len() as u32, cells[cell as usize].count);
+                total += items.len();
+            }
+        }
+        assert_eq!(total, 5_000, "every item in exactly one cell");
     }
 
     #[test]
     fn a_missing_item_changes_the_digest() {
-        assert_ne!(ledger_of(&[1, 2, 3]).digest(), ledger_of(&[1, 2]).digest());
+        assert_ne!(ledger_of(&[1, 2, 3]).summary(), ledger_of(&[1, 2]).summary());
     }
 
     #[test]
@@ -256,7 +429,7 @@ mod tests {
         let bytes = encode_items(original.iter());
         let mut recovered = Ledger::new();
         recovered.absorb(decode_items(&bytes));
-        assert_eq!(original.digest(), recovered.digest());
+        assert_eq!(original.summary(), recovered.summary());
         assert_eq!(recovered.len(), 3);
     }
 
