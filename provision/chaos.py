@@ -30,6 +30,7 @@ Three ways to take a node away, chosen at random each time:
 
 systemd's Restart=always brings the node back after kill and term.
 """
+import gzip
 import json
 import os
 import random
@@ -89,14 +90,15 @@ def now_ms():
     return int(time.time() * 1000)
 
 
-def read_events(path, tail_bytes=2_000_000):
+def read_events(path, tail_bytes=2_000_000):  # noqa: C901
     """The current run's events: everything after the last `started`.
 
     Only the tail is read. The log outlives every restart and grows for weeks;
     the question is always about the process running now.
     """
+    opener = gzip.open if path.endswith(".gz") else open
     try:
-        with open(path, "rb") as handle:
+        with opener(path, "rb") as handle:
             handle.seek(0, os.SEEK_END)
             size = handle.tell()
             handle.seek(max(0, size - tail_bytes))
@@ -118,10 +120,20 @@ def read_events(path, tail_bytes=2_000_000):
     # that outlives a rotation leaves its start — and its joins, and its claim —
     # in yesterday's file. Reading only today's loses the peer and the
     # ownership, and a node that knows neither never fires.
-    rotated = path + ".1"
-    if os.path.exists(rotated):
-        return read_events(rotated, tail_bytes) + events
-    return events
+    # Every rotation back to one holding a start, not merely the first: a run
+    # older than two days has its start in .2 or beyond, and logrotate names
+    # siblings rather than nesting, so following path + ".1" repeatedly finds
+    # nothing after the first step.
+    older = []
+    for age in range(1, 8):
+        for name in (f"{path}.{age}", f"{path}.{age}.gz"):
+            if not os.path.exists(name):
+                continue
+            rows = read_events(name, tail_bytes)
+            older = rows + older
+            if any(e.get("event") == "started" for e in rows):
+                return older + events
+    return older + events
 
 
 def situation(events, now):

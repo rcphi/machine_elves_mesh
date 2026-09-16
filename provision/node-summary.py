@@ -96,10 +96,14 @@ def timeline(events, now_ms):
             print(f"              … and {repeats} more like that")
             repeats = 0
         previous = kind
-        fields = {k: event.get(k, "?") for k in ("label", "tick", "addr", "external")}
+        # Every field the event carries, and "?" for any the description asks
+        # for and the event lacks. Naming the fields here instead meant a
+        # description mentioning a field nobody listed fell back to the bare
+        # event name — which is what the inventory lines did, silently.
+        fields = collections.defaultdict(lambda: "?", event)
         try:
-            description = NOTABLE[kind].format(**fields)
-        except (KeyError, IndexError):
+            description = NOTABLE[kind].format_map(fields)
+        except (IndexError, ValueError):
             description = kind
         ts = event.get("ts_unix_ms", 0)
         print(f"  {clock(ts)}  {description}  ({ago(ts, now_ms)})")

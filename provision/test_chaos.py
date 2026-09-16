@@ -22,13 +22,16 @@ def ev(offset_s, kind, **fields):
     return {"ts_unix_ms": T0 + int(offset_s * 1000), "event": kind, **fields}
 
 
-def owner_with_peer():
-    return [
-        ev(0, "started"),
-        ev(1, "joined", peer_id=PEER),
-        ev(6, "claimed", tick="0"),
-        ev(66, "working", tick="300"),
-    ]
+def owner_with_peer(minutes=1):
+    """An owner as its log actually looks: a working line every minute.
+
+    The count matters. A fixture with one working line hid a fault that made
+    chaos fire nothing at all for an entire armed run — see
+    test_working_lines_do_not_keep_resetting_the_settling_clock.
+    """
+    events = [ev(0, "started"), ev(1, "joined", peer_id=PEER), ev(6, "claimed", tick="0")]
+    events += [ev(6 + 60 * n, "working", tick=str(300 * n)) for n in range(1, minutes + 1)]
+    return events
 
 
 class Decide(unittest.TestCase):
@@ -75,6 +78,15 @@ class Decide(unittest.TestCase):
             ev(200, "joined", peer_id=PEER),
         ]
         self.assertIsNone(chaos.decide(events, self.at(200.2))[0])
+
+    def test_working_lines_do_not_keep_resetting_the_settling_clock(self):
+        # The owner writes one a minute, for as long as it holds the job. Any
+        # of them counting as a disturbance means the node is never settled,
+        # so nothing ever fires: an armed run that quietly measures nothing.
+        # Found by review, after an hour of a live run produced no disruptions.
+        events = owner_with_peer(minutes=30)
+        action, reason = chaos.decide(events, self.at(30 * 60 + 30))
+        self.assertIsNotNone(action, f"never fires: {reason}")
 
     def test_no_events_means_no_action(self):
         self.assertIsNone(chaos.decide([], self.at(400))[0])
