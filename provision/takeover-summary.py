@@ -24,12 +24,16 @@ The visible gap — last state heard to first state produced — is reported
 beside them. It is not a threshold as written, and it is what a player sees.
 """
 import argparse
+import bisect
 import glob
 import gzip
 import json
 import math
 import os
 import sys
+
+sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
+import chaos  # noqa: E402  — the same reading of a node's log that chaos.py acts on
 
 DETECT_MAX_MS = 3000
 RESUME_MAX_MS = 500
@@ -45,6 +49,9 @@ RETURN_GRACE_MS = 20_000
 # A kill this close to the victim's own yield hit a node that was no longer
 # the owner, whatever its log said a moment before.
 YIELD_RACE_MS = 1_000
+# How far back to read a victim's own log to decide whether it held the job.
+# The owner writes a working line every minute, so this is generous.
+OWNERSHIP_WINDOW_MS = 1_800_000
 
 
 def with_rotations(paths):
@@ -111,9 +118,37 @@ def num(value):
         return None
 
 
+def held_the_job(by_node, victim, at):
+    """Whether the victim's own log says it was running the job when hit.
+
+    Read the way chaos.py reads it, because the question is what the tool
+    believed. A tool that misreads its own node's log disturbs a standby, which
+    moves no work and produces no takeover — and would otherwise be counted as
+    a job nobody continued.
+    """
+    stamps, rows = by_node.get(victim, ([], []))
+    end = bisect.bisect_right(stamps, at)
+    start = bisect.bisect_left(stamps, at - OWNERSHIP_WINDOW_MS)
+    return chaos.situation(rows[start:end], at)[0]
+
+
+def by_node_ownership_events(events):
+    """Each node's ownership-relevant events, in time order, for fast lookup."""
+    relevant = chaos.OWNING | chaos.NOT_OWNING | {chaos.WORKING, "started"}
+    grouped = {}
+    for event in events:
+        if event.get("event") not in relevant:
+            continue
+        stamps, rows = grouped.setdefault(event.get("node"), ([], []))
+        stamps.append(event.get("ts_unix_ms", 0))
+        rows.append(event)
+    return grouped
+
+
 def match(actions, events):
     """Pairs each disruptive chaos action with what the survivors logged."""
     disruptions = [a for a in actions if a.get("action") in ("kill", "term", "partition")]
+    by_node = by_node_ownership_events(events)
     results = []
     for action in disruptions:
         victim, at = action["node"], action["ts_unix_ms"]
@@ -146,7 +181,8 @@ def match(actions, events):
             # over, so this is not an orphaned job.
             "was_standby": any(e.get("node") == victim and e.get("event") == "yielded"
                                and at - YIELD_RACE_MS <= e.get("ts_unix_ms", 0) <= at + YIELD_RACE_MS
-                               for e in events),
+                               for e in events)
+            or not held_the_job(by_node, victim, at),
         })
     return results
 

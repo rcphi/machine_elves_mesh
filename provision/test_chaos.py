@@ -103,7 +103,7 @@ class AcrossARotation(unittest.TestCase):
 
     def test_a_run_that_outlived_a_rotation_is_read_from_both_files(self):
         path = self.write(
-            today=[ev(400, "working", tick="50060"), ev(460, "rtt")],
+            today=[ev(400, "working", tick="50060"), ev(460, "working", tick="50360")],
             yesterday=[ev(0, "started"), ev(1, "joined", peer_id=PEER), ev(6, "took-over")],
         )
         events = chaos.read_events(path)
@@ -111,6 +111,33 @@ class AcrossARotation(unittest.TestCase):
         self.assertTrue(owns, "it was running the job")
         self.assertEqual(peers, 1, "its peer joined before the rotation")
         self.assertIsNotNone(chaos.decide(events, T0 + 500_000)[0])
+
+    def test_a_working_line_after_a_yield_does_not_prove_ownership(self):
+        # diamond, 2026-09-16: took over at 00:25:25, yielded at 00:25:56, and
+        # wrote a working line at 00:26:42 covering ticks done before the yield.
+        # Thirteen hours later chaos killed it as though it held the job.
+        events = [
+            ev(0, "started"), ev(1, "joined", peer_id=PEER),
+            ev(25 * 60 + 25, "took-over", tick="49344"),
+            ev(25 * 60 + 42, "working", tick="49429"),
+            ev(25 * 60 + 56, "yielded", label="riverboat"),
+            ev(26 * 60 + 42, "working", tick="49740"),
+        ]
+        self.assertFalse(chaos.situation(events, T0 + 27 * 60_000)[0], "it had yielded")
+        self.assertIsNone(chaos.decide(events, T0 + 13 * 3600_000)[0])
+
+    def test_ownership_implied_by_a_working_line_goes_stale(self):
+        # The owner writes one a minute. An hour of silence is not ownership.
+        events = [ev(0, "joined", peer_id=PEER), ev(60, "working", tick="9")]
+        self.assertTrue(chaos.situation(events, T0 + 120_000)[0])
+        self.assertFalse(chaos.situation(events, T0 + 3600_000)[0])
+
+    def test_a_claim_after_a_yield_is_ownership_again(self):
+        events = [
+            ev(0, "started"), ev(1, "joined", peer_id=PEER),
+            ev(10, "yielded", label="riverboat"), ev(300, "took-over", tick="5"),
+        ]
+        self.assertTrue(chaos.situation(events, T0 + 3600_000)[0])
 
     def test_working_alone_proves_ownership(self):
         # Even with yesterday's file gone, a node writing `working` is the one

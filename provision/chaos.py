@@ -69,7 +69,19 @@ SETTLED_SECONDS = int(os.environ.get("MESH_CHAOS_SETTLED_S", "60"))
 # or `took-over` that started the ownership may be in yesterday's file: on the
 # night of 2026-09-15 riverboat held the job from 00:26 and its chaos read the
 # rotated log, decided it was a standby, and fired nothing for five hours.
-OWNING = {"claimed", "took-over", "working"}
+OWNING = {"claimed", "took-over"}
+# `working` is written only by the node advancing the job, so it is evidence of
+# ownership — but it is a summary of the *previous* minute, so one can land
+# after ownership has already gone. On 2026-09-16 diamond yielded at 00:25:56,
+# wrote a working line at 00:26:42 for ticks done before that, and thirteen
+# hours later chaos read it as "running the job" and killed a standby.
+#
+# So it counts only when nothing said otherwise in the minute before it, and
+# only while it is fresh: the owner writes one every minute, so an old one says
+# what was true then, not what is true now.
+WORKING = "working"
+WORKING_AFTER_LOSING_OWNERSHIP_S = 60
+WORKING_STAYS_TRUE_FOR_S = 180
 NOT_OWNING = {"job-owner", "yielded", "job-failed"}
 
 
@@ -117,7 +129,11 @@ def situation(events, now):
 
     Returns (owns_job, peers_present, settled_for_seconds, last_tick).
     """
-    owns = False
+    # Ownership claimed outright does not expire; ownership merely implied by a
+    # working line does, so the two are tracked apart.
+    claimed = False
+    working_at = None
+    lost_at = None
     peers = set()
     last_disturbance = None
     last_tick = None
@@ -126,11 +142,16 @@ def situation(events, now):
         ts = event.get("ts_unix_ms", 0)
         if kind == "started":
             last_disturbance = ts
+        elif kind == WORKING:
+            if lost_at is None or ts - lost_at > WORKING_AFTER_LOSING_OWNERSHIP_S * 1000:
+                working_at = ts
         elif kind in OWNING:
-            owns = True
+            claimed = True
             last_disturbance = ts
         elif kind in NOT_OWNING:
-            owns = False
+            claimed = False
+            working_at = None
+            lost_at = ts
             if kind == "yielded":
                 last_disturbance = ts
         elif kind == "joined":
@@ -146,6 +167,10 @@ def situation(events, now):
             last_disturbance = ts
         if "tick" in event:
             last_tick = event["tick"]
+    # Ownership resting on a working line goes stale: the owner writes one a
+    # minute, so silence means this node is no longer the one working.
+    owns = claimed or (working_at is not None
+                       and now - working_at <= WORKING_STAYS_TRUE_FOR_S * 1000)
     settled = (now - last_disturbance) / 1000 if last_disturbance else 0
     return owns, len(peers), settled, last_tick
 

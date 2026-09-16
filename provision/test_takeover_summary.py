@@ -70,6 +70,30 @@ class Match(unittest.TestCase):
         self.assertIsNone(r["successor"])
         self.assertTrue(r["was_standby"])
 
+    def test_a_disruption_of_a_node_that_did_not_hold_the_job_is_marked(self):
+        # diamond, 2026-09-16: it yielded, then wrote a working line covering
+        # ticks from before the yield, and the chaos tool on the box read that
+        # as ownership thirteen hours later. No work moved, so this is not a
+        # job nobody continued.
+        actions = [act("diamond", 13 * 3600_000, "term")]
+        events = [
+            ev("diamond", 0, "took-over", tick="49344"),
+            ev("diamond", 17_000, "working", tick="49429"),
+            ev("diamond", 31_000, "yielded", label="riverboat"),
+            ev("diamond", 77_000, "working", tick="49740"),
+        ]
+        [r] = summary.match(actions, events)
+        self.assertIsNone(r["successor"])
+        self.assertTrue(r["was_standby"])
+
+    def test_a_disruption_of_the_real_owner_is_not_marked_as_a_standby(self):
+        actions, events = kill_and_takeover(600_000)
+        events += [ev("diamond", 540_000, "working", tick="10"),
+                   ev("diamond", 599_000, "working", tick="20")]
+        [r] = summary.match(actions, events)
+        self.assertFalse(r["was_standby"])
+        self.assertEqual(r["successor"], "riverboat")
+
     def test_two_takeovers_are_counted(self):
         actions, events = kill_and_takeover(0)
         events.append(ev("lightning", 2300, "took-over", tick="10"))
