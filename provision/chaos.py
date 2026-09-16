@@ -64,7 +64,12 @@ PARTITION_SECONDS = (20, 60)
 # a mesh still recovering from the last one and times both at once.
 SETTLED_SECONDS = int(os.environ.get("MESH_CHAOS_SETTLED_S", "60"))
 
-OWNING = {"claimed", "took-over"}
+# `working` is only ever written by the node advancing the job, so it proves
+# ownership on its own. That matters after a log rotation, where the `claimed`
+# or `took-over` that started the ownership may be in yesterday's file: on the
+# night of 2026-09-15 riverboat held the job from 00:26 and its chaos read the
+# rotated log, decided it was a standby, and fired nothing for five hours.
+OWNING = {"claimed", "took-over", "working"}
 NOT_OWNING = {"job-owner", "yielded", "job-failed"}
 
 
@@ -97,8 +102,13 @@ def read_events(path, tail_bytes=2_000_000):
     for index in range(len(events) - 1, -1, -1):
         if events[index].get("event") == "started":
             return events[index:]
-    # No start in the tail: either a very long run or a log that has none. The
-    # tail is still this run's, as far as anything here can tell.
+    # No start in the tail. The log is rotated daily with copytruncate, so a run
+    # that outlives a rotation leaves its start — and its joins, and its claim —
+    # in yesterday's file. Reading only today's loses the peer and the
+    # ownership, and a node that knows neither never fires.
+    rotated = path + ".1"
+    if os.path.exists(rotated):
+        return read_events(rotated, tail_bytes) + events
     return events
 
 

@@ -24,8 +24,11 @@ The visible gap — last state heard to first state produced — is reported
 beside them. It is not a threshold as written, and it is what a player sees.
 """
 import argparse
+import glob
+import gzip
 import json
 import math
+import os
 import sys
 
 DETECT_MAX_MS = 3000
@@ -44,10 +47,29 @@ RETURN_GRACE_MS = 20_000
 YIELD_RACE_MS = 1_000
 
 
+def with_rotations(paths):
+    """Every path given, plus the rotated files beside it.
+
+    Logs rotate daily, and a run that spans midnight leaves half its evidence
+    in events.jsonl.1. A shell glob of "*.jsonl" does not match that, and the
+    absence is silent: takeovers whose evidence is in the rotated file look
+    like takeovers that never happened. This summary reported 24 orphaned jobs
+    that way, from a night where nothing was orphaned at all.
+    """
+    found = []
+    for path in paths:
+        for candidate in [path] + sorted(glob.glob(path + ".[0-9]")
+                                         + glob.glob(path + ".[0-9].gz")):
+            if os.path.exists(candidate) and candidate not in found:
+                found.append(candidate)
+    return found
+
+
 def load(paths):
     events, actions = [], []
-    for path in paths:
-        with open(path, encoding="utf-8", errors="replace") as handle:
+    for path in with_rotations(paths):
+        opener = gzip.open if path.endswith(".gz") else open
+        with opener(path, mode="rt", encoding="utf-8", errors="replace") as handle:
             for line in handle:
                 line = line.strip()
                 if not line.startswith("{"):
@@ -222,6 +244,8 @@ def main():
     args = parser.parse_args()
 
     events, actions = load(args.logs)
+    print(f"read {len(with_rotations(args.logs))} files: "
+          f"{', '.join(os.path.basename(p) for p in with_rotations(args.logs))}\n")
     if not args.all:
         window = armed_window(actions)
         if window is None:

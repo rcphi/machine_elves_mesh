@@ -175,10 +175,15 @@ nothing else, so SSH to a partitioned box still works.
 Afterwards, gather both logs from every box and read them together:
 
 ```
-scp diamond:/var/log/mesh-node/{events,chaos}.jsonl run-a/diamond/
-scp riverboat:/var/log/mesh-node/{events,chaos}.jsonl run-a/riverboat/
-./takeover-summary.py run-a/*/*.jsonl
+scp 'diamond:/var/log/mesh-node/*.jsonl*'   run-a/diamond/
+scp 'riverboat:/var/log/mesh-node/*.jsonl*' run-a/riverboat/
+./takeover-summary.py run-a/*/events.jsonl run-a/*/chaos.jsonl
 ```
+
+**Take the rotated files too** — the `*` after `.jsonl` is not decoration. Logs
+rotate daily, so a run that spans midnight leaves half its evidence in
+`events.jsonl.1`. The summary reads the rotations beside each file it is given
+and prints which files it read; check that list against the run's hours.
 
 It reads only the armed period, reports p50/p95/p99 for detection, resume and
 the visible gap by cause and direction, gives the verdict against the

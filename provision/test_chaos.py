@@ -86,6 +86,46 @@ class Decide(unittest.TestCase):
         self.assertEqual(set(picks), {"kill", "term", "partition"})
 
 
+class AcrossARotation(unittest.TestCase):
+    """The night of 2026-09-15: riverboat held the job, its log rotated at
+    00:26, and its chaos fired nothing for the five hours that remained."""
+
+    def write(self, today, yesterday=None):
+        directory = tempfile.mkdtemp()
+        path = os.path.join(directory, "events.jsonl")
+        for name, rows in ((path, today), (path + ".1", yesterday)):
+            if rows is None:
+                continue
+            with open(name, "w") as handle:
+                for row in rows:
+                    handle.write(json.dumps(row) + "\n")
+        return path
+
+    def test_a_run_that_outlived_a_rotation_is_read_from_both_files(self):
+        path = self.write(
+            today=[ev(400, "working", tick="50060"), ev(460, "rtt")],
+            yesterday=[ev(0, "started"), ev(1, "joined", peer_id=PEER), ev(6, "took-over")],
+        )
+        events = chaos.read_events(path)
+        owns, peers, _, _ = chaos.situation(events, T0 + 500_000)
+        self.assertTrue(owns, "it was running the job")
+        self.assertEqual(peers, 1, "its peer joined before the rotation")
+        self.assertIsNotNone(chaos.decide(events, T0 + 500_000)[0])
+
+    def test_working_alone_proves_ownership(self):
+        # Even with yesterday's file gone, a node writing `working` is the one
+        # advancing the job — no other node writes it.
+        path = self.write(today=[ev(400, "joined", peer_id=PEER), ev(460, "working", tick="9")])
+        self.assertTrue(chaos.situation(chaos.read_events(path), T0 + 500_000)[0])
+
+    def test_a_standby_is_still_not_a_target_after_a_rotation(self):
+        path = self.write(
+            today=[ev(400, "job-owner", label="diamond"), ev(460, "rtt")],
+            yesterday=[ev(0, "started"), ev(1, "joined", peer_id=PEER), ev(6, "took-over")],
+        )
+        self.assertIsNone(chaos.decide(chaos.read_events(path), T0 + 500_000)[0])
+
+
 class ReadEvents(unittest.TestCase):
     def test_only_the_current_run_is_read(self):
         # Ownership from yesterday's run must not make today's standby a target.

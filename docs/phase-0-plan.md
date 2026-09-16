@@ -653,6 +653,31 @@ For a player on mobile data this is not a performance problem, it is a reason to
 
 **Hotspot runs are now time-boxed**, never overnight, and their data use estimated before they start.
 
+## Night A: the takeover criterion, measured — 2026-09-15/16
+
+`diamond` and `riverboat`, both on home broadband on the same LAN, on mesh `night-a` with a ledger of its own. Chaos armed for eight hours on each. **46 disruptions, every one continued by the other machine.** Nothing was orphaned, nothing was taken over twice, and no false alarm occurred.
+
+| Unannounced loss (kill and partition, n=33) | p50 | p95 | max | Threshold |
+|---|---|---|---|---|
+| **Detection** | 2164 ms | 2436 ms | 2438 ms | 2–3 s — **met** |
+| **Resume** (decision to first tick) | 100 ms | 200 ms | 200 ms | 500 ms — **met** |
+| **Visible gap** (last state heard to first produced) | 2264 ms | 2533 ms | 2539 ms | none set |
+
+An announced departure (n=13) costs a resume of 14–81 ms at p50 and a visible gap of 177–236 ms: a different order of magnitude, as it should be, because nothing has to be detected.
+
+**Both thresholds are met, and the player still waits about 2.5 s.** The gap is detection plus resume, and this plan said from the start that the 500 ms budget only holds if a standby begins continuing while the original is merely *suspected* gone. Speculation is not built. So the honest statement of this result is: **the mechanism works and is within its own budget; the experience it produces is not yet the one the budget was chosen to deliver.** Building speculative resume and re-running the same measurement is the way to close that, and the before is now on record.
+
+**The sample is smaller than intended, and the reason matters more than the number.** 46 disruptions arrived in 2h45m, and then the run went quiet for five hours — not because the mesh failed, but because both chaos tools stopped firing:
+
+- **`chaos.py` was blinded by log rotation**, the same fault found in `node-summary.py` the day before, in a second tool. At 00:26 `riverboat`'s log rotated; its claim on the job was in yesterday's file; it concluded it was a standby and never fired again. `diamond`, correctly, would not disturb a job it did not hold. Ownership had settled on `riverboat`, so nothing moved for five hours.
+- **`takeover-summary.py` did not read rotated files either**, and reported 24 orphaned takeovers on the first pass — evidence sitting in `events.jsonl.1`, unread, looking exactly like evidence that did not exist. It now gathers the rotations beside each file it is given and prints which files it read.
+
+Both are fixed, with tests. **n=33 makes a p95 worth quoting and a p99 worth nothing**, and the run should be repeated for a fuller distribution.
+
+**The repair fix held in the field.** Over fifteen hours the two nodes exchanged **1,608 items, about 70 KB**, across 92 rounds — against the 706 million items offered in nine hours on the hotspot. At rest, the cost is a 3 KB summary a minute.
+
+**And the mesh is still running.** Twelve hours after the last disruption, the job is advancing on `riverboat`, 271,000 ticks in, with `diamond` following at 1 ms.
+
 ## Volunteer machines and remote management
 
 Volunteers are not technically inclined. Machines are prepared centrally — Ubuntu 26.04, Rust and dependencies preinstalled — and shipped ready to plug in.
