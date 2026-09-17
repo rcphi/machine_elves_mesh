@@ -2,7 +2,9 @@
 """Tests for takeover-summary.py. `python3 -m unittest provision/test_takeover_summary.py`"""
 import importlib.util
 import io
+import math
 import os
+import time
 import unittest
 
 HERE = os.path.dirname(os.path.abspath(__file__))
@@ -144,6 +146,50 @@ class Report(unittest.TestCase):
         actions = [act("a", 100, "armed"), act("b", 200, "armed"),
                    act("a", 9_000, "disarmed"), act("b", 9_500, "disarmed")]
         self.assertEqual(summary.armed_window(actions), (T0 + 100, T0 + 9_500))
+
+
+class ArmedWindow(unittest.TestCase):
+    """A box's chaos log holds every run it has ever done. The window must be
+    the run being asked about — the last one — or the summary answers about a
+    different night without saying so."""
+
+    def test_a_run_still_going_is_read_and_the_run_before_it_is_not(self):
+        actions = [act("a", 100, "armed"), act("a", 9_000, "disarmed"),
+                   act("a", 50_000, "armed")]
+        self.assertEqual(summary.armed_window(actions), (T0 + 50_000, math.inf))
+
+    def test_the_last_of_two_finished_runs_is_the_one_read(self):
+        actions = [act("a", 100, "armed"), act("a", 9_000, "disarmed"),
+                   act("a", 50_000, "armed"), act("a", 80_000, "disarmed")]
+        self.assertEqual(summary.armed_window(actions), (T0 + 50_000, T0 + 80_000))
+
+    def test_the_window_opens_at_the_first_box_to_arm_not_the_last(self):
+        # Boxes are armed by hand a minute apart. A disruption in that minute
+        # is part of the run and must not fall outside it.
+        actions = [act("a", 100, "armed"), act("a", 9_000, "disarmed"),
+                   act("a", 50_000, "armed"), act("b", 110_000, "armed")]
+        self.assertEqual(summary.armed_window(actions), (T0 + 50_000, math.inf))
+
+    def test_a_box_that_sat_out_the_last_run_does_not_reopen_the_window(self):
+        # `b` was in the first run only; its log is collected with the rest.
+        actions = [act("a", 100, "armed"), act("b", 200, "armed"),
+                   act("a", 9_000, "disarmed"), act("b", 9_500, "disarmed"),
+                   act("a", 50_000, "armed")]
+        self.assertEqual(summary.armed_window(actions), (T0 + 50_000, math.inf))
+
+    def test_no_arm_at_all_is_no_window(self):
+        self.assertIsNone(summary.armed_window([act("a", 100, "kill")]))
+
+    def test_the_window_is_printed_so_it_can_be_checked_against_the_run(self):
+        line = summary.window_line(T0, T0 + 8 * 3600_000)
+        self.assertIn(time.strftime("%Y-%m-%d %H:%M", time.localtime(T0 / 1000)), line)
+        self.assertIn(time.strftime("%H:%M", time.localtime(T0 / 1000 + 8 * 3600)), line)
+        self.assertIn("8.0 h", line)
+
+    def test_a_run_still_going_says_so_rather_than_printing_a_false_end(self):
+        line = summary.window_line(T0, math.inf)
+        self.assertIn("still armed", line)
+        self.assertIn(time.strftime("%Y-%m-%d %H:%M", time.localtime(T0 / 1000)), line)
 
 
 if __name__ == "__main__":

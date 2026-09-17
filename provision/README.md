@@ -159,6 +159,9 @@ mesh-chaos status              # armed or not, and what it has done
 sudo mesh-chaos disarm         # stop early
 ```
 
+`status` counts the current run only — the one armed most recently — and says
+when it began. The log below it holds every earlier run too.
+
 **It acts only when this node is running the job and has a peer present**,
 and only once the last disruption has settled for a minute. Each fire picks
 kill (60%), term (20%) or a 20–60 s partition (20%), and logs to
@@ -185,10 +188,16 @@ rotate daily, so a run that spans midnight leaves half its evidence in
 `events.jsonl.1`. The summary reads the rotations beside each file it is given
 and prints which files it read; check that list against the run's hours.
 
-It reads only the armed period, reports p50/p95/p99 for detection, resume and
-the visible gap by cause and direction, gives the verdict against the
-thresholds, and counts what should not happen: orphaned jobs, double
-takeovers, false alarms, restarts nobody noticed.
+It reads only **the last armed period**, and prints which one that was, beside
+the file list and checked the same way. A chaos log is not rotated per run, so
+a box's holds every run it has ever done; reading from the first arm would
+answer about an older night in the same shape and the same units as an answer
+about this one. `--all` reads everything regardless.
+
+Within that period it reports p50/p95/p99 for detection, resume and the visible
+gap by cause and direction, gives the verdict against the thresholds, and
+counts what should not happen: orphaned jobs, double takeovers, false alarms,
+restarts nobody noticed.
 
 **Every duration is measured on a single machine's clock.** Clocks between boxes
 are used only to match an action to its takeover, to within seconds.

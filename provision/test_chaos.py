@@ -165,6 +165,32 @@ class AcrossARotation(unittest.TestCase):
         self.assertIsNone(chaos.decide(chaos.read_events(path), T0 + 500_000)[0])
 
 
+def act(offset_s, action, **fields):
+    return {"ts_unix_ms": T0 + int(offset_s * 1000), "action": action, **fields}
+
+
+class RunCounts(unittest.TestCase):
+    """`mesh-chaos status` is what an operator looks at mid-run to decide
+    whether the run is working. A chaos log holds every run the box has ever
+    done, so counting all of it answers about nights that are over."""
+
+    def test_only_the_current_runs_actions_are_counted(self):
+        rows = [act(0, "armed"), act(60, "kill"), act(120, "kill"), act(180, "disarmed"),
+                act(9_000, "armed"), act(9_060, "kill"), act(9_120, "skip")]
+        start, counts = chaos.run_counts(rows)
+        self.assertEqual(start, T0 + 9_000_000)
+        self.assertEqual(counts, {"armed": 1, "kill": 1, "skip": 1})
+
+    def test_a_finished_runs_own_actions_are_what_is_counted_after_it(self):
+        rows = [act(0, "armed"), act(60, "kill"), act(180, "disarmed"),
+                act(9_000, "armed"), act(9_060, "term"), act(9_180, "disarmed")]
+        _, counts = chaos.run_counts(rows)
+        self.assertEqual(counts, {"armed": 1, "term": 1, "disarmed": 1})
+
+    def test_a_log_with_no_run_in_it_counts_nothing(self):
+        self.assertEqual(chaos.run_counts([]), (None, {}))
+
+
 class ReadEvents(unittest.TestCase):
     def test_only_the_current_run_is_read(self):
         # Ownership from yesterday's run must not make today's standby a target.

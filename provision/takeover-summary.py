@@ -31,6 +31,7 @@ import json
 import math
 import os
 import sys
+import time
 
 sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
 import chaos  # noqa: E402  — the same reading of a node's log that chaos.py acts on
@@ -91,14 +92,20 @@ def load(paths):
     return events, actions
 
 
-def armed_window(actions):
-    armed = [a["ts_unix_ms"] for a in actions if a.get("action") == "armed"]
-    ended = [a["ts_unix_ms"] for a in actions if a.get("action") == "disarmed"]
-    if not armed:
-        return None
-    start = min(armed)
-    end = max(ended) if ended and max(ended) > start else math.inf
-    return start, end
+# The same rule chaos.py applies on the box: the run asked about is the last
+# one in these logs, not the first. Defined once, because reading the wrong
+# period has now blinded three tools in this directory.
+armed_window = chaos.armed_window
+
+
+def window_line(start, end):
+    """What period these numbers describe. Printed beside the file list, and
+    checked the same way: against the hours the run was actually armed."""
+    began = time.strftime("%Y-%m-%d %H:%M", time.localtime(start / 1000))
+    if end == math.inf:
+        return f"the run armed {began}, still armed"
+    finished = time.strftime("%H:%M", time.localtime(end / 1000))
+    return f"the run armed {began} -> {finished}, {(end - start) / 3600_000:.1f} h"
 
 
 def percentile(values, p):
@@ -281,16 +288,20 @@ def main():
 
     events, actions = load(args.logs)
     print(f"read {len(with_rotations(args.logs))} files: "
-          f"{', '.join(os.path.basename(p) for p in with_rotations(args.logs))}\n")
+          f"{', '.join(os.path.basename(p) for p in with_rotations(args.logs))}")
     if not args.all:
         window = armed_window(actions)
         if window is None:
             sys.exit("no 'armed' record in the chaos logs — pass --all to read everything")
         start, end = window
+        print(window_line(start, end))
         # A little past the end, so a takeover caused by the last action counts.
         inside = lambda r: start <= r.get("ts_unix_ms", 0) <= end + MATCH_WINDOW_MS  # noqa: E731
         events = [e for e in events if inside(e)]
         actions = [a for a in actions if inside(a)]
+    else:
+        print("every run in these logs, armed or not")
+    print()
     report(match(actions, events), events, actions)
 
 

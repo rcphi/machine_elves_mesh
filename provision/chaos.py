@@ -206,6 +206,44 @@ def decide(events, now, rng=random):
     return ACTIONS[0][0], "running the job with a peer present"
 
 
+def armed_window(actions):
+    """The last run in these records, not the first.
+
+    A chaos log holds every run the box has ever done — it is not rotated per
+    run — so a window from the first arm to the last disarm answers about an
+    older night while looking exactly like an answer about this one. The run
+    asked about is the most recent: everything armed after the last disarm
+    that precedes the newest arm. It opens at the *earliest* of those arms,
+    because boxes are armed by hand a minute apart and a disruption in that
+    minute belongs to the run.
+
+    Shared with takeover-summary.py, which asks the same question of several
+    boxes' logs at once."""
+    armed = [a["ts_unix_ms"] for a in actions if a.get("action") == "armed"]
+    ended = [a["ts_unix_ms"] for a in actions if a.get("action") == "disarmed"]
+    if not armed:
+        return None
+    before = [e for e in ended if e < max(armed)]
+    start = min(a for a in armed if not before or a > max(before))
+    after = [e for e in ended if e > start]
+    end = max(after) if after else float("inf")
+    return start, end
+
+
+def run_counts(actions):
+    """What this run has done, and when it began. Counting the whole file
+    reports nights that are over as if they were tonight."""
+    window = armed_window(actions)
+    if window is None:
+        return None, {}
+    start, end = window
+    counts = {}
+    for a in actions:
+        if start <= a.get("ts_unix_ms", 0) <= end:
+            counts[a["action"]] = counts.get(a["action"], 0) + 1
+    return start, counts
+
+
 def armed_until():
     try:
         with open(os.path.join(STATE_DIR, "until")) as handle:
@@ -354,19 +392,21 @@ def status():
         print("disarmed")
     else:
         print(f"armed for another {(until - now_ms()) / 3600000:.1f} h")
-    counts = {}
+    rows = []
     try:
         with open(CHAOS_LOG) as handle:
             for line in handle:
                 try:
-                    action = json.loads(line).get("action")
+                    rows.append(json.loads(line))
                 except json.JSONDecodeError:
                     continue
-                counts[action] = counts.get(action, 0) + 1
     except OSError:
         pass
+    began, counts = run_counts(rows)
+    if began is not None:
+        print(f"  since arming at {time.strftime('%H:%M', time.localtime(began / 1000))}:")
     for action, count in sorted(counts.items()):
-        print(f"  {action:<16} {count}")
+        print(f"    {action:<16} {count}")
     owns, peers, settled, tick = situation(read_events(NODE_LOG), now_ms())
     print(f"node: {'running the job' if owns else 'standing by'}, {peers} peer(s), "
           f"settled {settled:.0f}s, tick {tick}")
