@@ -678,6 +678,52 @@ Both are fixed, with tests. **n=33 makes a p95 worth quoting and a p99 worth not
 
 **And the mesh is still running.** Twelve hours after the last disruption, the job is advancing on `riverboat`, 271,000 ticks in, with `diamond` following at 1 ms.
 
+## Night A, second run: the same criterion at n=104 — 2026-09-17
+
+The same two boxes, the same mesh and ledger, chaos armed eight hours on each. **120 disruptions, every one continued by the other machine.** Nothing orphaned, nothing taken over twice, no false alarm, no restart that went unnoticed — 2.6 times Night A's sample with the same four counts at zero.
+
+| Unannounced loss (kill and partition, n=104) | p50 | p95 | p99 | max | Threshold |
+|---|---|---|---|---|---|
+| **Detection** | 2347 ms | 2461 ms | 2480 ms | 2486 ms | 2–3 s — **met** |
+| **Resume** (decision to first tick) | 100 ms | 200 ms | 201 ms | 212 ms | 500 ms — **met** |
+| **Visible gap** (last state heard to first produced) | 2450 ms | 2651 ms | 2659 ms | 2680 ms | none set |
+
+**This is the run where the p99 means something.** Night A's n=33 gave a p99 that was one sample; at n=104 it is the 103rd of 104, and it sits 19 ms above the p95. The distribution is not merely inside the threshold, it is tight against it: 2347 ms at p50 to 2486 ms at the worst of 104, a spread of 139 ms.
+
+An announced departure (n=16) resumes in 23–103 ms at p50 with a visible gap of 150–292 ms, the same order of magnitude Night A found.
+
+**The conclusion is unchanged, and it is the one that matters.** Both thresholds are met and **the player still waits about 2.45 s**, because the gap is detection plus resume and speculative resume from a warm standby — which this plan always said the 500 ms budget depended on — is still not built. A second, larger measurement of the same mechanism does not move that; it only removes "the sample was too small" as a reason to doubt it. The before is on record twice now.
+
+### What Night A blamed on rotation, this run proved fixed
+
+At 20:01, four and three-quarter hours in, **`riverboat`'s log rotated mid-run** — the exact event that ended Night A's measurement five hours early. Its ownership was now in `events.jsonl.1`.
+
+It fired three times in the next sixteen minutes, correctly naming itself the job owner each time. The run continued to its end. `takeover-summary.py` read the boundary as continuous, gathering nine files without being told to.
+
+That is the field proof the rotation fixes never had. The regression test failed against the copy installed on the boxes with the same words as the live log; this is the same fix working on a real machine, across a real rotation, unattended, while nobody was watching.
+
+### A third tool was reading the wrong period
+
+Twenty-five minutes into this run, the command this document gives for reading a run reported **47 disruptions, all of them from Night A and the dud run of the 16th, none from this one** — in the same units, the same verdicts and the same shape as a true answer. A chaos log is not rotated per run, so a box's holds every run it has ever done, and a window from the first arm to the last disarm names an older night. `mesh-chaos status` had it too: this run's two kills read as sixteen.
+
+Both now take the last armed period, by one rule defined once and shared, and both print which period that was. **That is three tools blinded by reading the wrong span of a log — two by a rotation, one by the absence of one.** The lesson is not about rotation. It is that a tool which silently answers about the wrong period produces a result indistinguishable from a correct one, and only a printed window makes it checkable.
+
+### Repair cost, and a guess that was wrong
+
+Over the run the two nodes repaired **about 26,800 items, roughly 1.2 MB** across 244 comparisons — an order more than Night A's 1,608, on 2.6 times the disruptions.
+
+The obvious explanation is partitions: a partitioned node keeps running and keeps producing, so both sides advance and the divergence to reconcile should be large. **The measurement says otherwise.** Attributing repairs to the disruption they follow, within 150 s (windows overlap slightly, so these are approximate):
+
+| | n | items per disruption |
+|---|---|---|
+| kill | 75 | ~315 |
+| term | 16 | ~383 |
+| partition | 29 | ~68 |
+
+**A partition is the cheapest of the three to reconcile, not the dearest.** The cost tracks the restart, not the divergence: a killed or stopped node is away about eight seconds and comes back needing everything produced meanwhile, while a partitioned node never stops, yields to whichever peer is further along, and needs little. Night A's smaller total is consistent — it had seven partitions and most of its quiet fifteen hours had no restarts at all.
+
+**All of this remains an upper bound.** Two dedicated always-on wired boxes on one LAN are the best case on every axis a real player's machine is worse.
+
 ## Volunteer machines and remote management
 
 Volunteers are not technically inclined. Machines are prepared centrally — Ubuntu 26.04, Rust and dependencies preinstalled — and shipped ready to plug in.
