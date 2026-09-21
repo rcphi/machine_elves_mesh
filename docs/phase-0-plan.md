@@ -724,6 +724,72 @@ The obvious explanation is partitions: a partitioned node keeps running and keep
 
 **All of this remains an upper bound.** Two dedicated always-on wired boxes on one LAN are the best case on every axis a real player's machine is worse.
 
+## Run B: the same criterion across two carriers — 2026-09-20
+
+`diamond` on home broadband, reachable because its router granted NAT-PMP port 4001; `yoinkerz` on a phone hotspot behind a carrier address nobody can dial. Two carriers, no rented infrastructure. Chaos armed two hours on each.
+
+**21 disruptions, every one continued by the other machine**, with the same four counts at zero: nothing orphaned, nothing taken over twice, no false alarm, no restart that went unnoticed.
+
+| Unannounced loss (kill and partition, n=15) | p50 | p95 | max | Threshold |
+|---|---|---|---|---|
+| **Detection** | 2265 ms | 2456 ms | 2456 ms | 2–3 s — **met** |
+| **Resume** (decision to first tick) | 100 ms | 200 ms | 200 ms | 500 ms — **met** |
+| **Visible gap** (last state heard to first produced) | 2428 ms | 2566 ms | 2566 ms | none set |
+
+An announced departure (n=6) resumes in 50–101 ms with a visible gap of 99–139 ms.
+
+### The internet path contributes nothing measurable
+
+Run A's second night, on one LAN, gave detection p95 **2461 ms** and resume p95 **200 ms**. Run B, across a mobile carrier and a home broadband connection, gives **2456 ms** and **200 ms** — five milliseconds apart on detection and identical on resume.
+
+**That is the result Run B existed to produce.** The two rigs were separated so the network's contribution could be told apart from the node's, and the answer is that for takeover timing there is no network contribution worth reporting. The gap a player waits through is the detection window and almost nothing else, which is what the plan said when it fixed 2 s and predicted a ~2.5 s wait until speculative resume exists.
+
+Both directions are symmetric: diamond→yoinkerz detects in 2173 ms at p50, yoinkerz→diamond in 2345 ms.
+
+**n=15, against Run A's 104.** A usable p95; the p99 is one sample and the summary says so. The window was armed 2.1 h but paired for about 92 minutes — the laptop was carried out of hotspot range near the end, and 26 fires were skipped for want of a peer. That is the operator's fault, not the carrier's.
+
+### What the phone paid
+
+**121.6 MB for the run** — 89.3 MB in, 32.3 MB out, on the laptop's own interface counters, including an unrelated snapd refresh in the first minutes.
+
+Scaled to the nine hours of 2026-09-13, that is roughly 550 MB against **7.54 GB**: about a fourteenfold reduction, and the repair rewrite is what did it.
+
+**The two ends do not agree, and the discrepancy is unexplained.** diamond's NIC recorded 108.0 MB sent while yoinkerz's recorded 89.3 MB received, and the laptop was offline for 40 of those minutes. Candidates are QUIC retransmission into a lossy mobile path, the 1,746 dial attempts diamond aimed at the LAN address the laptop no longer had, and the ssh used to watch the run. Interface counters cannot separate them. `IPAccounting=yes` on `mesh-node.service` would attribute bytes to the unit alone; it needs a restart, so it is a change for the next run rather than a correction to this one.
+
+**The estimate made before the run was wrong by about four times** — a few tens of MB predicted, ~122 MB paid. It was built from payload sizes: a 36-byte checkpoint five times a second looks like nothing. At roughly ten messages a second the wire cost is about 1.4 KB each once gossipsub signing and QUIC framing are counted. **Steady state costs about 60 MB an hour while a job is running**, which is 1.4 GB a day for an always-on player, and the standby pays a quarter of what the owner does. Fine on broadband; a real constraint on anything metered, and a number Phase 0 did not have before tonight.
+
+### Repair cost, and the ordering that replicates
+
+1,576 items crossed in repair over the whole run, against 18,188 produced. Attributing them to the disruption they follow:
+
+| | n | items per disruption |
+|---|---|---|
+| kill | 10 | ~37 |
+| term | 6 | ~53 |
+| partition | 5 | ~11 |
+
+**Same ordering as Night A's second run** — a partition is the cheapest to reconcile, an announced stop the dearest — at a tenth the magnitude, because this run produced items an order slower than a LAN pair does. Ledgers sat 16 items apart at the median comparison.
+
+### A forty-minute partition cost twelve items
+
+After the armed window closed, the laptop left hotspot range for **40 minutes**. Both machines declared the other gone and ran the job alone, each producing some 4,500 items with no contact.
+
+It came back on a different carrier address — `69.223.229.91:5409` became `69.224.92.117:1806` — without restarting, and dialled until diamond answered on attempt 1,746. Reconciling the two divergent histories moved **12 items in 8 cells**, over 8 rounds:
+
+```
+{"ledger-comparing","their_held":"19504","our_held":"19508","buckets":"4"}
+```
+
+**Two nodes that diverged for forty minutes were four items apart.** That is content-derived identity paying for itself ("Things are identified by what made them", above): items are named by what made them, the job is deterministic, so two nodes running the same job from the same checkpoint independently produce *the same items*. A partition does not create divergence to reconcile; it creates duplicate work whose results are identical and merge to nothing. This is outside the measured window and is not part of the criterion, but it is the strongest evidence yet for the mechanism Night A's repair-cost table first hinted at.
+
+### Two things the setup found
+
+**A peer on the wrong mesh is indistinguishable from a broken one.** Reverting the laptop restored its old binary and its old mesh name while leaving it pointed at diamond. It connected over the internet, was ignored by gossip, was dropped, and redialled — logging `silent-connection` every 4.5 s indefinitely, with nothing anywhere naming the cause. Fifteen minutes went into diagnosing what a single line — *connected, never subscribed, mesh name differs* — would have said outright. Worth fixing before volunteers can run mismatched versions.
+
+**diamond's log rotated at 00:02 UTC, mid-run, and the run did not notice.** This is the box whose logrotate config had drifted and was corrected the day before; this was its first rotation since. The node wrote through it and `takeover-summary.py` read the 8 files without being told to. Ad-hoc `grep` over `events.jsonl` alone, used while watching, made the resume count appear to fall from 8 to 1 — the same blindness as Night A, in a hand-typed command rather than a tool.
+
+**Still an upper bound.** A dedicated laptop on a good hotspot beside its phone is better than a player's machine on a bus.
+
 ## Volunteer machines and remote management
 
 Volunteers are not technically inclined. Machines are prepared centrally — Ubuntu 26.04, Rust and dependencies preinstalled — and shipped ready to plug in.
