@@ -430,6 +430,10 @@ struct Config {
     dial: Vec<Multiaddr>,
     heartbeat: Duration,
     detect: Duration,
+    /// How long an owner's silence starts a standby continuing its job, before
+    /// anyone is presumed gone. `None` runs the node exactly as it ran before
+    /// speculation existed.
+    speculate_after: Option<Duration>,
     json: bool,
     /// A job every node in the mesh holds. One of them runs it; the rest stand
     /// ready to continue it.
@@ -510,24 +514,38 @@ impl Work {
         theirs.0 > mine.0 || (theirs.0 == mine.0 && theirs.1 < mine.1)
     }
 
-    /// Decides, with no coordination at all, whether this node should continue
-    /// the job now that its owner is gone.
+    /// Whether `me` is the lowest identifier among the peers given.
     ///
-    /// The rule is simply the lowest peer identifier among everyone still
-    /// present. Every survivor holds the same membership list and applies the
-    /// same comparison, so they all reach the same answer without exchanging a
-    /// single message — and a vote here would cost more time than the takeover
-    /// it was arranging.
-    ///
-    /// Two nodes briefly disagreeing is survivable rather than catastrophic:
-    /// they would run identical ticks from identical state and produce
-    /// identical results (§11.4), so the duplicate is wasted work, not damage.
+    /// `peer != me` matters as much as the comparison. If this node ever
+    /// appears in its own membership — which self-discovery over the local
+    /// network will cause — then without it the test is `me < me`, which is
+    /// false, and this node silently becomes ineligible forever.
+    fn lowest_among<'a>(me: &PeerId, peers: impl Iterator<Item = &'a PeerId>) -> bool {
+        peers.filter(|peer| *peer != me).all(|peer| me < peer)
+    }
+
     fn should_take_over(me: &PeerId, members: &HashMap<PeerId, Member>) -> bool {
-        // `peer != me` matters as much as the comparison. If this node ever
-        // appears in its own membership — which self-discovery over the local
-        // network will cause — then without it the test is `me < me`, which is
-        // false, and this node silently becomes ineligible forever.
-        members.keys().filter(|peer| *peer != me).all(|peer| me < peer)
+        Self::lowest_among(me, members.keys())
+    }
+
+    /// Whether to start continuing a job whose owner has gone quiet but is not
+    /// yet presumed gone.
+    ///
+    /// The same election the takeover uses, run early and with the suspect
+    /// excluded — it is precisely the node whose absence is being assumed, and
+    /// counting it would, in a two-node mesh, make the survivor ineligible
+    /// whenever its identifier is the higher of the two.
+    fn should_speculate(
+        me: &PeerId,
+        owner: &PeerId,
+        members: &HashMap<PeerId, Member>,
+        now: Instant,
+        after: Duration,
+    ) -> bool {
+        members
+            .get(owner)
+            .is_some_and(|suspect| now.duration_since(suspect.last_heard) >= after)
+            && Self::lowest_among(me, members.keys().filter(|peer| *peer != owner))
     }
 }
 
@@ -630,6 +648,7 @@ fn parse_args() -> Result<Config> {
         dial: Vec::new(),
         heartbeat: Duration::from_millis(DEFAULT_HEARTBEAT_MS),
         detect: Duration::from_millis(DEFAULT_DETECT_MS),
+        speculate_after: None,
         json: false,
         job: None,
         job_tick: Duration::from_millis(DEFAULT_JOB_TICK_MS),
@@ -662,6 +681,13 @@ fn parse_args() -> Result<Config> {
                 config.detect =
                     Duration::from_millis(args.next().context("--detect-ms needs a number")?.parse()?)
             }
+            "--speculate-after-ms" => {
+                let ms: u64 = args.next().context("--speculate-after-ms needs a number")?.parse()?;
+                // Zero is off rather than instant. A standby that suspected an
+                // owner the moment a packet was late would run the job
+                // permanently alongside it.
+                config.speculate_after = (ms > 0).then(|| Duration::from_millis(ms));
+            }
             "--json" => config.json = true,
             "--job" => config.job = Some(args.next().context("--job needs a path")?),
             "--mesh" => config.mesh = args.next().context("--mesh needs a name")?,
@@ -686,6 +712,16 @@ fn parse_args() -> Result<Config> {
             }
             other => anyhow::bail!("unknown argument: {other}"),
         }
+    }
+
+    // A quarter of the detection window, which is also how often the sweep
+    // runs, so suspicion is noticed on the first sweep that could notice it.
+    // Derived rather than independent: retuning detection retunes this, and a
+    // pair of numbers that must stay ordered would eventually be set out of
+    // order.
+    let speculating_by_default = !std::env::args().any(|a| a == "--speculate-after-ms");
+    if speculating_by_default {
+        config.speculate_after = Some(config.detect / 4);
     }
 
     if config.listen.is_empty() {
@@ -769,6 +805,10 @@ fn print_usage() {
     println!("  --peer <multiaddr>   address of a node to dial (repeatable)");
     println!("  --heartbeat-ms <n>   how often to announce presence (default {DEFAULT_HEARTBEAT_MS})");
     println!("  --detect-ms <n>      silence before a peer is presumed gone (default {DEFAULT_DETECT_MS})");
+    println!("  --speculate-after-ms <n>");
+    println!("                       silence before a standby starts continuing the job, ahead");
+    println!("                       of any decision that the owner is gone (default: a quarter");
+    println!("                       of --detect-ms). 0 turns speculation off");
     println!("  --json               emit machine-readable events");
     println!("  --run-job <file.wasm> [--ticks N]");
     println!("                       run a job locally and show its effects, then exit");
@@ -2476,6 +2516,70 @@ mod tests {
             portmap::WORST_CASE,
             detect
         );
+    }
+
+    fn member_last_heard(at: Instant) -> Member {
+        Member { label: "peer".into(), joined: at, last_heard: at, disconnected: false, run: Some(1) }
+    }
+
+    #[test]
+    fn speculation_waits_for_the_owner_to_go_quiet() {
+        let now = Instant::now();
+        let after = Duration::from_millis(500);
+        let (me, owner) = (PeerId::random(), PeerId::random());
+        let mut members = HashMap::new();
+        members.insert(owner, member_last_heard(now - Duration::from_millis(200)));
+
+        assert!(!Work::should_speculate(&me, &owner, &members, now, after),
+                "200 ms of silence is one lost packet, not a missing machine");
+
+        members.insert(owner, member_last_heard(now - Duration::from_millis(600)));
+        assert!(Work::should_speculate(&me, &owner, &members, now, after));
+    }
+
+    #[test]
+    fn only_the_successor_speculates_and_the_suspect_does_not_count() {
+        // The election must exclude the node being suspected. Including it
+        // would mean that in a two-node mesh the higher identifier is never
+        // eligible, and speculation would appear simply not to work.
+        let now = Instant::now();
+        let after = Duration::from_millis(500);
+        let quiet = now - Duration::from_secs(1);
+        let mut ids = [PeerId::random(), PeerId::random(), PeerId::random()];
+        ids.sort();
+        let [low, middle, high] = ids;
+
+        let mut members = HashMap::new();
+        members.insert(low, member_last_heard(quiet));
+        members.insert(high, member_last_heard(now));
+
+        // `low` owns the job and has gone quiet. `middle` is the lowest of the
+        // survivors, so it speculates and `high` does not.
+        assert!(Work::should_speculate(&middle, &low, &members, now, after));
+
+        let mut seen_by_high = HashMap::new();
+        seen_by_high.insert(low, member_last_heard(quiet));
+        seen_by_high.insert(middle, member_last_heard(now));
+        assert!(!Work::should_speculate(&high, &low, &seen_by_high, now, after));
+    }
+
+    #[test]
+    fn a_peer_that_is_not_a_member_is_not_speculated_about() {
+        // Its silence cannot be measured, so there is nothing to suspect.
+        let now = Instant::now();
+        let (me, stranger) = (PeerId::random(), PeerId::random());
+        assert!(!Work::should_speculate(&me, &stranger, &HashMap::new(), now,
+                                        Duration::from_millis(500)));
+    }
+
+    #[test]
+    fn suspicion_falls_strictly_inside_detection() {
+        // Speculation that fired at or after detection would never happen: the
+        // takeover it is meant to precede would already have occurred.
+        let detect = Duration::from_millis(DEFAULT_DETECT_MS);
+        assert!(detect / 4 < detect);
+        assert!(detect / 4 >= Duration::from_millis(DEFAULT_HEARTBEAT_MS) / 2,
+                "a trigger below half a heartbeat would suspect a node that is answering normally");
     }
 
     #[test]
