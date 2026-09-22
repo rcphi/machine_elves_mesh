@@ -1815,6 +1815,41 @@ async fn run(config: Config) -> Result<()> {
                             // to claim it.
                             w.claim_after = None;
 
+                            // A checkpoint means somebody else is running this
+                            // job, which is the answer to the suspicion that
+                            // started this node running it. Resolved by the
+                            // same rule two owners always use, so a speculator
+                            // is not a special case: whoever is further along
+                            // keeps it, and the other stops.
+                            if let Some(spec) = w.speculating.as_ref() {
+                                if Work::theirs((w.tick, &me), (tick, &source)) {
+                                    let wasted = w.tick.saturating_sub(spec.from_tick);
+                                    let wasted_ms =
+                                        Instant::now().duration_since(spec.since).as_millis();
+                                    emit(&config, "speculation-abandoned",
+                                         &format!("{label} is running it after all — {wasted} ticks \
+                                                   computed on suspicion are discarded"),
+                                         &[("peer_id", &source.to_string()),
+                                           ("label", &label),
+                                           ("ticks_wasted", &wasted.to_string()),
+                                           ("wasted_ms", &wasted_ms.to_string())]);
+                                    w.speculating = None;
+                                    // Nothing ticked after this point, so a
+                                    // resume still owed is a resume that will
+                                    // never happen.
+                                    w.resuming = None;
+                                } else {
+                                    // Further along than the node that came
+                                    // back, so this one keeps the job and that
+                                    // one yields when it hears this node's next
+                                    // checkpoint. Speculation is over either
+                                    // way; what differs is who owns the work.
+                                    w.speculating = None;
+                                    w.owner = Some(me);
+                                    continue;
+                                }
+                            }
+
                             if w.owner == Some(me) {
                                 // Two nodes running the same job, which a
                                 // partition produces whenever both sides
@@ -2364,6 +2399,24 @@ mod tests {
         // measured from a decision that changed nothing about the work.
         assert!(!resume_is_owed(true), "already running it: the resume was reported at that tick");
         assert!(resume_is_owed(false), "nothing has ticked yet, so the resume is still owed");
+    }
+
+    #[test]
+    fn the_returning_owner_decides_by_the_same_rule_as_any_two_owners() {
+        // A speculator resumed from an older checkpoint, so an owner that never
+        // stopped is normally ahead and keeps the job. Behind, and it yields —
+        // the rule does not care which of the two was speculating.
+        let (me, owner) = (PeerId::random(), PeerId::random());
+        assert!(Work::theirs((12, &me), (15, &owner)), "they are further along");
+        assert!(!Work::theirs((15, &me), (12, &owner)), "we are");
+    }
+
+    #[test]
+    fn wasted_ticks_are_counted_from_where_speculation_began() {
+        let spec = Speculating { about: PeerId::random(), since: Instant::now(), from_tick: 40 };
+        assert_eq!(52u64.saturating_sub(spec.from_tick), 12);
+        // A speculation that never got a tick in wasted none.
+        assert_eq!(40u64.saturating_sub(spec.from_tick), 0);
     }
 
     fn serials(ticks: &[u64]) -> Vec<(String, ledger::Serial)> {
