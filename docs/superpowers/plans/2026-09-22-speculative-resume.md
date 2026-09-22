@@ -408,97 +408,59 @@ Co-Authored-By: Claude Opus 5 <noreply@anthropic.com>"
 
 - [ ] **Step 1: Write the failing test**
 
+`take_over_if_ours` needs a whole `Work`, which needs a loaded wasm job, and
+`job_or_skip!` lives in `node/tests/jobs.rs` rather than in `main.rs`'s unit
+tests. So the decision under test is extracted as a pure function first and
+tested there — which is the right shape anyway: what matters is *whether* a
+resume is armed, not the swarm around it.
+
 ```rust
     #[test]
     fn confirming_a_speculation_does_not_resume_twice() {
         // The first tick already happened and already reported itself. Arming
         // another resume here would report two for one takeover, the second
-        // measured from a decision that changed nothing.
-        let me = PeerId::random();
-        let config = test_config();
-        let mut work = test_work();
-        work.owner = None;
-        work.owner_lost_at = Some(Instant::now());
-        work.speculating = Some(Speculating {
-            about: PeerId::random(),
-            since: Instant::now(),
-            from_tick: 10,
-        });
-        work.resuming = None;
-
-        take_over_if_ours(&config, me, &mut work, &HashMap::new(), "vanished");
-
-        assert_eq!(work.owner, Some(me));
-        assert!(work.speculating.is_none(), "speculation has become ownership");
-        assert!(work.resuming.is_none(), "the resume was reported at the speculative tick");
-    }
-
-    #[test]
-    fn a_takeover_without_speculation_still_arms_a_resume() {
-        let me = PeerId::random();
-        let config = test_config();
-        let mut work = test_work();
-        work.owner = None;
-        work.owner_lost_at = Some(Instant::now());
-
-        take_over_if_ours(&config, me, &mut work, &HashMap::new(), "vanished");
-
-        assert_eq!(work.owner, Some(me));
-        assert!(work.resuming.is_some(), "nothing has ticked yet, so the resume is still owed");
+        // measured from a decision that changed nothing about the work.
+        assert!(!resume_is_owed(true), "already running it: the resume was reported at that tick");
+        assert!(resume_is_owed(false), "nothing has ticked yet, so the resume is still owed");
     }
 ```
 
-These need two helpers. Add them to the tests module:
+- [ ] **Step 1b: Write the matching rig expectation**
 
-```rust
-    fn test_config() -> Config {
-        Config {
-            label: "test".into(),
-            listen: vec![],
-            dial: vec![],
-            heartbeat: Duration::from_millis(DEFAULT_HEARTBEAT_MS),
-            detect: Duration::from_millis(DEFAULT_DETECT_MS),
-            speculate_after: Some(Duration::from_millis(DEFAULT_DETECT_MS / 4)),
-            json: true,
-            job: None,
-            job_tick: Duration::from_millis(DEFAULT_JOB_TICK_MS),
-            keepalive: Duration::from_millis(DEFAULT_KEEPALIVE_MS),
-            mesh: "test".into(),
-            port: DEFAULT_PORT,
-            identity: String::new(),
-            ledger: String::new(),
-            map_port: false,
-            mdns: false,
-            own: false,
-        }
-    }
+The end-to-end behaviour — exactly one `resumed` per takeover — is checked in
+Task 6 by the chaos rig, and by this assertion added to the summary tests in
+Task 5:
 
-    fn test_work() -> Work {
-        Work {
-            job: job::Job::load(FACTORY_JOB, job::DEFAULT_FUEL).expect("the factory job builds"),
-            ledger: ledger::Ledger::default(),
-            owner: None,
-            state: Vec::new(),
-            tick: 10,
-            owner_lost_at: None,
-            last_checkpoint_at: None,
-            resuming: None,
-            speculating: None,
-            claim_after: None,
-        }
-    }
+```python
+    def test_a_speculated_takeover_reports_one_resume_not_two(self):
+        actions, events = kill_with_speculation(1000)
+        resumes = [e for e in events if e.get("event") == "resumed"]
+        self.assertEqual(len(resumes), 1)
+        self.assertEqual(resumes[0]["cause"], "speculated")
 ```
-
-`FACTORY_JOB` is the path the existing job tests already use — reuse the same constant or `job_or_skip!` macro the tests in `node/tests/jobs.rs` use. If loading a real job in a unit test proves awkward, give `test_work` a `job` built by the same helper the existing `mod tests` uses for serials; do not invent a second mechanism.
 
 - [ ] **Step 2: Run to verify it fails**
 
-Run: `cd node && cargo test speculation_does_not_resume_twice`
-Expected: FAIL — `work.resuming` is `Some`, because the current code arms a resume unconditionally.
+Run: `cd node && cargo test confirming_a_speculation`
+Expected: FAIL — `cannot find function 'resume_is_owed' in this scope`.
 
 - [ ] **Step 3: Make confirmation absorb the speculation**
 
-Rewrite the body of `take_over_if_ours` after the `should_take_over` check:
+Add the extracted decision beside `take_over_if_ours`:
+
+```rust
+/// Whether a node that has just taken over still owes a resume.
+///
+/// A speculating node does not: its first tick happened when the suspicion
+/// began and reported itself then, timed from there. Reporting a second one
+/// here would count one takeover twice and measure it from a decision that
+/// changed nothing about what was being computed.
+fn resume_is_owed(was_speculating: bool) -> bool {
+    !was_speculating
+}
+```
+
+Then rewrite the body of `take_over_if_ours` after the `should_take_over` check:
 
 ```rust
     let now = Instant::now();
@@ -518,7 +480,7 @@ Rewrite the body of `take_over_if_ours` after the `should_take_over` check:
 
     work.owner = Some(me);
     work.owner_lost_at = None;
-    if speculated.is_none() {
+    if resume_is_owed(speculated.is_some()) {
         work.resuming =
             Some(Resuming { cause, decided: now, last_checkpoint: work.last_checkpoint_at });
     }
@@ -963,4 +925,4 @@ Add a section to `docs/phase-0-plan.md` in the style of the Night A and Run B se
 
 **Interfaces.** `Speculating { about, since, from_tick }` is defined in Task 2 and used by Tasks 3 and 4 with those field names. `Config.speculate_after: Option<Duration>` is defined in Task 1 and read in Task 2. `Work::lowest_among` and `Work::should_speculate` are defined once, in Task 1. The `speculated` / `speculated_ms` fields are emitted in Task 3 and read in Task 5 as the string `"true"`.
 
-**One known rough edge, left deliberately.** Task 3's tests need a `Work` value, which needs a loaded job, and the existing unit tests have not had to build one. The step says to reuse whatever the current tests use rather than invent a second mechanism; if that proves impossible, the honest fallback is to test `take_over_if_ours`'s resume-arming decision by extracting it as a small pure function, and the implementer should do that rather than skip the test.
+**One thing checked and corrected during review.** Task 3 first tested `take_over_if_ours` directly, which needs a whole `Work` and therefore a loaded wasm job — and `job_or_skip!` lives in `node/tests/jobs.rs`, not in `main.rs`'s unit tests, so it would not have compiled. The decision is now extracted as `resume_is_owed` and tested there, with the end-to-end "one resume per takeover" checked in the summary tests and the chaos rig instead. Every other task tests either a pure function or a Python entry point, and neither needs a swarm.
