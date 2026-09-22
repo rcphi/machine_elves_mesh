@@ -2041,17 +2041,33 @@ fn take_over_if_ours(
         .map(|at| now.duration_since(at))
         .unwrap_or_default();
 
+    // Already running it on suspicion: this decision changes who owns the job,
+    // not what is being computed. No tick is re-run and no second resume is
+    // reported — the work is done and published, and the resume that matters
+    // was measured from the suspicion.
+    let speculated = work.speculating.take();
+    let speculated_ms = speculated
+        .as_ref()
+        .map(|s| now.duration_since(s.since).as_millis().to_string());
+
     work.owner = Some(me);
     work.owner_lost_at = None;
-    work.resuming = Some(Resuming { cause, decided: now, last_checkpoint: work.last_checkpoint_at });
+    if resume_is_owed(speculated.is_some()) {
+        work.resuming =
+            Some(Resuming { cause, decided: now, last_checkpoint: work.last_checkpoint_at });
+    }
 
     emit(
         config,
         "took-over",
         &format!(
-            "continuing the job from tick {} — {:.0} ms after noticing",
+            "continuing the job from tick {} — {:.0} ms after noticing{}",
             work.tick,
-            gap.as_secs_f64() * 1000.0
+            gap.as_secs_f64() * 1000.0,
+            match &speculated_ms {
+                Some(ms) => format!(", having already been running it for {ms} ms"),
+                None => String::new(),
+            }
         ),
         &[
             ("tick", &work.tick.to_string()),
@@ -2059,8 +2075,20 @@ fn take_over_if_ours(
             ("decision_ms", &gap.as_millis().to_string()),
             ("state_bytes", &work.state.len().to_string()),
             ("survivors", &(members.len() + 1).to_string()),
+            ("speculated", if speculated_ms.is_some() { "true" } else { "false" }),
+            ("speculated_ms", speculated_ms.as_deref().unwrap_or("0")),
         ],
     );
+}
+
+/// Whether a node that has just taken over still owes a resume.
+///
+/// A speculating node does not: its first tick happened when the suspicion
+/// began and reported itself then, timed from there. Reporting a second one
+/// here would count one takeover twice and measure it from a decision that
+/// changed nothing about what was being computed.
+fn resume_is_owed(was_speculating: bool) -> bool {
+    !was_speculating
 }
 
 /// Announces departure and waits briefly for the message to propagate.
@@ -2327,6 +2355,15 @@ mod tests {
         assert_eq!(resume, Duration::from_millis(100));
         assert_eq!(gap, Some(Duration::from_millis(600)),
                    "600 ms is the whole point: detection is no longer inside it");
+    }
+
+    #[test]
+    fn confirming_a_speculation_does_not_resume_twice() {
+        // The first tick already happened and already reported itself. Arming
+        // another resume here would report two for one takeover, the second
+        // measured from a decision that changed nothing about the work.
+        assert!(!resume_is_owed(true), "already running it: the resume was reported at that tick");
+        assert!(resume_is_owed(false), "nothing has ticked yet, so the resume is still owed");
     }
 
     fn serials(ticks: &[u64]) -> Vec<(String, ledger::Serial)> {
