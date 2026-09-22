@@ -492,6 +492,9 @@ struct Work {
     last_checkpoint_at: Option<Instant>,
     /// Set by a takeover, cleared by the first tick after it.
     resuming: Option<Resuming>,
+    /// Set while continuing a job whose owner is suspected gone but has not
+    /// been declared so. See [`Speculating`].
+    speculating: Option<Speculating>,
     /// When this node may claim work nobody has answered for.
     ///
     /// A node told to run a job listens before doing so. Claiming immediately
@@ -618,6 +621,21 @@ impl Resuming {
             self.last_checkpoint.map(|at| now.duration_since(at)),
         )
     }
+}
+
+/// A job being continued on suspicion alone.
+///
+/// The owner has gone quiet but has not been declared gone, so `Work::owner`
+/// still points at it: nothing has been decided, and this node is running the
+/// job only because a stall costs a player more than duplicate work costs the
+/// mesh.
+struct Speculating {
+    /// Whose silence started it.
+    about: PeerId,
+    since: Instant,
+    /// The tick reached when it began, so work done on a suspicion that turns
+    /// out to be wrong can be counted rather than guessed at.
+    from_tick: u64,
 }
 
 fn main() -> Result<()> {
@@ -1061,6 +1079,7 @@ async fn run(config: Config) -> Result<()> {
                 owner_lost_at: None,
                 last_checkpoint_at: None,
                 resuming: None,
+                speculating: None,
                 claim_after: config
                     .own
                     .then(|| Instant::now() + config.detect * 3),
@@ -1240,7 +1259,11 @@ async fn run(config: Config) -> Result<()> {
                     }
                 }
 
-                if work.owner != Some(me) { continue }
+                // A speculating node runs the job without owning it. What it
+                // publishes is indistinguishable from an owner's because it is
+                // identical — same job, same tick, same derived serials — so
+                // nothing downstream needs to know which this is.
+                if work.owner != Some(me) && work.speculating.is_none() { continue }
 
                 let mut inputs = Vec::new();
                 inputs.extend_from_slice(&work.tick.to_le_bytes());
@@ -1385,6 +1408,50 @@ async fn run(config: Config) -> Result<()> {
                 if let Some(w) = work.as_mut() {
                     if w.owner.is_none() && w.owner_lost_at.is_some() {
                         take_over_if_ours(&config, me, w, &members, "vanished");
+                    }
+                }
+
+                // Suspicion, which is the same election run early. The owner is
+                // quiet but not yet gone; this node starts continuing the job
+                // anyway, and throws the work away if the owner proves alive.
+                if let (Some(w), Some(after)) = (work.as_mut(), config.speculate_after) {
+                    let owner = w.owner.filter(|owner| *owner != me);
+                    if let Some(owner) = owner {
+                        if w.speculating.is_none()
+                            && Work::should_speculate(&me, &owner, &members, now, after)
+                        {
+                            let member = members.get(&owner);
+                            let silent = member
+                                .map(|m| now.duration_since(m.last_heard))
+                                .unwrap_or_default();
+                            let label = member.map(|m| m.label.clone()).unwrap_or_default();
+                            w.speculating =
+                                Some(Speculating { about: owner, since: now, from_tick: w.tick });
+                            // The first tick reports itself as a resume, timed
+                            // from here. Under speculation that tick happens
+                            // before any decision, which is the whole gain.
+                            w.resuming = Some(Resuming {
+                                cause: "speculated",
+                                decided: now,
+                                last_checkpoint: w.last_checkpoint_at,
+                            });
+                            emit(
+                                &config,
+                                "speculating",
+                                &format!(
+                                    "{label} has said nothing for {:.0} ms — continuing its job \
+                                     from tick {} without waiting to be sure",
+                                    silent.as_secs_f64() * 1000.0,
+                                    w.tick
+                                ),
+                                &[
+                                    ("peer_id", &owner.to_string()),
+                                    ("label", &label),
+                                    ("silent_ms", &silent.as_millis().to_string()),
+                                    ("tick", &w.tick.to_string()),
+                                ],
+                            );
+                        }
                     }
                 }
 
@@ -2241,6 +2308,25 @@ mod tests {
         let (resume, gap) = resuming.timings(checkpoint + Duration::from_millis(2_450));
         assert_eq!(resume, Duration::from_millis(150));
         assert_eq!(gap, Some(Duration::from_millis(2_450)));
+    }
+
+    #[test]
+    fn a_speculative_first_tick_is_timed_from_the_suspicion() {
+        // The visible gap is what a player waits through, so it runs from the
+        // last checkpoint heard to the first state produced — and under
+        // speculation that first state is produced before anybody has decided
+        // the owner is gone.
+        let checkpoint = Instant::now();
+        let suspected = checkpoint + Duration::from_millis(500);
+        let resuming = Resuming {
+            cause: "speculated",
+            decided: suspected,
+            last_checkpoint: Some(checkpoint),
+        };
+        let (resume, gap) = resuming.timings(suspected + Duration::from_millis(100));
+        assert_eq!(resume, Duration::from_millis(100));
+        assert_eq!(gap, Some(Duration::from_millis(600)),
+                   "600 ms is the whole point: detection is no longer inside it");
     }
 
     fn serials(ticks: &[u64]) -> Vec<(String, ledger::Serial)> {
