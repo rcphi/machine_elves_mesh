@@ -552,6 +552,41 @@ impl Work {
     }
 }
 
+/// The outcome of a checkpoint arriving while this node is speculating.
+///
+/// A checkpoint is the answer to the suspicion that started the speculation,
+/// so it is resolved by the same rule two owners always use rather than a
+/// special case of its own — see [`resolve_speculation`].
+#[derive(Debug, PartialEq)]
+enum Speculation {
+    /// The sender was further along (or tied with the lower identifier), so
+    /// this node's speculative run is discarded. `ticks_wasted` is counted
+    /// from where the speculation began, not from zero — a speculation that
+    /// never got a tick in wasted none.
+    Abandoned { ticks_wasted: u64 },
+    /// This node was further along, so it keeps the job; the sender yields
+    /// when it hears this node's next checkpoint.
+    Outran,
+}
+
+/// Which of a speculating node and the checkpoint's sender keeps the job.
+///
+/// Deliberately just [`Work::theirs`] plus the arithmetic for how much was
+/// wasted: a speculator is not a special case of the two-owners rule, it is
+/// an instance of it. Kept separate from the `Message::Checkpoint` handler so
+/// the decision can be tested without driving the event loop.
+fn resolve_speculation(
+    spec: &Speculating,
+    mine: (u64, &PeerId),
+    theirs: (u64, &PeerId),
+) -> Speculation {
+    if Work::theirs(mine, theirs) {
+        Speculation::Abandoned { ticks_wasted: mine.0.saturating_sub(spec.from_tick) }
+    } else {
+        Speculation::Outran
+    }
+}
+
 struct Member {
     label: String,
     joined: Instant,
@@ -1822,31 +1857,35 @@ async fn run(config: Config) -> Result<()> {
                             // is not a special case: whoever is further along
                             // keeps it, and the other stops.
                             if let Some(spec) = w.speculating.as_ref() {
-                                if Work::theirs((w.tick, &me), (tick, &source)) {
-                                    let wasted = w.tick.saturating_sub(spec.from_tick);
-                                    let wasted_ms =
-                                        Instant::now().duration_since(spec.since).as_millis();
-                                    emit(&config, "speculation-abandoned",
-                                         &format!("{label} is running it after all — {wasted} ticks \
-                                                   computed on suspicion are discarded"),
-                                         &[("peer_id", &source.to_string()),
-                                           ("label", &label),
-                                           ("ticks_wasted", &wasted.to_string()),
-                                           ("wasted_ms", &wasted_ms.to_string())]);
-                                    w.speculating = None;
-                                    // Nothing ticked after this point, so a
-                                    // resume still owed is a resume that will
-                                    // never happen.
-                                    w.resuming = None;
-                                } else {
-                                    // Further along than the node that came
-                                    // back, so this one keeps the job and that
-                                    // one yields when it hears this node's next
-                                    // checkpoint. Speculation is over either
-                                    // way; what differs is who owns the work.
-                                    w.speculating = None;
-                                    w.owner = Some(me);
-                                    continue;
+                                match resolve_speculation(spec, (w.tick, &me), (tick, &source)) {
+                                    Speculation::Abandoned { ticks_wasted } => {
+                                        let wasted_ms = Instant::now()
+                                            .duration_since(spec.since)
+                                            .as_millis();
+                                        emit(&config, "speculation-abandoned",
+                                             &format!("{label} is running it after all — \
+                                                       {ticks_wasted} ticks computed on \
+                                                       suspicion are discarded"),
+                                             &[("peer_id", &source.to_string()),
+                                               ("label", &label),
+                                               ("ticks_wasted", &ticks_wasted.to_string()),
+                                               ("wasted_ms", &wasted_ms.to_string())]);
+                                        w.speculating = None;
+                                        // Nothing ticked after this point, so a
+                                        // resume still owed is a resume that will
+                                        // never happen.
+                                        w.resuming = None;
+                                    }
+                                    Speculation::Outran => {
+                                        // Further along than the node that came
+                                        // back, so this one keeps the job and that
+                                        // one yields when it hears this node's next
+                                        // checkpoint. Speculation is over either
+                                        // way; what differs is who owns the work.
+                                        w.speculating = None;
+                                        w.owner = Some(me);
+                                        continue;
+                                    }
                                 }
                             }
 
@@ -2401,22 +2440,65 @@ mod tests {
         assert!(resume_is_owed(false), "nothing has ticked yet, so the resume is still owed");
     }
 
-    #[test]
-    fn the_returning_owner_decides_by_the_same_rule_as_any_two_owners() {
-        // A speculator resumed from an older checkpoint, so an owner that never
-        // stopped is normally ahead and keeps the job. Behind, and it yields —
-        // the rule does not care which of the two was speculating.
-        let (me, owner) = (PeerId::random(), PeerId::random());
-        assert!(Work::theirs((12, &me), (15, &owner)), "they are further along");
-        assert!(!Work::theirs((15, &me), (12, &owner)), "we are");
+    /// Two random peer ids sorted so a test can talk about "lower" and
+    /// "higher" without caring which random value landed where.
+    fn ordered_peers() -> (PeerId, PeerId) {
+        let (a, b) = (PeerId::random(), PeerId::random());
+        if a < b { (a, b) } else { (b, a) }
     }
 
     #[test]
-    fn wasted_ticks_are_counted_from_where_speculation_began() {
-        let spec = Speculating { about: PeerId::random(), since: Instant::now(), from_tick: 40 };
-        assert_eq!(52u64.saturating_sub(spec.from_tick), 12);
-        // A speculation that never got a tick in wasted none.
-        assert_eq!(40u64.saturating_sub(spec.from_tick), 0);
+    fn a_speculator_behind_the_sender_abandons_and_counts_from_where_it_began() {
+        // A speculator resumed from an older checkpoint, so an owner that
+        // never stopped is normally ahead. The speculator yields, and reports
+        // how many ticks it ran on a suspicion that turned out wrong.
+        let (me, owner) = ordered_peers();
+        let spec = Speculating { about: owner, since: Instant::now(), from_tick: 40 };
+        assert_eq!(
+            resolve_speculation(&spec, (52, &me), (60, &owner)),
+            Speculation::Abandoned { ticks_wasted: 12 },
+        );
+    }
+
+    #[test]
+    fn a_speculator_ahead_of_the_sender_outruns_it() {
+        // The rule does not care which of the two was speculating: whoever is
+        // further along keeps the job, even when that is the speculator.
+        let (me, owner) = ordered_peers();
+        let spec = Speculating { about: owner, since: Instant::now(), from_tick: 10 };
+        assert_eq!(resolve_speculation(&spec, (50, &me), (30, &owner)), Speculation::Outran);
+    }
+
+    #[test]
+    fn a_tie_goes_to_the_lower_identifier_in_either_direction() {
+        let (lower, higher) = ordered_peers();
+
+        // `me` holds the lower identifier and ticks are tied: this node wins.
+        let spec = Speculating { about: higher, since: Instant::now(), from_tick: 20 };
+        assert_eq!(
+            resolve_speculation(&spec, (20, &lower), (20, &higher)),
+            Speculation::Outran,
+        );
+
+        // `me` holds the higher identifier and ticks are tied: the sender wins.
+        let spec = Speculating { about: lower, since: Instant::now(), from_tick: 20 };
+        assert_eq!(
+            resolve_speculation(&spec, (20, &higher), (20, &lower)),
+            Speculation::Abandoned { ticks_wasted: 0 },
+        );
+    }
+
+    #[test]
+    fn a_speculation_that_never_ticked_reports_zero_wasted_not_an_underflow() {
+        // This node's tick never moved past where speculation began, and the
+        // sender is further along, so this abandons — with nothing wasted,
+        // not a panic from `from_tick` subtracting past the current tick.
+        let (me, owner) = ordered_peers();
+        let spec = Speculating { about: owner, since: Instant::now(), from_tick: 40 };
+        assert_eq!(
+            resolve_speculation(&spec, (40, &me), (41, &owner)),
+            Speculation::Abandoned { ticks_wasted: 0 },
+        );
     }
 
     fn serials(ticks: &[u64]) -> Vec<(String, ledger::Serial)> {
