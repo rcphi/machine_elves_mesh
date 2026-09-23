@@ -242,10 +242,46 @@ class Speculation(unittest.TestCase):
         self.assertIn("3", text, "the wasted ticks are reported, not just the count")
 
     def test_a_speculated_takeover_reports_one_resume_not_two(self):
+        # The fixture emits exactly one `resumed` event; match() must not
+        # somehow report two takeovers or two resumes out of it.
         actions, events = kill_with_speculation(1000)
         resumes = [e for e in events if e.get("event") == "resumed"]
         self.assertEqual(len(resumes), 1)
         self.assertEqual(resumes[0]["cause"], "speculated")
+        results = summary.match(actions, events)
+        self.assertEqual(len(results), 1)
+        self.assertEqual(results[0]["takeovers"], 1)
+        self.assertEqual((results[0]["resume_ms"], results[0]["gap_ms"]), (100, 600))
+
+    def test_a_speculated_resume_is_anchored_to_this_disruptions_own_suspicion(self):
+        # Two disruptions on the same successor, close enough together that
+        # their match windows overlap and each can see the other's `resumed`
+        # event. `resumed` carries no label, so a fallback that just grabs
+        # "the first speculated resume in the window" can steal the wrong
+        # disruption's number. The `speculating` event does carry
+        # label == victim, so it — not chronological order alone — is what
+        # ties a resume back to ITS disruption.
+        ref = 5000
+        actions = [
+            act("yoinkerz", ref - 1500, "kill"),
+            act("diamond", ref, "kill"),
+        ]
+        events = [
+            ev("riverboat", ref - 1000, "speculating", label="yoinkerz", silent_ms="500", tick="1"),
+            ev("riverboat", ref - 900, "resumed", cause="speculated", resume_ms="999", gap_ms="999"),
+            ev("riverboat", ref + 700, "vanished", label="yoinkerz", silent_ms="2200"),
+            ev("riverboat", ref + 700, "took-over", tick="2", speculated="true", speculated_ms="1700"),
+
+            ev("riverboat", ref + 500, "speculating", label="diamond", silent_ms="500", tick="3"),
+            ev("riverboat", ref + 600, "resumed", cause="speculated", resume_ms="100", gap_ms="600"),
+            ev("riverboat", ref + 2200, "vanished", label="diamond", silent_ms="2200"),
+            ev("riverboat", ref + 2200, "took-over", tick="4", speculated="true", speculated_ms="1700"),
+        ]
+        by_victim = {r["victim"]: r for r in summary.match(actions, events)}
+        self.assertEqual((by_victim["yoinkerz"]["resume_ms"], by_victim["yoinkerz"]["gap_ms"]), (999, 999))
+        self.assertEqual((by_victim["diamond"]["resume_ms"], by_victim["diamond"]["gap_ms"]), (100, 600),
+                         "diamond's own resume, not yoinkerz's earlier one, "
+                         "even though yoinkerz's falls inside diamond's match window")
 
 
 if __name__ == "__main__":

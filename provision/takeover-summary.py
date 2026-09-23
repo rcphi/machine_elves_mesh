@@ -178,8 +178,27 @@ def match(actions, events):
             resumed = next((e for e in candidates
                             if e["ts_unix_ms"] >= first["ts_unix_ms"]), None)
             if resumed is None:
-                resumed = next((e for e in candidates
-                                if e.get("cause") == "speculated"), None)
+                # `resumed` carries no label, so picking any speculated resume
+                # in the window risks stealing one that belongs to a DIFFERENT
+                # disruption on the same successor — a real bug this tool
+                # shipped with once. The `speculating` event is the anchor:
+                # it is the only event that carries label == victim, so it
+                # ties a resume back to the suspicion that started THIS
+                # disruption's takeover, not just to whichever one is first
+                # in the window.
+                suspecting = [e for e in window
+                              if e.get("event") == "speculating"
+                              and e.get("label") == victim
+                              and e.get("node") == first["node"]
+                              and e["ts_unix_ms"] <= first["ts_unix_ms"]]
+                if suspecting:
+                    suspected = suspecting[-1]
+                    resumed = next((e for e in candidates
+                                    if suspected["ts_unix_ms"] <= e["ts_unix_ms"] <= first["ts_unix_ms"]),
+                                   None)
+                # No speculating event for this disruption means no speculated
+                # resume for it either — a missing number is honest; grabbing
+                # one from elsewhere in the window is not.
         results.append({
             "action": action["action"],
             "victim": victim,
