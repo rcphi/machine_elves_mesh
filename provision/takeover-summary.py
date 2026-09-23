@@ -22,6 +22,9 @@ Thresholds, fixed 2026-08-21 in docs/phase-0-plan.md and evaluated at p95:
 
 The visible gap — last state heard to first state produced — is reported
 beside them. It is not a threshold as written, and it is what a player sees.
+What it contains depends on the run: without speculation it spans the whole
+detection window, and with it only the silence before suspicion. The report
+says which, per run, rather than leaving a reader to assume the old meaning.
 """
 import argparse
 import bisect
@@ -298,8 +301,24 @@ def report(results, events, actions, out=sys.stdout):
     say(row("detection", [r["detect_ms"] for r in unannounced if r["detect_ms"] is not None], DETECT_MAX_MS))
     say(row("resume", [r["resume_ms"] for r in unannounced if r["resume_ms"] is not None], RESUME_MAX_MS))
     say(row("visible gap", [r["gap_ms"] for r in unannounced if r["gap_ms"] is not None]))
+    # What the gap contains is not a property of the tool, it is a property of
+    # the run. Under speculation the work restarts on suspicion, so the gap
+    # stops at that suspicion and never holds the detection window — printing
+    # the old sentence over speculated rows would describe a number that is
+    # not there.
+    speculated = [r for r in unannounced if r["speculated"]]
     say("  The visible gap is not a threshold as written. It is what a player waits "
-        "through,\n  and it includes detection.")
+        "through.")
+    if not speculated:
+        say("  It includes detection: nothing here restarted before the owner was "
+            "declared gone.")
+    elif len(speculated) == len(unannounced):
+        say("  It does NOT include detection: every takeover here was speculated, so the "
+            "gap\n  spans the silence before suspicion, not the wait for a decision.")
+    else:
+        say(f"  {len(speculated)} of {len(unannounced)} takeovers here were speculated: those "
+            "gaps span the silence\n  before suspicion, and the rest include the whole "
+            "detection window.")
 
     say("\nTHINGS THAT SHOULD NOT HAPPEN")
     orphaned = [r for r in results if r["successor"] is None]

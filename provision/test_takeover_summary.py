@@ -241,6 +241,27 @@ class Speculation(unittest.TestCase):
         self.assertIn("abandoned", text)
         self.assertIn("3", text, "the wasted ticks are reported, not just the count")
 
+    def test_the_report_says_whether_the_gap_contains_detection(self):
+        # The sentence beside the gap is a claim about what the number in
+        # front of the reader measures, and speculation changes the answer.
+        # Printed unconditionally it would tell a reader of a speculated run
+        # that ~2.5 s of detection is inside a 600 ms number.
+        def text_for(actions, events):
+            out = io.StringIO()
+            summary.report(summary.match(actions, events), events, actions, out=out)
+            return out.getvalue()
+
+        plain = text_for(*kill_and_takeover(1000))
+        self.assertIn("It includes detection", plain)
+
+        spec = text_for(*kill_with_speculation(1000))
+        self.assertIn("does NOT include detection", spec)
+
+        a_actions, a_events = kill_and_takeover(1000, victim="yoinkerz")
+        b_actions, b_events = kill_with_speculation(40_000)
+        mixed = text_for(a_actions + b_actions, a_events + b_events)
+        self.assertIn("1 of 2 takeovers here were speculated", mixed)
+
     def test_a_speculated_takeover_reports_one_resume_not_two(self):
         # The fixture emits exactly one `resumed` event; match() must not
         # somehow report two takeovers or two resumes out of it.
