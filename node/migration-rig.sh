@@ -23,6 +23,13 @@ ANNOUNCED_BUDGET_MS=500
 DETECT_MS=2000
 UNANNOUNCED_BUDGET_MS=3500
 
+# Extra flags appended to every node invocation, e.g.
+#   MESH_NODE_EXTRA="--speculate-after-ms 0" ./migration-rig.sh
+# to run the whole rig with speculation off. A flag that cannot be turned off
+# in the rig cannot be A/B tested on a real box either.
+# shellcheck disable=SC2206
+EXTRA=(${MESH_NODE_EXTRA:-})
+
 [[ -x "$BIN" ]] || { echo "build first: cargo build --release" >&2; exit 1; }
 [[ -f "$JOB" ]] || { echo "build the jobs first: ../jobs/build.sh" >&2; exit 1; }
 
@@ -61,7 +68,7 @@ run_case() {
 
     # shellcheck disable=SC2046
     "$BIN" --label owner --mesh "$mesh" --job "$JOB" --own --detect-ms "$DETECT_MS" --json \
-        $(own_files 4201 owner) > "$OUT/owner.log" 2>&1 &
+        $(own_files 4201 owner) "${EXTRA[@]}" > "$OUT/owner.log" 2>&1 &
     local owner=$!
     pids+=($owner)
     sleep 1
@@ -69,7 +76,7 @@ run_case() {
     for s in a b; do
         # shellcheck disable=SC2046
         "$BIN" --label "standby-$s" --mesh "$mesh" --job "$JOB" --detect-ms "$DETECT_MS" --json \
-            $(own_files "$port" "$s") > "$OUT/$s.log" 2>&1 &
+            $(own_files "$port" "$s") "${EXTRA[@]}" > "$OUT/$s.log" 2>&1 &
         pids+=($!)
         port=$((port + 1))
     done
@@ -151,7 +158,7 @@ return_case() {
     start_node() {
         "$BIN" --label "$1" --mesh "$mesh" --json --detect-ms "$DETECT_MS" \
             --port "$2" --no-map-port --no-mdns --peer "/ip4/127.0.0.1/udp/$3/quic-v1" \
-            --identity "$OUT/$1.identity" --ledger "$OUT/$1.ledger" >> "$OUT/$1.log" 2>&1 &
+            --identity "$OUT/$1.identity" --ledger "$OUT/$1.ledger" "${EXTRA[@]}" >> "$OUT/$1.log" 2>&1 &
         pids+=($!)
     }
     start_node stays 4301 4302
