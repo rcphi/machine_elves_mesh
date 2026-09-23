@@ -527,6 +527,15 @@ impl Work {
         peers.filter(|peer| *peer != me).all(|peer| me < peer)
     }
 
+    /// Whether this node is the one to continue a job whose owner has gone.
+    ///
+    /// There is no coordination here and no vote. Every survivor runs this
+    /// against the same membership and reaches the same answer on its own,
+    /// which is why exactly one of them acts — and why nothing has to be
+    /// exchanged first. Ties go to the lower identifier: arbitrary, and that
+    /// is the entire virtue, because it is the same arbitrary answer on every
+    /// machine. Arranging a vote would cost more messages, and more of the
+    /// gap a player is sitting through, than the takeover it arranges.
     fn should_take_over(me: &PeerId, members: &HashMap<PeerId, Member>) -> bool {
         Self::lowest_among(me, members.keys())
     }
