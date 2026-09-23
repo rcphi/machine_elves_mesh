@@ -575,6 +575,45 @@ enum Speculation {
 /// wasted: a speculator is not a special case of the two-owners rule, it is
 /// an instance of it. Kept separate from the `Message::Checkpoint` handler so
 /// the decision can be tested without driving the event loop.
+/// Whether the suspect itself has disproved the suspicion.
+///
+/// This is what [`Speculating::about`] is for: a suspicion names whose silence
+/// it rests on, so it can be checked against that peer rather than against
+/// whoever happens to be quiet now.
+///
+/// Without this check speculation is left only by a checkpoint or a takeover,
+/// and a peer can send neither while its heartbeats arrive and its checkpoints
+/// are dropped — a lossy link rather than a dead machine, which is what a real
+/// home connection produces and what a loopback rig will never show. Such a
+/// suspect never vanishes, so no takeover ever confirms the suspicion, and
+/// never checkpoints, so nothing ever answers it. The speculator would run as
+/// a permanent shadow owner, always a little behind the owner it can never
+/// displace — and the owner, hearing nobody ahead of it, would never yield.
+fn suspicion_disproved(spec: &Speculating, members: &HashMap<PeerId, Member>) -> bool {
+    members
+        .get(&spec.about)
+        .is_some_and(|suspect| suspect.last_heard > spec.since)
+}
+
+/// Ends a speculation that is not going to become this node's job, and says
+/// how far it had got.
+///
+/// The resume goes with it. A speculation that had not yet ticked still owes
+/// one, and nothing ticks after this, so leaving it armed would report a
+/// resume for work that never resumed — the same reasoning as the checkpoint
+/// case, which is why both exits use this rather than each clearing what it
+/// remembers to clear.
+fn stand_down(
+    speculating: &mut Option<Speculating>,
+    resuming: &mut Option<Resuming>,
+) -> Option<Speculating> {
+    let spec = speculating.take();
+    if spec.is_some() {
+        *resuming = None;
+    }
+    spec
+}
+
 fn resolve_speculation(
     spec: &Speculating,
     mine: (u64, &PeerId),
@@ -1360,7 +1399,17 @@ async fn run(config: Config) -> Result<()> {
                              &[("tick", &work.tick.to_string())]);
                         // Stop rather than spin: a job failing every tick would
                         // otherwise flood the mesh with identical complaints.
+                        // The suspicion goes with the ownership, because a
+                        // speculating node runs the job *without* owning it —
+                        // since the tick guard admits it on `speculating`
+                        // alone, clearing `owner` by itself stops nothing, and
+                        // the node fails, complains and tries again every
+                        // 200 ms for as long as it is left running. The
+                        // job-failed line above is the record of this; calling
+                        // it an abandoned speculation would claim the owner
+                        // came back, which is not what happened.
                         work.owner = None;
+                        stand_down(&mut work.speculating, &mut work.resuming);
                     }
                 }
             }
@@ -1450,6 +1499,36 @@ async fn run(config: Config) -> Result<()> {
                 // quiet but not yet gone; this node starts continuing the job
                 // anyway, and throws the work away if the owner proves alive.
                 if let (Some(w), Some(after)) = (work.as_mut(), config.speculate_after) {
+                    // First, the suspicions this sweep can put down. A suspect
+                    // that is heard from again has answered the only question
+                    // the speculation was asking — see [`suspicion_disproved`]
+                    // for why waiting for its checkpoint is not enough.
+                    if w.speculating.as_ref().is_some_and(|s| suspicion_disproved(s, &members)) {
+                        if let Some(spec) = stand_down(&mut w.speculating, &mut w.resuming) {
+                            let label = members
+                                .get(&spec.about)
+                                .map(|m| m.label.clone())
+                                .unwrap_or_default();
+                            let ticks_wasted = w.tick.saturating_sub(spec.from_tick);
+                            emit(
+                                &config,
+                                "speculation-abandoned",
+                                &format!(
+                                    "{label} is talking again, so it was never gone — \
+                                     {ticks_wasted} ticks computed on suspicion are discarded"
+                                ),
+                                &[
+                                    ("peer_id", &spec.about.to_string()),
+                                    ("label", &label),
+                                    ("cause", "heard-again"),
+                                    ("ticks_wasted", &ticks_wasted.to_string()),
+                                    ("wasted_ms",
+                                     &now.duration_since(spec.since).as_millis().to_string()),
+                                ],
+                            );
+                        }
+                    }
+
                     let owner = w.owner.filter(|owner| *owner != me);
                     if let Some(owner) = owner {
                         if w.speculating.is_none()
@@ -1868,6 +1947,7 @@ async fn run(config: Config) -> Result<()> {
                                                        suspicion are discarded"),
                                              &[("peer_id", &source.to_string()),
                                                ("label", &label),
+                                               ("cause", "checkpoint"),
                                                ("ticks_wasted", &ticks_wasted.to_string()),
                                                ("wasted_ms", &wasted_ms.to_string())]);
                                         w.speculating = None;
@@ -2106,10 +2186,36 @@ fn take_over_if_ours(
     members: &HashMap<PeerId, Member>,
     cause: &'static str,
 ) {
+    let now = Instant::now();
     if !Work::should_take_over(&me, members) {
+        // Losing an election this node's own suspicion started still ends the
+        // speculation. Returning before this ran — which a membership change
+        // between suspecting and confirming is enough to cause — stranded the
+        // node with `speculating: Some` and `owner: None`: still ticking, still
+        // publishing, never named in any log as having taken anything over,
+        // and now with no exit left, since the peer it was speculating about
+        // is gone and will send no checkpoint.
+        if let Some(spec) = stand_down(&mut work.speculating, &mut work.resuming) {
+            let label = members.get(&spec.about).map(|m| m.label.clone()).unwrap_or_default();
+            let ticks_wasted = work.tick.saturating_sub(spec.from_tick);
+            emit(
+                config,
+                "speculation-abandoned",
+                &format!(
+                    "another survivor is continuing the job, so the {ticks_wasted} ticks \
+                     computed on suspicion here are discarded"
+                ),
+                &[
+                    ("peer_id", &spec.about.to_string()),
+                    ("label", &label),
+                    ("cause", "not-ours"),
+                    ("ticks_wasted", &ticks_wasted.to_string()),
+                    ("wasted_ms", &now.duration_since(spec.since).as_millis().to_string()),
+                ],
+            );
+        }
         return;
     }
-    let now = Instant::now();
     let gap = work
         .owner_lost_at
         .map(|at| now.duration_since(at))
@@ -2819,6 +2925,64 @@ mod tests {
         seen_by_high.insert(low, member_last_heard(quiet));
         seen_by_high.insert(middle, member_last_heard(now));
         assert!(!Work::should_speculate(&high, &low, &seen_by_high, now, after));
+    }
+
+    #[test]
+    fn a_suspect_that_speaks_again_ends_the_suspicion() {
+        // The case a lossy link produces and a dead machine does not: the
+        // owner's heartbeats arrive while its checkpoints are dropped. It
+        // never vanishes, so no takeover confirms the suspicion, and it never
+        // checkpoints, so nothing answers it. Left running, the speculator is
+        // a shadow owner forever.
+        let now = Instant::now();
+        let owner = PeerId::random();
+        let spec = Speculating { about: owner, since: now, from_tick: 40 };
+
+        let mut members = HashMap::new();
+        members.insert(owner, member_last_heard(now - Duration::from_millis(600)));
+        assert!(!suspicion_disproved(&spec, &members),
+                "still silent: the suspicion stands");
+
+        members.insert(owner, member_last_heard(now + Duration::from_millis(100)));
+        assert!(suspicion_disproved(&spec, &members),
+                "heard since the suspicion was raised: it was never gone");
+    }
+
+    #[test]
+    fn a_suspect_that_has_vanished_does_not_disprove_its_own_suspicion() {
+        // Gone from the membership means the sweep has declared it lost, and
+        // the takeover — not this — is what ends the speculation. Answering
+        // yes here would abandon the work a moment before it is confirmed.
+        let owner = PeerId::random();
+        let spec = Speculating { about: owner, since: Instant::now(), from_tick: 1 };
+        assert!(!suspicion_disproved(&spec, &HashMap::new()));
+    }
+
+    #[test]
+    fn standing_down_ends_the_speculation_and_the_resume_it_owed() {
+        // Every way out of speculation that is not a takeover comes through
+        // here, because each of them stops the ticking: a resume left armed
+        // would be reported by whatever ticks next, timed from a suspicion
+        // that was put down long before.
+        let now = Instant::now();
+        let mut speculating = Some(Speculating { about: PeerId::random(), since: now, from_tick: 7 });
+        let mut resuming = Some(Resuming {
+            cause: "speculated",
+            decided: now,
+            last_checkpoint: Some(now),
+        });
+
+        let spec = stand_down(&mut speculating, &mut resuming);
+        assert_eq!(spec.map(|s| s.from_tick), Some(7), "the caller is told how far it had got");
+        assert!(speculating.is_none());
+        assert!(resuming.is_none(), "nothing ticks after this, so nothing resumes");
+
+        // A node that was not speculating keeps whatever resume it is owed:
+        // an ordinary takeover arms one and must still report it.
+        let mut none = None;
+        let mut owed = Some(Resuming { cause: "vanished", decided: now, last_checkpoint: None });
+        assert!(stand_down(&mut none, &mut owed).is_none());
+        assert!(owed.is_some(), "an ordinary takeover's resume is not a speculation's");
     }
 
     #[test]
