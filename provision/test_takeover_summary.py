@@ -33,6 +33,22 @@ def kill_and_takeover(at, silent=2200, resume=150, gap=2400, victim="diamond", s
     return actions, events
 
 
+def kill_with_speculation(at, silent=2200, suspected=500, resume=100, gap=600,
+                          victim="diamond", successor="riverboat"):
+    """A takeover where the work restarted before anyone decided anything."""
+    actions = [act(victim, at, "kill")]
+    events = [
+        ev(successor, at + suspected, "speculating", label=victim,
+           silent_ms=str(suspected), tick="10"),
+        ev(successor, at + suspected + resume, "resumed", cause="speculated",
+           resume_ms=str(resume), gap_ms=str(gap)),
+        ev(successor, at + silent, "vanished", label=victim, silent_ms=str(silent)),
+        ev(successor, at + silent, "took-over", tick="13", speculated="true",
+           speculated_ms=str(silent - suspected)),
+    ]
+    return actions, events
+
+
 class Percentile(unittest.TestCase):
     def test_nearest_rank_is_a_value_that_occurred(self):
         values = list(range(1, 101))
@@ -190,6 +206,46 @@ class ArmedWindow(unittest.TestCase):
         line = summary.window_line(T0, math.inf)
         self.assertIn("still armed", line)
         self.assertIn(time.strftime("%Y-%m-%d %H:%M", time.localtime(T0 / 1000)), line)
+
+
+class Speculation(unittest.TestCase):
+    def test_a_resume_before_its_takeover_is_still_that_takeovers_resume(self):
+        actions, events = kill_with_speculation(1000)
+        [row] = summary.match(actions, events)
+        self.assertEqual(row["resume_ms"], 100)
+        self.assertEqual(row["gap_ms"], 600,
+                         "the gap is what the player waited: suspicion plus resume")
+        self.assertEqual(row["detect_ms"], 2200,
+                         "detection still means the silence before the peer was declared gone")
+        self.assertTrue(row["speculated"])
+
+    def test_an_unspeculated_takeover_reads_exactly_as_before(self):
+        actions, events = kill_and_takeover(1000)
+        [row] = summary.match(actions, events)
+        self.assertEqual(row["resume_ms"], 150)
+        self.assertEqual(row["gap_ms"], 2400)
+        self.assertFalse(row["speculated"])
+
+    def test_the_report_counts_suspicions_that_were_wrong(self):
+        actions, events = kill_with_speculation(1000)
+        events += [
+            ev("riverboat", 5000, "speculating", label="diamond", silent_ms="500", tick="60"),
+            ev("riverboat", 5600, "speculation-abandoned", label="diamond",
+               ticks_wasted="3", wasted_ms="600"),
+        ]
+        out = io.StringIO()
+        summary.report(summary.match(actions, events), events, actions, out=out)
+        text = out.getvalue()
+        self.assertIn("SPECULATION", text)
+        self.assertIn("started", text)
+        self.assertIn("abandoned", text)
+        self.assertIn("3", text, "the wasted ticks are reported, not just the count")
+
+    def test_a_speculated_takeover_reports_one_resume_not_two(self):
+        actions, events = kill_with_speculation(1000)
+        resumes = [e for e in events if e.get("event") == "resumed"]
+        self.assertEqual(len(resumes), 1)
+        self.assertEqual(resumes[0]["cause"], "speculated")
 
 
 if __name__ == "__main__":

@@ -169,9 +169,17 @@ def match(actions, events):
         first = takeovers[0] if takeovers else None
         resumed = None
         if first:
-            resumed = next((e for e in window if e.get("event") == "resumed"
-                            and e.get("node") == first["node"]
-                            and e["ts_unix_ms"] >= first["ts_unix_ms"]), None)
+            # A speculated resume happens BEFORE the takeover it belongs to:
+            # the standby started the work on suspicion and only later was told
+            # it had been right. Requiring the usual order here would report
+            # this feature's whole effect as missing data.
+            candidates = [e for e in window
+                          if e.get("event") == "resumed" and e.get("node") == first["node"]]
+            resumed = next((e for e in candidates
+                            if e["ts_unix_ms"] >= first["ts_unix_ms"]), None)
+            if resumed is None:
+                resumed = next((e for e in candidates
+                                if e.get("cause") == "speculated"), None)
         results.append({
             "action": action["action"],
             "victim": victim,
@@ -181,6 +189,7 @@ def match(actions, events):
             "detect_ms": num(lost.get("silent_ms")) if lost and lost.get("event") == "vanished" else None,
             "resume_ms": num(resumed.get("resume_ms")) if resumed else None,
             "gap_ms": num(resumed.get("gap_ms")) if resumed else None,
+            "speculated": bool(first and first.get("speculated") == "true"),
             "takeovers": len({t["node"] for t in takeovers}),
             "seconds": action.get("seconds"),
             # The victim's own log said it owned the job when chaos read it,
@@ -275,6 +284,21 @@ def report(results, events, actions, out=sys.stdout):
     for e in alarms:
         say(f"    false alarm: {e.get('label')} seen by {e.get('node')} at {e['ts_unix_ms']}, "
             f"away {e.get('away_ms')} ms")
+
+    started = [e for e in events if e.get("event") == "speculating"]
+    abandoned = [e for e in events if e.get("event") == "speculation-abandoned"]
+    confirmed = [r for r in results if r["speculated"]]
+    if started:
+        say("\nSPECULATION")
+        say(f"  started                   {len(started):>4}  suspicions acted on before any decision")
+        say(f"  confirmed                 {len(confirmed):>4}  the owner really had gone")
+        say(f"  abandoned                 {len(abandoned):>4}  the owner came back and kept the job")
+        wasted = [num(e.get("ticks_wasted")) for e in abandoned
+                  if num(e.get("ticks_wasted")) is not None]
+        if wasted:
+            say(row("ticks wasted", wasted))
+        say("  A wrong suspicion costs ticks, not correctness: the same job from the same")
+        say("  state makes the same items, so discarded work merges to nothing.")
 
     skips = sum(1 for a in actions if a.get("action") == "skip")
     say(f"\n{len(results)} disruptions, {skips} fires skipped (standby, no peer, or not settled)")
