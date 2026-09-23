@@ -283,6 +283,61 @@ class Speculation(unittest.TestCase):
                          "diamond's own resume, not yoinkerz's earlier one, "
                          "even though yoinkerz's falls inside diamond's match window")
 
+    def test_a_takeover_does_not_reach_forward_to_a_later_disruptions_resume(self):
+        # The mirror image of the test above, and the ordering that matters
+        # more. Under speculation a takeover's own resume is always EARLIER
+        # than the takeover, so a search that runs forward from the takeover
+        # can only ever find somebody else's: the next 30 s of match window
+        # holds the successor's next disruption, and its resume is smaller,
+        # because that is the whole effect of speculating. Reaching forward
+        # therefore does not merely mismatch, it biases the headline number
+        # optimistic — and, succeeding, hides the anchored search that would
+        # have got it right.
+        ref = 5000
+        actions = [
+            act("diamond", ref, "kill"),
+            act("yoinkerz", ref + 3000, "kill"),
+        ]
+        events = [
+            ev("riverboat", ref + 500, "speculating", label="diamond", silent_ms="500", tick="1"),
+            ev("riverboat", ref + 600, "resumed", cause="speculated", resume_ms="100", gap_ms="600"),
+            ev("riverboat", ref + 2200, "vanished", label="diamond", silent_ms="2200"),
+            ev("riverboat", ref + 2200, "took-over", tick="2", speculated="true", speculated_ms="1700"),
+
+            ev("riverboat", ref + 3500, "speculating", label="yoinkerz", silent_ms="500", tick="3"),
+            ev("riverboat", ref + 3600, "resumed", cause="speculated", resume_ms="777", gap_ms="888"),
+            ev("riverboat", ref + 5200, "vanished", label="yoinkerz", silent_ms="2200"),
+            ev("riverboat", ref + 5200, "took-over", tick="4", speculated="true", speculated_ms="1700"),
+        ]
+        by_victim = {r["victim"]: r for r in summary.match(actions, events)}
+        self.assertEqual((by_victim["diamond"]["resume_ms"], by_victim["diamond"]["gap_ms"]), (100, 600),
+                         "diamond's takeover must not borrow the resume of the "
+                         "yoinkerz disruption that follows it")
+        self.assertEqual((by_victim["yoinkerz"]["resume_ms"], by_victim["yoinkerz"]["gap_ms"]), (777, 888))
+
+    def test_an_unspeculated_takeover_stops_at_the_next_disruption(self):
+        # The same bound from the other side. This takeover's resume never
+        # arrived — the successor died before its first tick, say — and the
+        # next disruption's resume sits in the window. A missing number is
+        # honest; the next disruption's number reported as this one's is not.
+        ref = 5000
+        actions = [
+            act("diamond", ref, "kill"),
+            act("yoinkerz", ref + 6000, "kill"),
+        ]
+        events = [
+            ev("riverboat", ref + 2200, "vanished", label="diamond", silent_ms="2200"),
+            ev("riverboat", ref + 2200, "took-over", tick="2"),
+
+            ev("riverboat", ref + 8200, "vanished", label="yoinkerz", silent_ms="2200"),
+            ev("riverboat", ref + 8200, "took-over", tick="9"),
+            ev("riverboat", ref + 8350, "resumed", resume_ms="150", gap_ms="2350"),
+        ]
+        by_victim = {r["victim"]: r for r in summary.match(actions, events)}
+        self.assertIsNone(by_victim["diamond"]["resume_ms"],
+                          "no resume of its own, so no number at all")
+        self.assertEqual((by_victim["yoinkerz"]["resume_ms"], by_victim["yoinkerz"]["gap_ms"]), (150, 2350))
+
 
 if __name__ == "__main__":
     unittest.main()

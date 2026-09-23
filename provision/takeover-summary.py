@@ -169,23 +169,33 @@ def match(actions, events):
         first = takeovers[0] if takeovers else None
         resumed = None
         if first:
-            # A speculated resume happens BEFORE the takeover it belongs to:
-            # the standby started the work on suspicion and only later was told
-            # it had been right. Requiring the usual order here would report
-            # this feature's whole effect as missing data.
-            candidates = [e for e in window
-                          if e.get("event") == "resumed" and e.get("node") == first["node"]]
-            resumed = next((e for e in candidates
-                            if e["ts_unix_ms"] >= first["ts_unix_ms"]), None)
-            if resumed is None:
-                # `resumed` carries no label, so picking any speculated resume
-                # in the window risks stealing one that belongs to a DIFFERENT
-                # disruption on the same successor — a real bug this tool
-                # shipped with once. The `speculating` event is the anchor:
-                # it is the only event that carries label == victim, so it
-                # ties a resume back to the suspicion that started THIS
-                # disruption's takeover, not just to whichever one is first
-                # in the window.
+            # `resumed` carries no label, so nothing in the event itself says
+            # which disruption it belongs to. The match window runs ~30 s past
+            # the action and a successor can be disrupted several times inside
+            # it, so an unbounded search — in either direction — will happily
+            # report another disruption's number as this one's. Both ends have
+            # to be pinned to events that DO name this disruption.
+            candidates = sorted((e for e in window
+                                 if e.get("event") == "resumed"
+                                 and e.get("node") == first["node"]),
+                                key=lambda e: e["ts_unix_ms"])
+            # Where this disruption's evidence stops: the successor's next
+            # suspicion or takeover. Anything at or after that was caused by
+            # something else, whatever it is.
+            later = [e["ts_unix_ms"] for e in window
+                     if e.get("node") == first["node"]
+                     and e.get("event") in ("speculating", "took-over")
+                     and e["ts_unix_ms"] > first["ts_unix_ms"]]
+            until = min(later) if later else math.inf
+            if first.get("speculated") == "true":
+                # A speculated resume happens BEFORE the takeover it belongs
+                # to: the standby started the work on suspicion and only later
+                # was told it had been right. So the search runs backwards from
+                # the takeover, anchored on the `speculating` event — the only
+                # event in this sequence carrying label == victim, and so the
+                # only thing that ties a resume to THIS disruption. Taking the
+                # last such suspicion also steps over an earlier one that was
+                # abandoned: its resume is not this takeover's resume.
                 suspecting = [e for e in window
                               if e.get("event") == "speculating"
                               and e.get("label") == victim
@@ -199,6 +209,15 @@ def match(actions, events):
                 # No speculating event for this disruption means no speculated
                 # resume for it either — a missing number is honest; grabbing
                 # one from elsewhere in the window is not.
+            else:
+                # Nothing was speculated, so the resume follows its takeover in
+                # the ordinary way — but only up to the successor's next
+                # suspicion or takeover. Past that point a `resumed` belongs to
+                # the next disruption, and it is a smaller number, so taking it
+                # would bias the headline metric optimistic by exactly the
+                # noise a run is built to measure.
+                resumed = next((e for e in candidates
+                                if first["ts_unix_ms"] <= e["ts_unix_ms"] < until), None)
         results.append({
             "action": action["action"],
             "victim": victim,
