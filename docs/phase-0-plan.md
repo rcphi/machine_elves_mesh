@@ -842,6 +842,46 @@ Household isolation (`--isolate-lan`) is opt-in, verifies internet reachability 
 4a. **Speculative resume** — *built and passing both local rigs; awaiting Run C on real boxes.* A standby begins continuing a suspected-gone owner's job from `detect/4` (500 ms) of silence, rather than waiting out the full detection window, so the visible gap should fall from the ~2.45 s Night A measured toward the resume budget alone. `node/migration-rig.sh` passes with speculation on (the default) and, now that `MESH_NODE_EXTRA` plumbs flags through to every node it starts, with `--speculate-after-ms 0` forcing it off — a flag that could not be turned off in the rig could not have been A/B tested on a box either. `sudo node/chaos-rig.sh 15` ran 17 disruptions (10 kill, 4 partition, 3 announced) with the same four counts at zero (orphaned, doubled, false alarms, unnoticed restarts) it has always required, plus a `SPECULATION` block of 14 started, 14 confirmed, 0 abandoned — exactly one suspicion per unannounced disruption and none during the announced ones, which is the answer to "does suspicion fire when nothing is wrong?" that loopback *can* give. The visible gap fell to p50 842 ms / p95 1199 ms: a real improvement on 2.45 s, but not the clean ~600 ms a 500 ms threshold implies, because the sweep that raises suspicion is periodic and can lag the threshold by up to its own interval before it fires. What loopback cannot answer — how often suspicion fires when nothing is wrong, *on a connection where things are sometimes slow or lost* — is exactly what Run C is for, and it has not happened yet.
 5. **Volunteer run** — the same binary, on real connections, measured against the stop criteria.
 
+## Run C: handover — not yet run (2026-09-22)
+
+**What this run tests.** Speculative resume passed both local rigs (4a, above) but loopback cannot answer the question that matters: how often suspicion fires when nothing is wrong, on a connection where things are sometimes slow or lost rather than perfectly reliable. Run C is that answer — the same eight-hour chaos run Night A and Run B used, on the same two wired boxes, with speculation on, so the visible-gap measurement can be compared directly against Night A run 2's pre-speculation baseline.
+
+**What would count as failure.** Any of: a false suspicion rate so high it would visibly disrupt an unbroken connection; any orphaned, doubled, false-alarmed, or unnoticed-restart count above zero (the four counts every prior run has held at zero); detection or resume moving off their established p95s, which would mean speculation changed behaviour it was not supposed to touch. A visible gap that fails to improve on 2651 ms would not be a clean failure of the code — see the correction below — but it would be a failure of the run's reason for existing.
+
+Judge against the spec's table, carried over verbatim:
+
+| | Baseline (Night A run 2, n=104) | Run C |
+|---|---|---|
+| Detection p95 | 2461 ms | expect unchanged |
+| Resume p95 | 200 ms | expect unchanged |
+| **Visible gap p95** | **2651 ms** | **target: under 500 ms** |
+| Orphaned / doubled / false alarm / unnoticed | 0 | must stay 0 |
+| False suspicion rate | n/a | record it; it will not be zero |
+
+**Correction to the 500 ms target — do not measure this away.** That number is the design document's target, carried into this table unchanged, and the local chaos rig (4a, above) has already shown it will not be met as written: 15 disruptions there produced a visible gap of p50 842 ms / p95 1199 ms, not the ~500–600 ms the threshold implies. The reason is structural, not a bug to fix before Run C: suspicion is raised by a sweep that runs every `detect/4` (the same 500 ms), not continuously, so the silence already elapsed when a disruption happens to fall right after a sweep can be anywhere from just past 500 ms to just under 1000 ms before the *next* sweep catches it and speculation begins. A 500 ms budget on a periodic check whose own period is 500 ms was never going to land on 500 ms at p95 — it lands somewhere in the sweep's own window, and the local rig already shows where. Run C is expected to reproduce that shape on real hardware, not to somehow meet the original number. The target stays as written above because this project fixes criteria before measuring; whether to revise it, and to what, is the human's decision to make after Run C, not something to quietly correct in this table beforehand.
+
+**Staged and verified 2026-09-22.** `./release.sh` at commit `cf3f161`, built with `rustc 1.98.0 (88d9e12ae 2026-08-18)`, static (`x86_64-unknown-linux-musl`). `~/runc/` on both boxes holds `mesh-node`, `chaos.py`, `mesh-chaos.service`, `mesh-chaos.timer`, and `timed-run.sh`; the staged `mesh-node`'s sha256 (`b0b9ea75631e67ca2fcc6b11fddfa48e68331df3aa295dce6c657fab2e53c872`) matches `dist/mesh-node` on both. Read-only check of current state found both boxes `active`, both still configured with `MESH=night-a` (not yet switched to `run-c`) and matching `PEERS=` entries pointing at each other, and both running `/usr/local/bin/mesh-node` at sha256 `1f3d23442b348900a897ac4299a32d6ce0d3e4340d1827bcf326eb9caf8c8dd2` — a build from before this one, left in place rather than reverted to something older. Neither box was touched to reconcile this; it is information for whoever runs Run C, not something this handover corrected. `timed-run.sh` keeps this config and binary and restores them on `--revert`, so nothing here blocks the run.
+
+**Commands the human runs** (both machines are wired, so `--not-a-hotspot` is honest — see the hotspot data-budget note, which is why this is never left running unattended past its `--hours`):
+
+```
+ssh -t rpc@192.168.50.48  'cd ~/runc && sudo ./timed-run.sh --label diamond   --mesh run-c --peer 192.168.50.128 --own --hours 8 --not-a-hotspot'
+ssh -t rpc@192.168.50.128 'cd ~/runc && sudo ./timed-run.sh --label riverboat --mesh run-c --peer 192.168.50.48        --hours 8 --not-a-hotspot'
+```
+
+Collect and read afterward:
+
+```
+mkdir -p provision/results/run-c/{diamond,riverboat}
+scp 'rpc@192.168.50.48:/var/log/mesh-node/*.jsonl*'  provision/results/run-c/diamond/
+scp 'rpc@192.168.50.128:/var/log/mesh-node/*.jsonl*' provision/results/run-c/riverboat/
+cd provision && python3 takeover-summary.py results/run-c/*/events.jsonl results/run-c/*/chaos.jsonl
+```
+
+The `*` after `.jsonl` is not decoration — an eight-hour run crosses the 00:02 UTC rotation that has bitten two runs already (Night A run 2, Run B).
+
+**The claim this run retracts, or confirms.** This plan has twice said the player waits detection plus resume — about 2.45–2.65 s — because speculative resume was not built. It is now built. Once Run C's numbers exist, this section (or the results section beside it) must say plainly whether the visible gap actually fell, and by how much, rather than leaving the old detection-plus-resume claim standing unqualified. That has not happened yet: no result from Run C appears anywhere in this document until the run has actually run.
+
 ## Open decisions
 
 - **The rendezvous fallback**, if no volunteer turns out to be directly reachable. Manual invite exchange covers address distribution but not simultaneous-transmission timing.
