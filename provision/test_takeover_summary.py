@@ -208,6 +208,47 @@ class ArmedWindow(unittest.TestCase):
         self.assertIn(time.strftime("%Y-%m-%d %H:%M", time.localtime(T0 / 1000)), line)
 
 
+class SpeculationCauses(unittest.TestCase):
+    """The block must say which kind of wrong suspicion it is counting."""
+
+    def report_of(self, extra_events):
+        actions, events = kill_with_speculation(1000)
+        out = io.StringIO()
+        summary.report(summary.match(actions, events + extra_events),
+                       events + extra_events, actions, out=out)
+        return out.getvalue()
+
+    def test_an_abandonment_is_broken_down_by_its_cause(self):
+        # "the owner came back and kept the job" is true of one of these three
+        # and false of the other two. Run C is the first run that produces them.
+        text = self.report_of([
+            ev("riverboat", 5000, "speculating", label="diamond", silent_ms="500", tick="60"),
+            ev("riverboat", 5600, "speculation-abandoned", label="diamond",
+               cause="checkpoint", ticks_wasted="3", wasted_ms="600"),
+            ev("riverboat", 7000, "speculating", label="diamond", silent_ms="500", tick="80"),
+            ev("riverboat", 7600, "speculation-abandoned", label="diamond",
+               cause="heard-again", ticks_wasted="2", wasted_ms="600"),
+            ev("riverboat", 9000, "speculating", label="diamond", silent_ms="500", tick="90"),
+            ev("riverboat", 9600, "speculation-abandoned", label="diamond",
+               cause="not-ours", ticks_wasted="1", wasted_ms="600"),
+        ])
+        self.assertIn("checkpoint", text)
+        self.assertIn("heard-again", text)
+        self.assertIn("not-ours", text)
+        self.assertNotRegex(
+            text, r"abandoned\s+3\s+the owner came back and kept the job",
+            "two of those three are not the owner coming back")
+
+    def test_a_suspicion_that_ended_without_a_word_is_counted_as_unaccounted(self):
+        # A job failure stands the speculation down and emits nothing, so
+        # started can exceed confirmed plus abandoned. Silence about the
+        # difference reads as arithmetic that does not add up.
+        text = self.report_of([
+            ev("riverboat", 5000, "speculating", label="diamond", silent_ms="500", tick="60"),
+        ])
+        self.assertIn("unaccounted", text)
+
+
 class Speculation(unittest.TestCase):
     def test_a_resume_before_its_takeover_is_still_that_takeovers_resume(self):
         actions, events = kill_with_speculation(1000)

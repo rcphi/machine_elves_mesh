@@ -578,12 +578,6 @@ enum Speculation {
     Outran,
 }
 
-/// Which of a speculating node and the checkpoint's sender keeps the job.
-///
-/// Deliberately just [`Work::theirs`] plus the arithmetic for how much was
-/// wasted: a speculator is not a special case of the two-owners rule, it is
-/// an instance of it. Kept separate from the `Message::Checkpoint` handler so
-/// the decision can be tested without driving the event loop.
 /// Whether the suspect itself has disproved the suspicion.
 ///
 /// This is what [`Speculating::about`] is for: a suspicion names whose silence
@@ -623,6 +617,12 @@ fn stand_down(
     spec
 }
 
+/// Which of a speculating node and the checkpoint's sender keeps the job.
+///
+/// Deliberately just [`Work::theirs`] plus the arithmetic for how much was
+/// wasted: a speculator is not a special case of the two-owners rule, it is
+/// an instance of it. Kept separate from the `Message::Checkpoint` handler so
+/// the decision can be tested without driving the event loop.
 fn resolve_speculation(
     spec: &Speculating,
     mine: (u64, &PeerId),

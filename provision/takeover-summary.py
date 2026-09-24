@@ -46,6 +46,15 @@ RESUME_MAX_MS = 500
 # Detection is ~2.5 s at most; the rest is margin for clock disagreement and a
 # slow election, not an allowance for a slow takeover — that shows up in the
 # numbers themselves, not as a missed match.
+# What each abandonment cause means, in the node's own terms. Kept here rather
+# than inline so that a cause the node emits and this tool does not know about
+# prints as itself instead of being quietly folded into a neighbour.
+ABANDONMENT = {
+    "checkpoint": "checkpoint — the owner came back and kept the job",
+    "heard-again": "heard-again — the suspect was alive, its checkpoints lost",
+    "not-ours": "not-ours — another survivor took the job",
+}
+
 MATCH_WINDOW_MS = 30_000
 MATCH_EARLY_MS = 2_000
 # A partitioned node's return is expected shortly after its partition ends.
@@ -268,7 +277,10 @@ def false_alarms(events, actions):
     return alarms
 
 
-def row(name, values, limit=None):
+def row(name, values, limit=None, unit="ms"):
+    """One distribution. `unit` because not everything measured here is a duration —
+    ticks wasted on a wrong suspicion are a count, and printing them as
+    milliseconds states a number in units it was never in."""
     n = len(values)
     if not n:
         return f"  {name:<22} no samples"
@@ -277,8 +289,8 @@ def row(name, values, limit=None):
     if limit is not None:
         verdict = "  PASS" if p95 <= limit else f"  FAIL (p95 over {limit} ms)"
     thin = "  (p99 is one sample or fewer)" if n < 100 else ""
-    return (f"  {name:<22} n={n:<4} p50 {p50:>5} ms   p95 {p95:>5} ms   "
-            f"p99 {p99:>5} ms   max {max(values):>5} ms{verdict}{thin}")
+    return (f"  {name:<22} n={n:<4} p50 {p50:>5} {unit}   p95 {p95:>5} {unit}   "
+            f"p99 {p99:>5} {unit}   max {max(values):>5} {unit}{verdict}{thin}")
 
 
 def report(results, events, actions, out=sys.stdout):
@@ -349,11 +361,31 @@ def report(results, events, actions, out=sys.stdout):
         say("\nSPECULATION")
         say(f"  started                   {len(started):>4}  suspicions acted on before any decision")
         say(f"  confirmed                 {len(confirmed):>4}  the owner really had gone")
-        say(f"  abandoned                 {len(abandoned):>4}  the owner came back and kept the job")
+        say(f"  abandoned                 {len(abandoned):>4}  the suspicion was wrong")
+        # Broken down because one line cannot describe all three. Only
+        # "checkpoint" is the owner coming back to keep the job; "heard-again"
+        # is a peer that was alive all along on a link losing its checkpoints,
+        # and "not-ours" is another survivor taking the job while the suspect
+        # stays gone. Run C is the first run that can produce the last two, and
+        # a single description would have mislabelled them both.
+        by_cause = {}
+        for e in abandoned:
+            by_cause.setdefault(e.get("cause") or "unlabelled", []).append(e)
+        for cause, group in sorted(by_cause.items()):
+            say(f"      {ABANDONMENT[cause] if cause in ABANDONMENT else cause:<50}"
+                f"{len(group):>4}")
+        # A speculation can also end without a word: a job that fails stands it
+        # down and emits nothing, because the node has stopped working rather
+        # than changed its mind. Without this line the three counts simply fail
+        # to add up, and a reader cannot tell a silent exit from a lost event.
+        unaccounted = len(started) - len(confirmed) - len(abandoned)
+        if unaccounted:
+            say(f"  unaccounted               {unaccounted:>4}  ended without an event — a job that "
+                "failed, or a log that begins mid-suspicion")
         wasted = [num(e.get("ticks_wasted")) for e in abandoned
                   if num(e.get("ticks_wasted")) is not None]
         if wasted:
-            say(row("ticks wasted", wasted))
+            say(row("ticks wasted", wasted, unit="ticks"))
         say("  A wrong suspicion costs ticks, not correctness: the same job from the same")
         say("  state makes the same items, so discarded work merges to nothing.")
 
