@@ -191,6 +191,19 @@ const DEFAULT_PORT: u16 = 4001;
 /// starts second would fail permanently if the first had given up.
 const DIAL_RETRY: Duration = Duration::from_secs(2);
 
+/// The retry timer, built so that a quiet mesh does not store up work for it.
+///
+/// Its arm in the event loop is guarded by `!pending.is_empty()`, so while
+/// every peer is reachable the interval is never polled at all.
+fn dial_retry_interval() -> tokio::time::Interval {
+    let mut retry = tokio::time::interval(DIAL_RETRY);
+    // Not the default `Burst`, which hands over every tick that elapsed while
+    // nobody was polling. A lost peer is redialled once immediately and then
+    // every DIAL_RETRY, however long the mesh was healthy first.
+    retry.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Delay);
+    retry
+}
+
 /// How often a quiet connection is poked to stop a router forgetting it.
 ///
 /// Measured rather than guessed: the mobile connection tested forgot an idle
@@ -1076,7 +1089,7 @@ async fn run(config: Config) -> Result<()> {
     // amount of waiting fixes it because nothing is trying.
     let mut reached_by: HashMap<PeerId, Vec<Multiaddr>> = HashMap::new();
     let mut dial_attempts: u32 = 0;
-    let mut dial_retry = tokio::time::interval(DIAL_RETRY);
+    let mut dial_retry = dial_retry_interval();
     // Where this node can currently see each peer. Observed, never claimed:
     // a peer's own idea of its address is worthless behind translation.
     let mut seen_at: HashMap<PeerId, Multiaddr> = HashMap::new();
@@ -2393,6 +2406,46 @@ fn json_string(raw: &str) -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// The mesh ran undisturbed for 41.1 hours before Run C, and when the peer
+    /// finally left, `dial_retry`'s arm became eligible and fired 74,016 stored
+    /// ticks at once: 16,873 connections in 86 seconds, 7.5 MB of log, and a
+    /// `chaos.py` blinded for six minutes because its 2 MB tail window no
+    /// longer reached the run's own `started` line.
+    ///
+    /// The interval's arm is guarded, so nothing polls it while every peer is
+    /// reachable, and tokio's default `MissedTickBehavior::Burst` hands over
+    /// every tick that elapsed unwatched. The healthier the mesh, the larger
+    /// the burst — which is why two earlier runs looked clean: they began after
+    /// runs full of disruptions, with backlogs seconds deep rather than days.
+    #[tokio::test(start_paused = true)]
+    async fn a_quiet_mesh_does_not_store_up_dial_retries() {
+        // riverboat's own account of it: was_present_ms=148031679.
+        const THE_MESH_WAS_HEALTHY_FOR: Duration = Duration::from_millis(148_031_679);
+
+        let mut retry = dial_retry_interval();
+        retry.tick().await; // every interval yields its first tick immediately
+
+        // Nothing polls it for 41 hours, because every peer is reachable.
+        tokio::time::advance(THE_MESH_WAS_HEALTHY_FOR).await;
+
+        // Then a peer leaves and the arm becomes eligible. Ten retries should
+        // take the nine intervals that separate them; a stored-up backlog
+        // delivers them with no time passing at all.
+        let began = tokio::time::Instant::now();
+        for _ in 0..10 {
+            retry.tick().await;
+        }
+        let took = began.elapsed();
+
+        assert!(
+            took >= DIAL_RETRY * 9,
+            "ten retries took {took:?}, not the {:?} that nine intervals cost: \
+             {} ticks were stored up while the mesh was healthy and fired at once",
+            DIAL_RETRY * 9,
+            THE_MESH_WAS_HEALTHY_FOR.as_millis() / DIAL_RETRY.as_millis(),
+        );
+    }
 
     #[test]
     fn the_keepalive_leaves_margin_on_the_worst_measured_connection() {

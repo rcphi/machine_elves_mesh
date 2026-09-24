@@ -876,6 +876,14 @@ Nothing was wrong when this paragraph was first written at 20:51 — the node ch
 
 **State of the boxes at re-staging** (read-only; neither was reconfigured): both `active`, both still on `MESH=night-a` with matching `PEERS=` pointing at each other, both still running `/usr/local/bin/mesh-node` at sha256 `1f3d2344…`, an older build left in place rather than reverted. `mesh-chaos` is disarmed on both, and the mesh has been advancing the same job uninterrupted for over 40 hours. `timed-run.sh` keeps the current config and binary and restores them on `--revert`, so none of this blocks the run.
 
+**A defect the run's first 86 seconds exposed, fixed in the tree but deliberately not staged.** When `timed-run.sh` stopped diamond's node to switch it to `run-c`, riverboat — still running the old build — logged `left  label=diamond  was_present_ms=148031679`: the two had been connected for **41.1 hours**, the longest undisturbed stretch any run has begun from. It then opened **16,873 connections in 86 seconds**, about 197 a second, writing 7.5 MB of log.
+
+The cause is not speculation, and not new: the burst came from the *pre-speculation* binary. `dial_retry` is a 2-second `tokio::time::interval` whose arm is guarded by `!pending.is_empty()`, so while every peer is reachable nothing polls it, and tokio's default `MissedTickBehavior::Burst` keeps every tick that elapsed unwatched. 148,031,679 ms of health is **74,015 stored ticks**, released the instant a peer left. The healthier the mesh, the bigger the burst — which is why Night A and Run B looked clean at 1–3 connections: they began after runs full of disruptions, with backlogs seconds deep rather than days. Their low numbers were never evidence of a healthier code path.
+
+On this LAN it cost log volume and one real blindness: the burst pushed the run's `started` line outside `chaos.py`'s 2 MB tail, so diamond misread `settled` as 41 hours until its first restart. On a volunteer's connection it would be worse — 74,000 dials at a NAT resembles a port scan and can exhaust a cheap router's connection table, and on a metered link an estimated 60–70 MB of QUIC handshakes is about an hour of the measured hotspot budget spent in 86 seconds.
+
+The fix is one line — `set_missed_tick_behavior(Delay)`, so a lost peer is redialled once immediately and then every 2 seconds however long the mesh was healthy first — with a test that moves the clock 41.1 hours rather than waiting for it. **It is committed but not staged**: Run C finishes on the binary it started with, and `dist/VERSION` is deliberately left behind `HEAD` so the check above catches it before the next run.
+
 **Commands the human runs** (both machines are wired, so `--not-a-hotspot` is honest — see the hotspot data-budget note, which is why this is never left running unattended past its `--hours`):
 
 ```

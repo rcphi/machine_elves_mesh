@@ -11,3 +11,8 @@ libp2p = { version = "0.56.0", features = ["tokio", "quic", "tcp", "noise", "yam
 sha2 = "0.11.0"
 tokio = { version = "1.53.1", features = ["rt-multi-thread", "macros", "time", "signal"] }
 wasmtime = "48.0.0"
+
+[dev-dependencies]
+# `test-util` gives the tests a clock they can move: a fault that needs the mesh
+# to stay healthy for two days cannot be reproduced by waiting for it.
+tokio = { version = "1.53.1", features = ["rt-multi-thread", "macros", "time", "signal", "test-util"] }
