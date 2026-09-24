@@ -665,7 +665,7 @@ For a player on mobile data this is not a performance problem, it is a reason to
 
 An announced departure (n=13) costs a resume of 14–81 ms at p50 and a visible gap of 177–236 ms: a different order of magnitude, as it should be, because nothing has to be detected.
 
-**Both thresholds are met, and the player still waits about 2.5 s.** The gap is detection plus resume, and this plan said from the start that the 500 ms budget only holds if a standby begins continuing while the original is merely *suspected* gone. Speculation is not built. So the honest statement of this result is: **the mechanism works and is within its own budget; the experience it produces is not yet the one the budget was chosen to deliver.** Building speculative resume and re-running the same measurement is the way to close that, and the before is now on record.
+**Both thresholds are met, and the player still waits about 2.5 s.** The gap is detection plus resume, and this plan said from the start that the 500 ms budget only holds if a standby begins continuing while the original is merely *suspected* gone. Speculation is not built. So the honest statement of this result is: **the mechanism works and is within its own budget; the experience it produces is not yet the one the budget was chosen to deliver.** Building speculative resume and re-running the same measurement is the way to close that, and the before is now on record. *(Superseded 2026-09-24: speculative resume is built and Run C measured the visible gap at 1060 ms p95, 763 ms p50 — see "Run C: the player's wait, measured". This paragraph is left as written, because the distance between what was predicted and what was measured is the point.)*
 
 **The sample is smaller than intended, and the reason matters more than the number.** 46 disruptions arrived in 2h45m, and then the run went quiet for five hours — not because the mesh failed, but because both chaos tools stopped firing:
 
@@ -692,7 +692,7 @@ The same two boxes, the same mesh and ledger, chaos armed eight hours on each. *
 
 An announced departure (n=16) resumes in 23–103 ms at p50 with a visible gap of 150–292 ms, the same order of magnitude Night A found.
 
-**The conclusion is unchanged, and it is the one that matters.** Both thresholds are met and **the player still waits about 2.45 s**, because the gap is detection plus resume and speculative resume from a warm standby — which this plan always said the 500 ms budget depended on — is still not built. A second, larger measurement of the same mechanism does not move that; it only removes "the sample was too small" as a reason to doubt it. The before is on record twice now.
+**The conclusion is unchanged, and it is the one that matters.** Both thresholds are met and **the player still waits about 2.45 s**, because the gap is detection plus resume and speculative resume from a warm standby — which this plan always said the 500 ms budget depended on — is still not built. A second, larger measurement of the same mechanism does not move that; it only removes "the sample was too small" as a reason to doubt it. The before is on record twice now. *(Superseded 2026-09-24: speculative resume is built and Run C measured the visible gap at 1060 ms p95, 763 ms p50 — see "Run C: the player's wait, measured". This paragraph is left as written, because the distance between what was predicted and what was measured is the point.)*
 
 ### What Night A blamed on rotation, this run proved fixed
 
@@ -842,7 +842,7 @@ Household isolation (`--isolate-lan`) is opt-in, verifies internet reachability 
 4a. **Speculative resume** — *built and passing both local rigs; awaiting Run C on real boxes.* A standby begins continuing a suspected-gone owner's job from `detect/4` (500 ms) of silence, rather than waiting out the full detection window, so the visible gap should fall from the ~2.45 s Night A measured toward the resume budget alone. `node/migration-rig.sh` passes with speculation on (the default) and, now that `MESH_NODE_EXTRA` plumbs flags through to every node it starts, with `--speculate-after-ms 0` forcing it off — a flag that could not be turned off in the rig could not have been A/B tested on a box either. `sudo node/chaos-rig.sh 15` ran 17 disruptions (10 kill, 4 partition, 3 announced) with the same four counts at zero (orphaned, doubled, false alarms, unnoticed restarts) it has always required, plus a `SPECULATION` block of 14 started, 14 confirmed, 0 abandoned — exactly one suspicion per unannounced disruption and none during the announced ones, which is the answer to "does suspicion fire when nothing is wrong?" that loopback *can* give. The visible gap fell to p50 842 ms / p95 1199 ms: a real improvement on 2.45 s, but not the clean ~600 ms a 500 ms threshold implies, because the sweep that raises suspicion is periodic and can lag the threshold by up to its own interval before it fires. **These figures were re-derived from the same logs after a bug was fixed in the tool that produced them** (a takeover could borrow a later disruption's resume, which would have biased the gap optimistic). They did not move — not one number in this paragraph — because the rig fired its disruptions 33 s apart at the closest and the tool matches within a 30 s window, so no takeover here could reach the next one's evidence. That is the rig's pacing saving it, not the old tool being right. What loopback cannot answer — how often suspicion fires when nothing is wrong, *on a connection where things are sometimes slow or lost* — is exactly what Run C is for, and it has not happened yet.
 5. **Volunteer run** — the same binary, on real connections, measured against the stop criteria.
 
-## Run C: handover — not yet run (2026-09-22)
+## Run C: handover (2026-09-22) — run on 2026-09-24, results in the section after this one
 
 **What this run tests.** Speculative resume passed both local rigs (4a, above) but loopback cannot answer the question that matters: how often suspicion fires when nothing is wrong, on a connection where things are sometimes slow or lost rather than perfectly reliable. Run C is that answer — the same eight-hour chaos run, on the same two wired boxes (diamond and riverboat), that Night A's second run (n=104) used, with speculation on, so the visible-gap measurement can be compared directly against that run's pre-speculation baseline. (Run B was two hours, and one of its two boxes was a phone hotspot — a different comparison, not this one.)
 
@@ -903,6 +903,44 @@ cd provision && python3 takeover-summary.py results/run-c/*/events.jsonl results
 The `*` after `.jsonl` is not decoration — a run this long can cross a mid-run log rotation, which has already bitten two runs on two different boxes at two different times: riverboat's at 20:01 in Night A's second run, diamond's at 00:02 UTC in Run B.
 
 **The claim this run retracts, or confirms.** This plan has twice said the player waits detection plus resume — about 2.5 s after Night A's first run, about 2.45 s after its second — because speculative resume was not built. It is now built. Once Run C's numbers exist, this section (or the results section beside it) must say plainly whether the visible gap actually fell, and by how much, rather than leaving the old detection-plus-resume claim standing unqualified. That has not happened yet: no result from Run C appears anywhere in this document until the run has actually run.
+
+## Run C: the player's wait, measured — 2026-09-24
+
+`diamond` and `riverboat`, the same two wired boxes as Night A's second run, on mesh `run-c` with a ledger of its own, speculation on, chaos armed eight hours each. **118 disruptions, every one continued by the other machine**, and the four counts that must not move stayed at zero.
+
+| | Baseline (Night A run 2, n=104) | **Run C (n=92)** | Judged |
+|---|---|---|---|
+| Detection p95 | 2461 ms | **2439 ms** | unchanged, as required — **2–3 s met** |
+| Resume p95 | 200 ms | **200 ms** | unchanged, as required — **500 ms met** |
+| **Visible gap p95** | **2651 ms** | **1060 ms** | target was under 500 ms — **missed, as predicted** |
+| Visible gap p50 | 2450 ms | **763 ms** | |
+| Orphaned / doubled / false alarm / unnoticed | 0 | **0** | held |
+| False suspicion rate | n/a | **0 of 93 suspicions** | recorded |
+
+**The claim this plan made twice is now retracted with a number.** It said the player waits detection plus resume — about 2.5 s after Night A's first run, about 2.45 s after its second — *because speculative resume was not built*. It is built, and the wait is **1060 ms at p95, 763 ms at p50**: the gap fell by **60%**, and it no longer contains detection at all. What a player waits through is now the silence before suspicion plus the resume, and the takeover arrives about 1.5 s *after* the work has already restarted.
+
+**The 500 ms target was missed and the reason is the one written down before the run.** Suspicion is raised by a sweep running every `detect/4` — the same 500 ms as the budget — so the silence already elapsed when a disruption lands just after a sweep runs anywhere from 500 ms to just under 1 s before the next one catches it. A 500 ms budget on a 500 ms periodic check was never going to land at 500 ms at p95. The decision of 2026-09-23 not to sweep at `detect/8` was taken before the run and is unchanged by it; the remaining win is still a known, cheap, deferred change.
+
+**The prediction was slightly conservative, and the rig slightly pessimistic.** Before the run this section said the stall would go "from about 2.45 s to somewhere near 1.2 s." Measured: 1.06 s. The local chaos rig had predicted p50 842 / p95 1199 ms; real hardware returned p50 763 / p95 1060. Loopback with compressed timings was the *harsher* estimate of the two, which is worth knowing the next time the rig is used to anticipate a box run.
+
+**An announced departure is in a different class entirely**: resume p50 28–102 ms and a visible gap of p50 166–240 ms, because nothing has to be suspected or detected. The gap only exists when a node vanishes without saying so.
+
+**Direction is not symmetric.** `diamond → riverboat` gaps run faster than the reverse at p50 (644 vs 859 ms on kills, 630 vs 810 ms on partitions) while the p95s are close. Both nodes sweep on the same 500 ms period but not in the same phase, and where a disruption lands in the victim's successor's sweep cycle decides how much of that window it waits. It is the jitter the section above describes, seen from one side.
+
+### What zero false suspicions does and does not establish
+
+93 suspicions, 92 confirmed by a real departure, **none abandoned**: speculation never once started work because of a peer that was fine. The single `unaccounted` is the startup stagger, where riverboat raised a suspicion one second into its own life while the two boxes were being armed 83 seconds apart.
+
+**The bound this puts on the false-suspicion rate is weak, and the link is the easiest one this design will ever run on.** Zero events across 16 node-hours gives, by the rule of three, a 95% upper bound of roughly **one false suspicion per 5 node-hours** — not a small number for a player. And two boxes on one switch have essentially no loss and no jitter, while the case `a6cdc78` was written for is a suspect on a *lossy* link whose heartbeats arrive and whose checkpoints do not. **Run C could not produce that condition, so the honest reading is "not measurable on this rig," not "does not happen."**
+
+### What the next run should do differently
+
+Three of the four things Run C measured were settled long before it ended. The visible gap p95 was within 35 ms of its final value after **forty minutes** (n=5) and moved between 1037 and 1135 ms for the remaining seven hours; detection and resume p95 never moved at all. Only the false-suspicion bound kept improving, and it improved on the wrong link.
+
+- **Iterate on `node/chaos-rig.sh`, not the boxes.** It produced 17 disruptions in 15 minutes — about 68/hour against the box run's measured **14.9/hour** — needs no boxes, and its gap figures turned out to bracket the real ones.
+- **When the boxes are used, make them show what only they can.** If the false-suspicion rate is the question, impair the link deliberately (`tc netem` loss and jitter on the mesh port) rather than waiting longer on a clean one. An hour of a degraded link answers what eight hours of a clean one cannot.
+- **If more samples are wanted, shorten the fire interval.** Of 187 fires, 118 acted; 29 skips were the standby's own timer, 7 fell during partitions, and only **13 came from the settling gate** — so the 60-second settle is not the constraint, the 3–7 minute timer is.
+- **A long run is still worth doing occasionally as a soak**, for drift that only appears over hours — memory, descriptors, ledger growth — but that does not need a disruption every four minutes.
 
 ## Open decisions
 
