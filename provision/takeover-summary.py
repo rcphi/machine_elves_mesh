@@ -39,6 +39,10 @@ import time
 sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
 import chaos  # noqa: E402  — the same reading of a node's log that chaos.py acts on
 
+# The owner writes a `working` line once a minute, so a steady owner must
+# appear at least once in a minute and a half either side of any instant.
+WORKING_SPAN_MS = 90_000
+
 DETECT_MAX_MS = 3000
 RESUME_MAX_MS = 500
 
@@ -151,6 +155,53 @@ def held_the_job(by_node, victim, at):
     return chaos.situation(rows[start:end], at)[0]
 
 
+def kept_working_elsewhere(events, victim, at):
+    """Which other node was already advancing the job when this one was hit.
+
+    On a flapping link two nodes can both believe they own the job, and
+    chaos fires at whichever one believes it. If another node was advancing
+    the work before the disruption and still advancing it after, nothing
+    stopped and no takeover was needed — so the absence of a `took-over` is
+    not a job nobody continued. Run D produced two of these and the summary
+    called them orphans while the survivor's ticks never missed a beat.
+
+    `working` is the evidence because only the node advancing the job writes
+    it. It is written once a minute, so a minute and a half either side is
+    the span in which a steady owner must appear at least once.
+    """
+    for node in {e.get("node") for e in events if e.get("node") != victim}:
+        lines = [e["ts_unix_ms"] for e in events
+                 if e.get("node") == node and e.get("event") == "working"]
+        before = any(at - WORKING_SPAN_MS <= t < at for t in lines)
+        after = any(at < t <= at + WORKING_SPAN_MS for t in lines)
+        if before and after:
+            return node
+    return None
+
+
+def speculations_ended_by_a_yield(events):
+    """Suspicions that ended because the node gave the job up instead.
+
+    A speculator stood down by a yield emits no abandonment cause — the node
+    resolved two owners rather than changing its mind about one — so these
+    fell into `started - confirmed - abandoned` and were reported as silent
+    exits. Whatever happens first to that node after the suspicion is what
+    ended it.
+    """
+    ended = 0
+    for index, event in enumerate(events):
+        if event.get("event") != "speculating":
+            continue
+        node = event.get("node")
+        following = (e.get("event") for e in events[index + 1:]
+                     if e.get("node") == node
+                     and e.get("event") in ("speculation-abandoned", "took-over",
+                                            "yielded", "speculating"))
+        if next(following, None) == "yielded":
+            ended += 1
+    return ended
+
+
 def by_node_ownership_events(events):
     """Each node's ownership-relevant events, in time order, for fast lookup."""
     relevant = chaos.OWNING | chaos.NOT_OWNING | {chaos.WORKING, "started"}
@@ -249,6 +300,7 @@ def match(actions, events):
                                and at - YIELD_RACE_MS <= e.get("ts_unix_ms", 0) <= at + YIELD_RACE_MS
                                for e in events)
             or not held_the_job(by_node, victim, at),
+            "kept_elsewhere": kept_working_elsewhere(events, victim, at),
         })
     return results
 
@@ -333,7 +385,8 @@ def report(results, events, actions, out=sys.stdout):
             "detection window.")
 
     say("\nTHINGS THAT SHOULD NOT HAPPEN")
-    orphaned = [r for r in results if r["successor"] is None]
+    orphaned = [r for r in results if r["successor"] is None and not r["kept_elsewhere"]]
+    kept = [r for r in results if r["successor"] is None and r["kept_elsewhere"]]
     doubled = [r for r in results if r["takeovers"] > 1]
     alarms = false_alarms(events, actions)
     unnoticed = [e for e in events if e.get("event") == "restarted-unnoticed"]
@@ -348,8 +401,14 @@ def report(results, events, actions, out=sys.stdout):
     say(f"  yields                    {len(yields):>4}  two owners resolved "
         "(expected after partitions: "
         f"{sum(1 for a in actions if a.get('action') == 'partition')})")
+    if kept:
+        say(f"  (another node was already advancing the job through {len(kept)} more "
+            "disruption(s), so no takeover was needed and nothing stopped)")
     for r in orphaned:
         say(f"    orphaned: {r['action']} of {r['victim']} at {r['at']}")
+    for r in kept:
+        say(f"    kept going: {r['action']} of {r['victim']} at {r['at']} — "
+            f"{r['kept_elsewhere']} never stopped working")
     for e in alarms:
         say(f"    false alarm: {e.get('label')} seen by {e.get('node')} at {e['ts_unix_ms']}, "
             f"away {e.get('away_ms')} ms")
@@ -378,7 +437,15 @@ def report(results, events, actions, out=sys.stdout):
         # down and emits nothing, because the node has stopped working rather
         # than changed its mind. Without this line the three counts simply fail
         # to add up, and a reader cannot tell a silent exit from a lost event.
-        unaccounted = len(started) - len(confirmed) - len(abandoned)
+        # Its own line, not one of the abandonment causes. These carry no
+        # cause because the node emitted none: it resolved two owners rather
+        # than changing its mind about one. Listed under `abandoned` the
+        # sub-counts would not add up to the subtotal above them.
+        by_yield = speculations_ended_by_a_yield(events)
+        if by_yield:
+            say(f"  ended by a yield          {by_yield:>4}  two owners resolved instead; "
+                "the node gave the job up rather than deciding about the suspect")
+        unaccounted = len(started) - len(confirmed) - len(abandoned) - by_yield
         if unaccounted:
             say(f"  unaccounted               {unaccounted:>4}  ended without an event — a job that "
                 "failed, or a log that begins mid-suspicion")

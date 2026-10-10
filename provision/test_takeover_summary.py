@@ -119,6 +119,88 @@ class Match(unittest.TestCase):
         self.assertEqual(r["takeovers"], 2)
 
 
+class WorkThatNeverStopped(unittest.TestCase):
+    """Run D, on a flapping mobile link, produced two disruptions the summary
+    called jobs nobody continued. Both hit a node that believed it owned the
+    job while the other node was already advancing it, and that node's ticks
+    did not pause for a moment. No takeover was needed, so none was logged,
+    and the absence was read as work lost."""
+
+    def owner_and_second_owner(self):
+        # yoinkerz's own log says it holds the job, so the existing
+        # "victim was a standby" guard does not apply.
+        events = [ev("yoinkerz", 1_000, "claimed", tick="0"),
+                  ev("yoinkerz", 30_000, "working", tick="150"),
+                  # diamond is advancing the same job, before and after.
+                  ev("diamond", 10_000, "working", tick="300"),
+                  ev("diamond", 70_000, "working", tick="600"),
+                  ev("diamond", 62_000, "vanished", label="yoinkerz", silent_ms="2300")]
+        return [act("yoinkerz", 60_000, "kill")], events
+
+    def test_a_kill_of_a_second_owner_names_the_node_that_kept_working(self):
+        actions, events = self.owner_and_second_owner()
+        [r] = summary.match(actions, events)
+        self.assertIsNone(r["successor"])
+        self.assertFalse(r["was_standby"])
+        self.assertEqual(r["kept_elsewhere"], "diamond")
+
+    def test_it_is_not_counted_as_a_job_nobody_continued(self):
+        actions, events = self.owner_and_second_owner()
+        out = io.StringIO()
+        summary.report(summary.match(actions, events), events, actions, out)
+        text = out.getvalue().split("THINGS THAT SHOULD NOT HAPPEN")[1]
+        self.assertIn("nobody took over             0", text)
+        self.assertNotIn("orphaned:", text)
+
+    def test_a_real_orphan_is_still_counted(self):
+        # Nobody else was working, so this one really did stop.
+        actions = [act("yoinkerz", 60_000, "kill")]
+        events = [ev("yoinkerz", 1_000, "claimed", tick="0"),
+                  ev("yoinkerz", 30_000, "working", tick="150"),
+                  ev("diamond", 62_000, "vanished", label="yoinkerz", silent_ms="2300")]
+        [r] = summary.match(actions, events)
+        self.assertIsNone(r["kept_elsewhere"])
+
+
+class SpeculationsThatEndedWithoutAnEvent(unittest.TestCase):
+    """A speculator stood down by a yield emits no abandonment cause, so
+    `started - confirmed - abandoned` counted it as a silent exit. Run D had
+    19 of them, which is a large unexplained remainder for a block whose
+    purpose is to account for every suspicion."""
+
+    def test_a_suspicion_ended_by_a_yield_is_attributed_to_the_yield(self):
+        events = [ev("riverboat", 0, "speculating", label="diamond", silent_ms="600"),
+                  ev("riverboat", 2_000, "yielded", label="diamond",
+                     their_tick="407", our_tick="403")]
+        self.assertEqual(summary.speculations_ended_by_a_yield(events), 1)
+
+    def test_a_suspicion_that_was_confirmed_is_not_attributed_to_a_later_yield(self):
+        # The took-over comes first, so the yield ended the ownership, not the
+        # suspicion.
+        events = [ev("riverboat", 0, "speculating", label="diamond", silent_ms="600"),
+                  ev("riverboat", 1_000, "took-over", tick="10"),
+                  ev("riverboat", 9_000, "yielded", label="diamond")]
+        self.assertEqual(summary.speculations_ended_by_a_yield(events), 0)
+
+    def test_a_yield_by_another_node_does_not_end_this_nodes_suspicion(self):
+        events = [ev("riverboat", 0, "speculating", label="diamond", silent_ms="600"),
+                  ev("diamond", 2_000, "yielded", label="riverboat")]
+        self.assertEqual(summary.speculations_ended_by_a_yield(events), 0)
+
+    def test_the_unaccounted_line_drops_what_the_yield_explains(self):
+        events = [ev("riverboat", 0, "speculating", label="diamond", silent_ms="600"),
+                  ev("riverboat", 2_000, "yielded", label="diamond")]
+        out = io.StringIO()
+        summary.report([], events, [], out)
+        text = out.getvalue()
+        # At the top level, not nested under `abandoned` — these carry no
+        # abandonment cause, and listing them beside the causes makes the
+        # sub-counts fail to add up to the subtotal above them.
+        self.assertIn("\n  ended by a yield", text)
+        self.assertNotIn("\n      ended by a yield", text)
+        self.assertNotIn("unaccounted", text)
+
+
 class FalseAlarms(unittest.TestCase):
     def test_a_return_explained_by_a_partition_is_not_an_alarm(self):
         actions = [act("diamond", 0, "partition", seconds=30)]
