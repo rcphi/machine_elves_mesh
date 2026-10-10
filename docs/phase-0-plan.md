@@ -965,27 +965,36 @@ Three of the four things Run C measured were settled long before it ended. The v
 
 **Predicting a non-zero rate is deliberate.** If the hotspot returns zero too, that is a stronger result for the design than Run C's zero was, because the link had every opportunity. If it returns a high rate, the sweep's 500 ms trigger is too eager for a mobile path and the number says by how much.
 
-**Staged and verified 2026-10-10.** `./release.sh` at commit `95d3723`, `rustc 1.98.0 (88d9e12ae 2026-08-18)`, static musl. `~/rund/` on `diamond` and `yoinkerz` holds `machine-elves/` (binaries, `SHA256SUMS`, `VERSION`, jobs) and `provision/` (so `setup.sh` resolves its own repo root). On both boxes the staged `mesh-node` is sha256 `18e3d3a3807104cc5306d2cd7d079753f35671f8a0141314cfa639ffb0efc747`, matching `dist/mesh-node`; checksums verify, `--help` runs, and `IPAccounting=yes` is present in the staged unit. **`yoinkerz` was still running `1f3d2344`, the pre-speculation build** — without this step Run D would have measured nothing new.
+**Staged and verified 2026-10-10.** `./release.sh` at commit `95d3723`, `rustc 1.98.0 (88d9e12ae 2026-08-18)`, static musl. `~/rund/` on `diamond` and `yoinkerz` holds `machine-elves/` (binaries, `SHA256SUMS`, `VERSION`, jobs) and `provision/`, with `mesh-node` in **both** places: `timed-run.sh` requires it beside itself. On both boxes the staged `mesh-node` is sha256 `18e3d3a3807104cc5306d2cd7d079753f35671f8a0141314cfa639ffb0efc747`, matching `dist/mesh-node`; checksums verify, `--help` runs, and `IPAccounting=yes` is present in the staged unit. **`yoinkerz` was still running `1f3d2344`, the pre-speculation build** — without this step Run D would have measured nothing new.
 
 **Two setup faults from earlier runs, not to be repeated.**
 
 - **Do not give `diamond` an address for `yoinkerz`.** Run B aimed **1,746 dial attempts** at the LAN address the laptop no longer had once it moved to the hotspot. `yoinkerz` behind carrier NAT cannot be dialled by anyone; it dials out and is observed. `diamond` needs no `PEERS` at all.
 - **Start `diamond` first and read its address from its own log.** `timed-run.sh` restarts the node, which re-emits `port-mapped` because the event fires only when the mapping changes. Take the address from that line rather than from this document — it was `204.210.210.200:4001` on 2026-09-27 and an ISP may change it at any time.
 
+**Two faults in the first version of this handover, found by running it.** Recorded because both were mine and both were silent until a command failed.
+
+- **`setup.sh` is not needed and does not do what was claimed.** Its entire node section — unit file, config, logrotate, `mesh-node-run` — is gated on `--mesh`, which was not passed, so `--dist` installed the binaries and `VERSION` and nothing else. Passing `--mesh` would have been worse: it rewrites `/etc/mesh-node/config`, which `timed-run.sh` owns, so `--revert` would then restore a config `setup.sh` had invented rather than the one that was there. **`timed-run.sh` installs the binary itself**, so the only thing `setup.sh` was wanted for is the one line below.
+- **`timed-run.sh` requires `mesh-node` beside itself** and says so, but the staging put the binary in `machine-elves/` to suit `setup.sh`. It failed with `missing beside me: mesh-node`. Run C's flat `~/runc/` had this right; the layout changed to serve a tool that turned out to be unnecessary.
+
+A follow-up worth doing *after* this run, not before it: `timed-run.sh` could install `mesh-node.service` when one sits beside it, which would remove the manual step below. Changing that tool in the hour before a run is the same mistake in a different coat.
+
 **Commands the human runs.** `riverboat` is stopped first so it stops dialling `diamond` on a mesh `diamond` has left; different meshes ignore each other, but its connection attempts land in the log being read.
 
 ```
 ssh -t rpc@192.168.50.128 'sudo systemctl stop mesh-node'
 
-ssh -t rpc@192.168.50.48 'sudo ~/rund/provision/setup.sh --label diamond --dist ~/rund/machine-elves'
+ssh -t rpc@192.168.50.48 'sudo install -m 0644 ~/rund/provision/mesh-node.service /etc/systemd/system/mesh-node.service && sudo systemctl daemon-reload'
 ssh -t rpc@192.168.50.48 'cd ~/rund/provision && sudo ./timed-run.sh --label diamond --mesh run-d --peer 127.0.0.1 --own --hours 2 --not-a-hotspot'
 ssh rpc@192.168.50.48 'grep port-mapped /var/log/mesh-node/events.jsonl | tail -1'
 ```
 
-The third command prints the address the fourth needs. `--peer 127.0.0.1` is a placeholder because `timed-run.sh` requires `--peer`: `diamond` is the reachable end and dials nobody. **Then move the laptop to the hotspot** and, from the laptop:
+The `install` line is the whole of what `IPAccounting` needs; on both boxes it is the only difference between the installed unit and the staged one. `timed-run.sh` restarts the unit, so the new setting takes effect without a separate restart.
+
+The last command prints the address the laptop needs. `--peer 127.0.0.1` is a placeholder because `timed-run.sh` requires `--peer`: `diamond` is the reachable end and dials nobody. **Then move the laptop to the hotspot** and, from the laptop:
 
 ```
-sudo ~/rund/provision/setup.sh --label yoinkerz --dist ~/rund/machine-elves
+sudo install -m 0644 ~/rund/provision/mesh-node.service /etc/systemd/system/mesh-node.service && sudo systemctl daemon-reload
 cd ~/rund/provision && sudo ./timed-run.sh --label yoinkerz --mesh run-d --peer <diamond's external IP> --hours 2
 ```
 
