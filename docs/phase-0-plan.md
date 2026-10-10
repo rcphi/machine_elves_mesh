@@ -943,6 +943,67 @@ Three of the four things Run C measured were settled long before it ended. The v
 - **If more samples are wanted, shorten the fire interval.** Of 187 fires, 118 acted; 29 skips were the standby's own timer, 7 fell during partitions, and only **13 came from the settling gate** — so the 60-second settle is not the constraint, the 3–7 minute timer is.
 - **A long run is still worth doing occasionally as a soak**, for drift that only appears over hours — memory, descriptors, ledger growth — but that does not need a disruption every four minutes.
 
+## Run D: handover — not yet run (2026-10-10)
+
+**What this run tests, and it is two things.** Run C put the visible gap at 1060 ms p95 but on two boxes sharing a switch: a link with no loss and no jitter, which is exactly the condition `a6cdc78`'s speculation exit was written for and exactly what Run C could not produce. Run D puts `yoinkerz` on a phone hotspot and `diamond` on home broadband, two carriers and no rented infrastructure, so that:
+
+1. **The gap is re-measured across a real internet path**, against Run B's pre-speculation **2566 ms** on the same two machines and the same two carriers. Run B found the internet contributes nothing measurable to *detection*; whether that holds for a trigger that fires on 500 ms of silence is a different question, because 500 ms of silence is something a mobile path can produce on its own.
+2. **False suspicion is measured on a link that genuinely loses and delays packets.** The hotspot is not a simulation of an impaired link, it is one. This is the only remaining question that could still change a conclusion.
+
+**What would count as failure.** Any of the four counts leaving zero (orphaned, doubled, false-alarmed, unnoticed restart). Detection or resume moving off their established p95s. Or false suspicion causing **ownership churn** — yields beyond those the partitions explain — which is the form in which a wrong suspicion stops being free.
+
+**There is no threshold for the false-suspicion rate and one is not being invented now.** A wrong suspicion costs ticks and not correctness: the same job from the same state makes the same items, so discarded work merges to nothing. What is recorded is the rate, the ticks wasted, and whether any of it reached the player as a change of owner.
+
+| | Baseline | Run D | Prediction, fixed before the run |
+|---|---|---|---|
+| Detection p95 | 2456 ms (Run B) | | unchanged |
+| Resume p95 | 200 ms (Run B) | | unchanged |
+| **Visible gap p95** | **2566 ms** (Run B) | | **near Run C's 1060 ms** if the path contributes nothing |
+| Orphaned / doubled / false alarm / unnoticed | 0 | | must stay 0 |
+| **False suspicion** | 0 of 93 (Run C, on a switch) | | **expected non-zero** — and that is the point |
+| Data on the phone | 121.6 MB / 2.1 h (Run B) | | ~120 MB at the measured 60 MB/h |
+
+**Predicting a non-zero rate is deliberate.** If the hotspot returns zero too, that is a stronger result for the design than Run C's zero was, because the link had every opportunity. If it returns a high rate, the sweep's 500 ms trigger is too eager for a mobile path and the number says by how much.
+
+**Staged and verified 2026-10-10.** `./release.sh` at commit `95d3723`, `rustc 1.98.0 (88d9e12ae 2026-08-18)`, static musl. `~/rund/` on `diamond` and `yoinkerz` holds `machine-elves/` (binaries, `SHA256SUMS`, `VERSION`, jobs) and `provision/` (so `setup.sh` resolves its own repo root). On both boxes the staged `mesh-node` is sha256 `18e3d3a3807104cc5306d2cd7d079753f35671f8a0141314cfa639ffb0efc747`, matching `dist/mesh-node`; checksums verify, `--help` runs, and `IPAccounting=yes` is present in the staged unit. **`yoinkerz` was still running `1f3d2344`, the pre-speculation build** — without this step Run D would have measured nothing new.
+
+**Two setup faults from earlier runs, not to be repeated.**
+
+- **Do not give `diamond` an address for `yoinkerz`.** Run B aimed **1,746 dial attempts** at the LAN address the laptop no longer had once it moved to the hotspot. `yoinkerz` behind carrier NAT cannot be dialled by anyone; it dials out and is observed. `diamond` needs no `PEERS` at all.
+- **Start `diamond` first and read its address from its own log.** `timed-run.sh` restarts the node, which re-emits `port-mapped` because the event fires only when the mapping changes. Take the address from that line rather than from this document — it was `204.210.210.200:4001` on 2026-09-27 and an ISP may change it at any time.
+
+**Commands the human runs.** `riverboat` is stopped first so it stops dialling `diamond` on a mesh `diamond` has left; different meshes ignore each other, but its connection attempts land in the log being read.
+
+```
+ssh -t rpc@192.168.50.128 'sudo systemctl stop mesh-node'
+
+ssh -t rpc@192.168.50.48 'sudo ~/rund/provision/setup.sh --label diamond --dist ~/rund/machine-elves'
+ssh -t rpc@192.168.50.48 'cd ~/rund/provision && sudo ./timed-run.sh --label diamond --mesh run-d --peer 127.0.0.1 --own --hours 2 --not-a-hotspot'
+ssh rpc@192.168.50.48 'grep port-mapped /var/log/mesh-node/events.jsonl | tail -1'
+```
+
+The third command prints the address the fourth needs. `--peer 127.0.0.1` is a placeholder because `timed-run.sh` requires `--peer`: `diamond` is the reachable end and dials nobody. **Then move the laptop to the hotspot** and, from the laptop:
+
+```
+sudo ~/rund/provision/setup.sh --label yoinkerz --dist ~/rund/machine-elves
+cd ~/rund/provision && sudo ./timed-run.sh --label yoinkerz --mesh run-d --peer <diamond's external IP> --hours 2
+```
+
+`--not-a-hotspot` is deliberately absent on `yoinkerz`: it *is* the hotspot, and `--hours 2` is inside the limit that flag guards. **This run is never left unattended past its hours** — 60 MB an hour is real money on a phone, and the two-hour box is the budget, not a target.
+
+Afterwards:
+
+```
+mkdir -p provision/results/run-d/{diamond,yoinkerz}
+scp 'rpc@192.168.50.48:/var/log/mesh-node/chaos.jsonl*'  provision/results/run-d/diamond/
+scp 'rpc@192.168.50.48:/var/log/mesh-node/events.jsonl*' provision/results/run-d/diamond/
+# yoinkerz once it is back on the LAN, chaos logs first, then events
+cd provision && python3 takeover-summary.py results/run-d/*/events.jsonl results/run-d/*/chaos.jsonl
+systemctl show mesh-node -p IPIngressBytes -p IPEgressBytes   # on each box, before reverting
+```
+
+Read `IPAccounting` **before** anything restarts the unit, because the counters reset with it. That is the number Run B could not get.
+
 ## Open decisions
 
 - **The rendezvous fallback**, if no volunteer turns out to be directly reachable. Manual invite exchange covers address distribution but not simultaneous-transmission timing.
