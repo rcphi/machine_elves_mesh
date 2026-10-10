@@ -16,6 +16,14 @@ ExecStart=/usr/local/bin/mesh-node-run
 Restart=always
 RestartSec=10
 
+# What this unit alone sent and received, so a metered run can be billed to the
+# node rather than to the machine. Run B measured the hotspot at 121.6 MB from
+# interface counters and could not explain why diamond's NIC claimed 108.0 MB
+# sent against yoinkerz's 89.3 MB received — ssh, dial storms and QUIC
+# retransmission all sit in that number and interface counters cannot separate
+# them. This attributes the bytes.
+IPAccounting=yes
+
 # One JSON record per line, so a partial write from a power cut costs one
 # event rather than the file.
 StandardOutput=append:/var/log/mesh-node/events.jsonl
