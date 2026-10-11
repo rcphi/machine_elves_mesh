@@ -82,7 +82,7 @@ These are recorded in advance deliberately. A number chosen after seeing results
 
 | | Threshold | What it governs |
 |---|---|---|
-| **Detection** | 2–3 s of silence | How long a node may go quiet before it is presumed gone. This is the dip tolerance — set too low, the mesh thrashes, migrating work every time a wifi link stutters. |
+| **Detection** | 2–3 s of silence | How long a node may go quiet before it is presumed gone. This is the dip tolerance — set too low, the mesh thrashes, migrating work every time a wifi link stutters. **Measured thrashing on a phone hotspot — Run D, 2026-10-10: once every 14 minutes.** |
 | **Resume** | **500 ms** | How long the visible gap may last once a takeover begins. This is the player-facing number. |
 
 **500 ms is too slow for gameplay input and that is fine**, because this is not the input path. It is the recovery path for an unannounced disappearance, which should be rare. Anything a player does continuously — moving, interacting — runs locally and is never waiting on a remote node.
@@ -839,9 +839,9 @@ Household isolation (`--isolate-lan`) is opt-in, verifies internet reachability 
 2. **Local rig** — *done*. Several nodes forming an overlay, gossiping membership, and noticing departures. `node/rig.sh` runs it and checks the result. Processes rather than containers for now: they share one host and reach each other trivially, so this tests the logic and nothing about real networks.
 3. **Job execution** — *done*. Sandboxed WebAssembly with a CPU ceiling, in `node/src/job.rs`. Sample jobs in `jobs/`, built by `jobs/build.sh`.
 4. **Checkpoint and migrate** — *done*. A job whose host disappears is continued by a survivor, from the last checkpoint. `node/migration-rig.sh` runs it and checks the result.
-4a. **Speculative resume** — *done, and measured on real boxes.* Run C (2026-09-24) put the visible gap at **1060 ms p95** against a 2651 ms baseline, with detection and resume unchanged. A standby begins continuing a suspected-gone owner's job from `detect/4` (500 ms) of silence, rather than waiting out the full detection window, so the visible gap should fall from the ~2.45 s Night A measured toward the resume budget alone. `node/migration-rig.sh` passes with speculation on (the default) and, now that `MESH_NODE_EXTRA` plumbs flags through to every node it starts, with `--speculate-after-ms 0` forcing it off — a flag that could not be turned off in the rig could not have been A/B tested on a box either. `sudo node/chaos-rig.sh 15` ran 17 disruptions (10 kill, 4 partition, 3 announced) with the same four counts at zero (orphaned, doubled, false alarms, unnoticed restarts) it has always required, plus a `SPECULATION` block of 14 started, 14 confirmed, 0 abandoned — exactly one suspicion per unannounced disruption and none during the announced ones, which is the answer to "does suspicion fire when nothing is wrong?" that loopback *can* give. The visible gap fell to p50 842 ms / p95 1199 ms: a real improvement on 2.45 s, but not the clean ~600 ms a 500 ms threshold implies, because the sweep that raises suspicion is periodic and can lag the threshold by up to its own interval before it fires. **These figures were re-derived from the same logs after a bug was fixed in the tool that produced them** (a takeover could borrow a later disruption's resume, which would have biased the gap optimistic). They did not move — not one number in this paragraph — because the rig fired its disruptions 33 s apart at the closest and the tool matches within a 30 s window, so no takeover here could reach the next one's evidence. That is the rig's pacing saving it, not the old tool being right. What loopback cannot answer — how often suspicion fires when nothing is wrong, *on a connection where things are sometimes slow or lost* — is what Run C was for. It ran on 2026-09-24: **0 false suspicions in 93**, but on two boxes sharing a switch, which has neither loss nor jitter, so that is the condition Run C could not make adverse. Run D takes it to a phone hotspot, where the condition is real rather than simulated.
+4a. **Speculative resume** — *done, and measured on real boxes.* Run C (2026-09-24) put the visible gap at **1060 ms p95** against a 2651 ms baseline, with detection and resume unchanged. A standby begins continuing a suspected-gone owner's job from `detect/4` (500 ms) of silence, rather than waiting out the full detection window, so the visible gap should fall from the ~2.45 s Night A measured toward the resume budget alone. `node/migration-rig.sh` passes with speculation on (the default) and, now that `MESH_NODE_EXTRA` plumbs flags through to every node it starts, with `--speculate-after-ms 0` forcing it off — a flag that could not be turned off in the rig could not have been A/B tested on a box either. `sudo node/chaos-rig.sh 15` ran 17 disruptions (10 kill, 4 partition, 3 announced) with the same four counts at zero (orphaned, doubled, false alarms, unnoticed restarts) it has always required, plus a `SPECULATION` block of 14 started, 14 confirmed, 0 abandoned — exactly one suspicion per unannounced disruption and none during the announced ones, which is the answer to "does suspicion fire when nothing is wrong?" that loopback *can* give. The visible gap fell to p50 842 ms / p95 1199 ms: a real improvement on 2.45 s, but not the clean ~600 ms a 500 ms threshold implies, because the sweep that raises suspicion is periodic and can lag the threshold by up to its own interval before it fires. **These figures were re-derived from the same logs after a bug was fixed in the tool that produced them** (a takeover could borrow a later disruption's resume, which would have biased the gap optimistic). They did not move — not one number in this paragraph — because the rig fired its disruptions 33 s apart at the closest and the tool matches within a 30 s window, so no takeover here could reach the next one's evidence. That is the rig's pacing saving it, not the old tool being right. What loopback cannot answer — how often suspicion fires when nothing is wrong, *on a connection where things are sometimes slow or lost* — is what Run C was for. It ran on 2026-09-24: **0 false suspicions in 93**, but on two boxes sharing a switch, which has neither loss nor jitter, so that is the condition Run C could not make adverse. **Run D took it to a phone hotspot on 2026-10-10 and the condition became real: 36 wrong suspicions in 73**, exited by `checkpoint` 28 and `heard-again` 8 — the latter being the cause `a6cdc78` was written for, firing in the field for the first time. The gap held at 1076 ms p95 across two carriers against Run C's 1060 ms on one switch, and the whole of the wrong suspicion cost 0.29% of the run's ticks.
 5. **Volunteer run** — *not run, and not currently possible.* The same binary on connections the operator does not own, measured against the stop criteria. **No volunteers are available** (2026-09-25), so this step has no path as written, and nothing that follows substitutes for it: three machines in one household, two of them on the same switch, are not ordinary people's machines on ordinary connections. Every conclusion Phase 0 reaches must say so.
-5a. **Run D** — the nearest the available rig reaches: `diamond` on broadband and `yoinkerz` on a phone hotspot, two carriers, speculation on. It answers the one question Run C could not — false suspicion on a link that genuinely loses and delays packets — and re-tests the visible gap across a real internet path against Run B's pre-speculation 2566 ms. It does not answer step 5.
+5a. **Run D** — *done, 2026-10-10.* The nearest the available rig reaches: `diamond` on broadband and `yoinkerz` on a phone hotspot, two carriers, speculation on. It answered the one question Run C could not — false suspicion on a link that genuinely loses and delays packets — and re-tested the visible gap across a real internet path against Run B's pre-speculation 2566 ms, which held at **1076 ms p95**. It also **met two of its own pre-declared failure conditions**: 17 false alarms and 19 yields the partitions do not explain, at a measured cost of 0.29% of the run's ticks and nothing a player could see. **It does not answer step 5**, and no result in it should be read as if it did.
 
 ## Run C: handover (2026-09-22) — run on 2026-09-24, results in the section after this one
 
@@ -932,7 +932,7 @@ The `*` after `.jsonl` is not decoration — a run this long can cross a mid-run
 
 93 suspicions, 92 confirmed by a real departure, **none abandoned**: speculation never once started work because of a peer that was fine. The single `unaccounted` is the startup stagger, where riverboat raised a suspicion one second into its own life while the two boxes were being armed 83 seconds apart.
 
-**The bound this puts on the false-suspicion rate is weak, and the link is the easiest one this design will ever run on.** Zero events across 16 node-hours gives, by the rule of three, a 95% upper bound of roughly **one false suspicion per 5 node-hours** — not a small number for a player. And two boxes on one switch have essentially no loss and no jitter, while the case `a6cdc78` was written for is a suspect on a *lossy* link whose heartbeats arrive and whose checkpoints do not. **Run C could not produce that condition, so the honest reading is "not measurable on this rig," not "does not happen."**
+**The bound this puts on the false-suspicion rate is weak, and the link is the easiest one this design will ever run on.** Zero events across 16 node-hours gives, by the rule of three, a 95% upper bound of roughly **one false suspicion per 5 node-hours** — not a small number for a player. And two boxes on one switch have essentially no loss and no jitter, while the case `a6cdc78` was written for is a suspect on a *lossy* link whose heartbeats arrive and whose checkpoints do not. **Run C could not produce that condition, so the honest reading is "not measurable on this rig," not "does not happen."** *(Run D produced it: 36 of 73, including the 8 `heard-again` exits this rig could not reach. See two sections down.)*
 
 ### What the next run should do differently
 
@@ -943,7 +943,7 @@ Three of the four things Run C measured were settled long before it ended. The v
 - **If more samples are wanted, shorten the fire interval.** Of 187 fires, 118 acted; 29 skips were the standby's own timer, 7 fell during partitions, and only **13 came from the settling gate** — so the 60-second settle is not the constraint, the 3–7 minute timer is.
 - **A long run is still worth doing occasionally as a soak**, for drift that only appears over hours — memory, descriptors, ledger growth — but that does not need a disruption every four minutes.
 
-## Run D: handover — not yet run (2026-10-10)
+## Run D: handover (2026-10-10) — run the same day, results in the section after this one
 
 **What this run tests, and it is two things.** Run C put the visible gap at 1060 ms p95 but on two boxes sharing a switch: a link with no loss and no jitter, which is exactly the condition `a6cdc78`'s speculation exit was written for and exactly what Run C could not produce. Run D puts `yoinkerz` on a phone hotspot and `diamond` on home broadband, two carriers and no rented infrastructure, so that:
 
@@ -1013,8 +1013,118 @@ systemctl show mesh-node -p IPIngressBytes -p IPEgressBytes   # on each box, bef
 
 Read `IPAccounting` **before** anything restarts the unit, because the counters reset with it. That is the number Run B could not get.
 
+## Run D: false suspicion on a real link, measured — 2026-10-10
+
+`diamond` on home broadband and `yoinkerz` on a phone hotspot, two carriers, no rented infrastructure, mesh `run-d`, speculation on, chaos armed 14:36–16:44 UTC. **23 disruptions, 2.1 h, and the job advanced 36,674 ticks without ever stopping.** Both questions the handover set were answered, and the second one answered against the prediction's hope rather than its fear.
+
+| | Baseline | **Run D** | Prediction, fixed before the run | Judged |
+|---|---|---|---|---|
+| Detection p95 | 2456 ms (Run B) | **2463 ms** (n=20) | unchanged | held — **2–3 s met** |
+| Resume p95 | 200 ms (Run B) | **200 ms** (n=18) | unchanged | held — **500 ms met** |
+| **Visible gap p95** | **2566 ms** (Run B) | **1076 ms** (n=18) | near Run C's 1060 ms | **landed, 16 ms off** |
+| Visible gap p50 | 2460 ms (Run B) | **831 ms** | | |
+| Orphaned / doubled / unnoticed restart | 0 | **0** | must stay 0 | held |
+| **False alarms** | 0 (Run B, Run C) | **17** | not predicted | **left zero** |
+| **Yields beyond the partitions** | 0 (Run B), 1 (Run C) | **19** of 23 | the failure condition | **met** |
+| False suspicion | 0 of 93 (Run C, on a switch) | **36 of 73** | expected non-zero | as predicted |
+| Data on the phone | 121.6 MB / 2.1 h (Run B) | **not measurable** — see below | ~120 MB | not obtained |
+
+### The 58% cut in the player's wait is not an artefact of the switch
+
+Run C measured the gap at 1060 ms p95 on two boxes sharing a switch. Run D measures **1076 ms p95 across two carriers** — 16 ms apart, on a path whose round trip is 85 times longer. Against the same two machines' own pre-speculation 2566 ms, the player's wait fell by **58%**, and as in Run C it no longer contains detection at all: the takeover arrives about 1.4 s *after* the work has already restarted elsewhere.
+
+This is the second time this plan has found the internet path contributing nothing measurable, and it is the stronger of the two. Run B's finding was about *detection*, a 2–3 s window that a 100 ms path disappears into. The gap is triggered by **500 ms of silence**, which is well inside what a mobile path can manufacture by itself — so there was a real reason to expect it to degrade, and it did not.
+
+### Round trip, for the record
+
+| | Run C (one switch) | **Run D (two carriers)** |
+|---|---|---|
+| RTT p50 | ~1 ms | **85 ms** |
+| RTT p95 | | **192 ms** |
+| RTT p99 | | **599 ms** |
+| RTT max | | **666 ms** |
+
+n=470 across both nodes inside the window. The tail matters more than the median: a single round trip at p99 is longer than the entire resume budget, which is why §"Two consequences of choosing 500 ms" insists the standby already hold the state. A design that fetched state after the failure would have missed the budget on this link in one hop.
+
+### Two of the pre-declared failure conditions were met
+
+The handover named three. It is worth quoting, because the temptation after a run is to re-read the condition until the result passes it:
+
+> **What would count as failure.** Any of the four counts leaving zero (orphaned, doubled, false-alarmed, unnoticed restart). Detection or resume moving off their established p95s. Or false suspicion causing **ownership churn** — yields beyond those the partitions explain — which is the form in which a wrong suspicion stops being free.
+
+**False alarms: 17.** A false alarm is a peer that went silent long enough to be declared gone and then came back *without having restarted* — it was never broken, the mesh only thought so. Chaos explains eight of the 25 returns in this run (4 partitions seen from both sides); the other 17 have no chaos action behind them at all. Time away, per observer: **p50 2546 ms, 11 of 17 over 2 s, 5 over 3 s, max 14,475 ms**, against a detection threshold of 2–3 s.
+
+**Yields beyond the partitions: 19.** 23 yields where 4 are explained. A yield is how two nodes that both believe they own the job settle it, so this is the churn condition, by name.
+
+**These are one phenomenon counted twice.** The hotspot produced dropouts of a third of a second to fourteen and a half seconds that no chaos action caused. Each long enough dropout is seen from both ends, both ends suspect the other, both ends start the job, and one of them yields. 17 false alarms and 19 excess yields are the two faces of roughly nine link events.
+
+### What the churn actually cost, which is the number the decision needs
+
+The condition is met and the mesh still never lost or doubled a tick. Every yield was settled by tick number, and the node that gave up was behind:
+
+| | Run B (no speculation) | Run C (switch) | **Run D (hotspot)** |
+|---|---|---|---|
+| Yields | 5 | 27 | **23** |
+| Tick deficit of the yielding node, p50 | 11 | 3 | **3** |
+| Tick deficit, max | 12 | 5 | **5** |
+
+- **Duplicated by yields:** 52 ticks.
+- **Discarded by wrong suspicions:** 55 ticks across 36 abandonments (p50 **1**, p95 5, max 8).
+- **Total wasted: 107 ticks of 36,674 — 0.29%.**
+
+Speculation also *reduced* the cost of a yield, which was not something this plan predicted: Run B's five yields each threw away 9–12 ticks, Run C's and Run D's throw away 0–5. A standby that has been advancing the job all along is close behind when the two owners meet, so there is less to discard.
+
+**So the honest statement is narrow and it is not reassuring by itself.** On a phone hotspot, the 2–3 s detection threshold thrashes — it migrates work for a peer that never left, about nine times in two hours, or **once every fourteen minutes**. What it cost here was 0.29% of the work and nothing a player could see, because this job is a deterministic simulation and §9.3 permits exactly this. The cost would not be 0.29% for work §9.3 excludes from speculation, and nothing in Run D measures that case.
+
+### The first real false suspicions, and what they validate
+
+Run C returned 0 abandoned of 93 suspicions and this plan said plainly that this was "not measurable on this rig," not "does not happen." Run D makes it measurable:
+
+| | |
+|---|---|
+| started | **73** suspicions acted on before any decision |
+| confirmed | **18** the owner really had gone |
+| abandoned | **36** the suspicion was wrong |
+| — `checkpoint`: the owner came back and kept the job | 28 |
+| — `heard-again`: the suspect was alive, its checkpoints lost | 8 |
+| ended by a yield | **12** two owners resolved instead |
+| unaccounted | **7** ended without an event |
+
+**`a6cdc78` has now run in the field in the condition it was written for.** That change gave speculation an exit for a suspect on a lossy link whose heartbeats arrive while its checkpoints do not — the `heard-again` cause, which fired 8 times here and could not fire once on a switch. The 28 `checkpoint` exits are the ordinary case: the owner reappeared with a newer checkpoint and the speculation stood itself down.
+
+**A node-side gap the tool now papers over.** The 12 "ended by a yield" speculations emit no abandonment event — a yield stands the speculation down without one. The tool infers them by looking forward for the node's next decision; the node should say so itself. Until `535afb8` these 12 sat in `unaccounted`, where they read as 19 speculations that ended in silence.
+
+### What the data figures are, and why there is no total
+
+**There is no total for this run and the method is at fault, not the measurement.** `IPAccounting=yes` was added to the unit for exactly this, but systemd's counters reset when the unit restarts, and chaos restarted the node **10 times on `diamond` and 11 on `yoinkerz`**. The figures read after the run cover only each box's last segment:
+
+| | bytes in | bytes out | segment | implies |
+|---|---|---|---|---|
+| `diamond` | 3,280,812 | 1,171,604 | last 27.0 min | ~9.9 MB/h |
+| `yoinkerz` | 1,794,533 | 3,701,839 | last 30.8 min | ~10.7 MB/h |
+
+Extrapolated, ~21 MB per node for the run — well under the 60 MB/h that Run B's phone-side figure implied, but **an extrapolation from a quarter of the run is not a measurement**, and the two cannot be compared anyway: Run B's 121.6 MB came from the phone's own counter, which totals everything the handset sent, while these count one service's sockets. The phone-side figure was not captured this time.
+
+The fix is already written down as a follow-up: count on something that outlives a restart — a parent slice, or `nft` counters on UDP 4001 — rather than per-service accounting on a unit that chaos exists to kill.
+
+### Two counts in this section were wrong when first read, and the correction moved nothing else
+
+First read, Run D reported **2 orphaned jobs** and **19 unaccounted speculations**. Both were reporting faults in `takeover-summary.py`, fixed with tests in `535afb8`:
+
+- The two "orphans" were disruptions of a node that believed it owned the job *while the other machine was already advancing it* — 300 ticks a minute, unbroken, straight through both. No takeover was needed because nothing had stopped. The summary now names it: `kept going: kill of yoinkerz — diamond never stopped working`.
+- 12 of the 19 unaccounted speculations were the yields described above.
+
+**Re-read through the corrected tool, Night A run 2, Run B and Run C did not move by one number.** That is the check `277f534` exists for: a tool fix that moves only the case it was written for is a fix, and one that moves everything is a new bug.
+
+**One suspicion of mine about this section's largest number was wrong.** I thought the false-alarm count was inflated — that the partition excuse matched on *duration*, forgiving Run B's 37-second outages while counting Run D's 5-second ones. It does not; the excuse requires an actual partition action overlapping the return. Run B had 5 partitions × 2 sides = exactly its 10 returns, which is why its count is 0. Run D's 17 are real. The finding is larger than I first reported, not smaller.
+
+### What Run D is not
+
+**It is not step 5.** Two internet connections in one household, both machines owned and administered by the operator, one of them a laptop carried to a hotspot for the afternoon. It is the nearest the available rig reaches to a volunteer run and it is not one. **Phase 0 results remain an upper bound**, and this run moves the bound on one axis only: the link is now genuinely lossy, while the machines are still dedicated and still the operator's.
+
 ## Open decisions
 
 - **The rendezvous fallback**, if no volunteer turns out to be directly reachable. Manual invite exchange covers address distribution but not simultaneous-transmission timing.
 - ~~**The threshold for an acceptable stall**~~ — settled 2026-08-21: 2–3 s detection, 500 ms resume, at p95.
 - **How many volunteers** the go/no-go can honestly rest on, given three is enough to detect a problem class but not to estimate its frequency.
+- **Whether the detection window should be fixed or per-link.** Run D showed 2–3 s thrashing on a phone hotspot — work migrating for a peer that never left, once every fourteen minutes. The threshold stays as fixed on 2026-08-21, because changing a criterion after seeing the measurement is the thing this plan refuses to do. But the measurement is now in hand, and the question it raises is open: a single global window is set by the worst link any player has, the same shape of problem as the keepalive interval in step 1a. Deciding it needs a case where wrong suspicion is *not* free — work §9.3 excludes from speculation — and Run D did not measure that.
