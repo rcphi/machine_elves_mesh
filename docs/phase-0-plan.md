@@ -551,9 +551,9 @@ That is the same asymmetry as everything else here — not everyone bridges addr
 
 **Phase 0's question is answered, and by a plainer route than expected.** Ordinary home machines form a mesh across the internet with no rented infrastructure, provided one of them asks its router for a door — and consumer routers say yes.
 
-### Still owed
+### Still owed — *settled 2026-08-23*
 
-**The mapping expires in an hour.** The node must renew it, the way it already keeps NAT mappings alive with keepalives. Until it does, a long-running node silently stops being reachable, which is precisely the failure that is hardest to notice.
+**The mapping expires in an hour.** The node must renew it, the way it already keeps NAT mappings alive with keepalives. Until it does, a long-running node silently stops being reachable, which is precisely the failure that is hardest to notice. ***Built** in `3362a50` and `c04a118`: `portmap::RENEW_EVERY` renews every fifteen minutes, spawned rather than awaited so a failing renewal fits inside the detection window, and a renewal that stops succeeding is reported rather than swallowed. The table below already said "held open by renewal"; this section had not been updated to match. Field evidence: `diamond` has held port 4001 across four multi-hour runs, including 8.7 hours on 2026-09-13 and two eight-hour chaos runs.*
 
 ## Work migrated across two carriers — 2026-08-23
 
