@@ -1,0 +1,89 @@
+#!/usr/bin/env python3
+"""Keeps diamond's LTE management link up, and fences the tunnel user onto it.
+
+    mesh-backchannel-link           fence, then connect the modem and apply its address
+    mesh-backchannel-link --fence   fence only: run before every start of the tunnel
+
+The fence is what makes the back channel management-only. The `backchannel`
+user's IPv4 traffic looks up table 4302 and nothing else; that table holds a
+default route out the LTE interface and, beneath it, an `unreachable` default,
+so a lookup with LTE down fails here instead of falling through to the main
+table and leaving by eno1. Its IPv6 is prohibited outright. Nothing is ever
+added to the main table, so no other process can reach LTE.
+
+Design: docs/superpowers/specs/2026-11-05-lte-backchannel-design.md
+"""
+import re
+from dataclasses import dataclass
+
+USER = "backchannel"
+CONFIG = "/etc/mesh-backchannel/config"
+TABLE = "4302"
+PRIORITY = "1000"
+ROUTE_METRIC = "100"
+UNREACHABLE_METRIC = "65535"
+# LTE paths commonly carry less than 1500; too large a value shows up as an
+# SSH session that hangs on large output, which is a miserable thing to debug
+# over the very link that is misbehaving.
+DEFAULT_MTU = 1428
+
+LIST_ITEM = re.compile(r"^(.*)\.value\[(\d+)\]$")
+
+
+def parse_keyed(text):
+    """`mmcli -K` output as {key: value}. A `x.length` / `x.value[n]` family
+    becomes a list under `x`; mmcli prints `--` for empty."""
+    out, lists = {}, {}
+    for line in text.splitlines():
+        key, sep, value = line.partition(":")
+        if not sep:
+            continue
+        key, value = key.strip(), value.strip()
+        if value == "--":
+            value = ""
+        item = LIST_ITEM.match(key)
+        if item:
+            lists.setdefault(item.group(1), []).append((int(item.group(2)), value))
+        elif key.endswith(".length"):
+            lists.setdefault(key[: -len(".length")], [])
+        else:
+            out[key] = value
+    for key, items in lists.items():
+        out[key] = [value for _, value in sorted(items)]
+    return out
+
+
+def as_list(value):
+    """mmcli prints an empty list as a scalar `--`, which parses to ""."""
+    if isinstance(value, list):
+        return [v for v in value if v]
+    return [value] if value else []
+
+
+def modem_path(modem_list):
+    paths = as_list(modem_list.get("modem-list", []))
+    return paths[0] if paths else None
+
+
+def bearer_paths(modem):
+    return as_list(modem.get("modem.generic.bearers", []))
+
+
+@dataclass(frozen=True)
+class Link:
+    interface: str
+    address: str
+    prefix: str
+    mtu: int
+
+
+def connected_link(bearer):
+    if bearer.get("bearer.status.connected") != "yes":
+        return None
+    interface = bearer.get("bearer.status.interface", "")
+    address = bearer.get("bearer.ipv4-config.address", "")
+    prefix = bearer.get("bearer.ipv4-config.prefix", "")
+    if not (interface and address and prefix):
+        return None
+    mtu = bearer.get("bearer.ipv4-config.mtu", "")
+    return Link(interface, address, prefix, int(mtu) if mtu.isdigit() else DEFAULT_MTU)
