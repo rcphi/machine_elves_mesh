@@ -13,6 +13,7 @@ added to the main table, so no other process can reach LTE.
 
 Design: docs/superpowers/specs/2026-11-05-lte-backchannel-design.md
 """
+import json
 import re
 from dataclasses import dataclass
 
@@ -87,3 +88,44 @@ def connected_link(bearer):
         return None
     mtu = bearer.get("bearer.ipv4-config.mtu", "")
     return Link(interface, address, prefix, int(mtu) if mtu.isdigit() else DEFAULT_MTU)
+
+
+def fence_commands(uid):
+    """The floor first, so the rule never points at an empty table: an empty
+    table falls through to main, and main leaves by eno1."""
+    uids = f"{uid}-{uid}"
+    return [
+        ["ip", "route", "replace", "unreachable", "default",
+         "metric", UNREACHABLE_METRIC, "table", TABLE],
+        ["ip", "rule", "add", "uidrange", uids, "lookup", TABLE, "priority", PRIORITY],
+        ["ip", "-6", "rule", "add", "uidrange", uids, "prohibit", "priority", PRIORITY],
+    ]
+
+
+def parse_addresses(ip_json):
+    addresses = []
+    for iface in json.loads(ip_json or "[]"):
+        for info in iface.get("addr_info", []):
+            if info.get("family") == "inet":
+                addresses.append(f"{info['local']}/{info['prefixlen']}")
+    return addresses
+
+
+def link_commands(link, current):
+    """`noprefixroute` because the kernel otherwise adds the carrier's subnet
+    to the main table, which is a route via LTE that every process can see.
+    IPv6 off because a router advertisement from the carrier would put a
+    default IPv6 route via LTE into main by itself."""
+    want = f"{link.address}/{link.prefix}"
+    iface = link.interface
+    commands = [
+        ["sysctl", "-qw", f"net.ipv6.conf.{iface}.disable_ipv6=1"],
+        ["ip", "link", "set", "dev", iface, "up", "mtu", str(link.mtu)],
+    ]
+    commands += [["ip", "addr", "del", stale, "dev", iface] for stale in current if stale != want]
+    commands += [
+        ["ip", "addr", "replace", want, "dev", iface, "noprefixroute"],
+        ["ip", "route", "replace", "default", "dev", iface,
+         "metric", ROUTE_METRIC, "table", TABLE],
+    ]
+    return commands
