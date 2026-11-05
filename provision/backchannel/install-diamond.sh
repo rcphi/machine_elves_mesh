@@ -1,0 +1,84 @@
+#!/usr/bin/env bash
+#
+# diamond's half of its LTE back channel.
+#
+#   sudo ./install-diamond.sh            # user, key, files, units; prints the key for riverboat
+#   sudo ./install-diamond.sh --start    # once riverboat has the key: enable link and tunnel
+#   sudo ./install-diamond.sh --remove   # stop and remove units, routes and rules; keeps the user and key
+#
+# Expects, beside itself: mesh-backchannel-link, mesh-backchannel-link.service,
+# mesh-backchannel-link.timer, mesh-backchannel.service.in, config,
+# riverboat-host-key.pub. Design:
+# docs/superpowers/specs/2026-11-05-lte-backchannel-design.md
+set -euo pipefail
+
+DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
+ETC=/etc/mesh-backchannel
+HOME_DIR=/var/lib/backchannel
+BIN=/usr/local/sbin/mesh-backchannel-link
+UNITS=/etc/systemd/system
+
+[[ $EUID -eq 0 ]] || { echo "run me with sudo" >&2; exit 1; }
+
+case "${1:-}" in
+--remove)
+    systemctl disable --now mesh-backchannel.service mesh-backchannel-link.timer 2>/dev/null || true
+    rm -f "$UNITS/mesh-backchannel.service" "$UNITS/mesh-backchannel-link.service" \
+          "$UNITS/mesh-backchannel-link.timer" "$BIN"
+    systemctl daemon-reload
+    if uid="$(id -u backchannel 2>/dev/null)"; then
+        ip rule del uidrange "$uid-$uid" lookup 4302 priority 1000 2>/dev/null || true
+        ip -6 rule del uidrange "$uid-$uid" prohibit priority 1000 2>/dev/null || true
+    fi
+    ip route flush table 4302 2>/dev/null || true
+    echo "removed. Kept: user backchannel, its key, $ETC."
+    echo "The modem stays connected until: mmcli -m any --simple-disconnect"
+    exit 0 ;;
+--start)
+    [[ -f "$ETC/known_hosts" && -x "$BIN" ]] || { echo "install first: sudo $0" >&2; exit 1; }
+    systemctl enable --now mesh-backchannel-link.timer
+    systemctl start mesh-backchannel-link.service
+    systemctl enable --now mesh-backchannel.service
+    systemctl --no-pager status mesh-backchannel.service | head -5
+    exit 0 ;;
+"") ;;
+*) echo "usage: $0 [--start | --remove]" >&2; exit 1 ;;
+esac
+
+for f in mesh-backchannel-link mesh-backchannel-link.service mesh-backchannel-link.timer \
+         mesh-backchannel.service.in config riverboat-host-key.pub; do
+    [[ -f "$DIR/$f" ]] || { echo "missing beside me: $f" >&2; exit 1; }
+done
+
+id backchannel &>/dev/null ||
+    adduser --system --group --home "$HOME_DIR" --shell /usr/sbin/nologin backchannel
+install -d -m 0700 -o backchannel -g backchannel "$HOME_DIR/.ssh"
+[[ -f "$HOME_DIR/.ssh/id_ed25519" ]] ||
+    sudo -u backchannel ssh-keygen -q -t ed25519 -N "" -C backchannel@diamond -f "$HOME_DIR/.ssh/id_ed25519"
+
+install -d -m 0755 "$ETC"
+[[ -f "$ETC/config" ]] || install -m 0644 "$DIR/config" "$ETC/config"
+# shellcheck source=config
+. "$ETC/config"
+for v in HOME_ADDR HOME_PORT LISTEN_PORT; do
+    [[ -n "${!v:-}" ]] || { echo "$ETC/config sets no $v" >&2; exit 1; }
+done
+printf '[%s]:%s %s\n' "$HOME_ADDR" "$HOME_PORT" "$(cut -d' ' -f1,2 "$DIR/riverboat-host-key.pub")" \
+    > "$ETC/known_hosts"
+chmod 0644 "$ETC/known_hosts"
+
+install -m 0755 "$DIR/mesh-backchannel-link" "$BIN"
+install -m 0644 "$DIR/mesh-backchannel-link.service" "$DIR/mesh-backchannel-link.timer" "$UNITS/"
+sed -e "s/@HOME_ADDR@/$HOME_ADDR/g" -e "s/@HOME_PORT@/$HOME_PORT/g" -e "s/@LISTEN_PORT@/$LISTEN_PORT/g" \
+    "$DIR/mesh-backchannel.service.in" > "$UNITS/mesh-backchannel.service"
+systemctl daemon-reload
+systemd-analyze verify "$UNITS/mesh-backchannel.service" "$UNITS/mesh-backchannel-link.service" \
+    "$UNITS/mesh-backchannel-link.timer"
+
+# Running the script once with no tunnel yet checks the fence and the link now
+# rather than at the first timer tick.
+"$BIN" || echo "link not up yet (see above); the fence is in place either way" >&2
+
+echo
+echo "Give this to riverboat as diamond-backchannel.pub, then: sudo $0 --start"
+cat "$HOME_DIR/.ssh/id_ed25519.pub"
