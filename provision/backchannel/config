@@ -1,0 +1,7 @@
+# /etc/mesh-backchannel/config — read by mesh-backchannel-link and by
+# install-diamond.sh, which writes the tunnel unit from it. Edit, then re-run
+# install-diamond.sh so the unit picks up a changed address.
+APN=vzwinternet
+HOME_ADDR=204.210.210.200
+HOME_PORT=2302
+LISTEN_PORT=2201
