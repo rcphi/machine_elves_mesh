@@ -11,3 +11,13 @@ network:
     eno1:
       dhcp4: true
       dhcp6: true
+      # Kept from the installer's config as backups, beside whatever the local
+      # router offers. systemd-resolved moves to the next server when one stops
+      # answering, so a friend's router with broken DNS does not cost the box
+      # its clock: timesyncd finds its servers by name, and every measurement
+      # is a timestamp. The mesh and the back channel dial by address and do
+      # not need DNS at all.
+      nameservers:
+        addresses:
+          - 208.67.222.222
+          - 8.8.8.8
