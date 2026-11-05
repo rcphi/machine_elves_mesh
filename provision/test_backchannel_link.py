@@ -257,5 +257,44 @@ class Config(unittest.TestCase):
                          {"APN": "vzwinternet", "HOME_PORT": "2302"})
 
 
+class ReversePathFiltering(unittest.TestCase):
+    def test_replies_arriving_on_lte_are_not_dropped_as_martians(self):
+        # The kernel checks an incoming packet's source against the main
+        # table as uid 0, so the tunnel user's rule never applies; with no
+        # route home in main (the friend's network down), loose rp_filter
+        # drops the tunnel's replies. Set on the interface every run,
+        # because the name changes and udev resets it on a new device.
+        self.assertIn(["sysctl", "-qw", "net.ipv4.conf.wwp0s20f0u8i5.rp_filter=0"],
+                      link.link_commands(LINK, []))
+
+
+def shipped(name):
+    with open(os.path.join(HERE, "backchannel", name)) as f:
+        return f.read()
+
+
+class WhatShipsToTheBoxes(unittest.TestCase):
+    def test_all_rp_filter_is_relaxed_so_the_interface_value_counts(self):
+        # The effective value is max(all, interface); Ubuntu sets all=2.
+        self.assertIn("net.ipv4.conf.all.rp_filter = 0", shipped("60-mesh-backchannel.sysctl.conf"))
+
+    def test_networkd_does_not_delete_the_fence_as_foreign(self):
+        conf = shipped("60-mesh-backchannel.networkd.conf")
+        self.assertIn("ManageForeignRoutingPolicyRules=no", conf)
+        self.assertIn("ManageForeignRoutes=no", conf)
+
+    def test_install_diamond_installs_both(self):
+        script = shipped("install-diamond.sh")
+        self.assertIn("60-mesh-backchannel.sysctl.conf", script)
+        self.assertIn("60-mesh-backchannel.networkd.conf", script)
+
+    def test_the_tunnel_may_never_use_the_friends_ethernet(self):
+        self.assertIn("RestrictNetworkInterfaces=~eno1", shipped("mesh-backchannel.service.in"))
+
+    def test_the_key_cannot_forward_into_the_home_lan(self):
+        self.assertIn('permitopen="127.0.0.1:1"', shipped("install-riverboat.sh"))
+        self.assertIn("PermitOpen none", shipped("40-backchannel.conf"))
+
+
 if __name__ == "__main__":
     unittest.main()

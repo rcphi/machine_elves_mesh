@@ -1182,6 +1182,7 @@ Co-Authored-By: Claude Opus 5.5 <noreply@anthropic.com>"
 cd /home/ubuntu/workspace/machine_elves_mesh/provision/backchannel
 scp -q mesh-backchannel-link mesh-backchannel-link.service mesh-backchannel-link.timer \
        mesh-backchannel.service.in config riverboat-host-key.pub install-diamond.sh \
+       60-mesh-backchannel.sysctl.conf 60-mesh-backchannel.networkd.conf \
        rpc@192.168.50.48:backchannel/
 ssh rpc@192.168.50.48 'cd ~/backchannel && sha256sum *' ; sha256sum *
 ```
@@ -1217,10 +1218,20 @@ ssh -t rpc@192.168.50.48 'cd ~/backchannel && sudo ./install-diamond.sh --start'
 
 Expected: riverboat prints `riverboat ready…`, and diamond's tunnel shows `active (running)`.
 
+Then read sshd's *effective* settings for the user, not just the syntax check (added after the branch review):
+
+```bash
+ssh -t rpc@192.168.50.128 'sudo sshd -T -C user=backchannel,host=x,addr=203.0.113.1 | grep -Ei "^(allowtcpforwarding|permitlisten|permitopen|permittty|forcecommand) "'
+```
+
+Expected: `allowtcpforwarding remote`, `permitlisten localhost:2201`, `permitopen none`, `permittty no`, `forcecommand /usr/sbin/nologin`.
+
 - [ ] **Step 5: Agent runs the read-only checks**
 
 ```bash
-ssh rpc@192.168.50.48 'U=$(id -u backchannel)
+ssh rpc@192.168.50.48 'U=$(id -u backchannel); I=$(ip -br link | awk "/^wwp/{print \$1}")
+ echo "rp_filter all/eno1/lte: $(sysctl -n net.ipv4.conf.all.rp_filter)/$(sysctl -n net.ipv4.conf.eno1.rp_filter)/$(sysctl -n net.ipv4.conf.$I.rp_filter)"
+ echo "unit limit: $(systemctl show -p RestrictNetworkInterfaces mesh-backchannel.service)"
  echo "main:   $(ip route get 1.1.1.1 | head -1)"
  echo "fenced: $(ip route get 204.210.210.200 uid $U | head -1)"
  echo "rules4: $(ip rule show | grep -c uidrange)  rules6: $(ip -6 rule show | grep -c uidrange)"
@@ -1231,6 +1242,8 @@ ssh -J rpc@192.168.50.128 -p 2201 rpc@localhost 'hostname; echo "came in over: $
 ```
 
 Expected:
+- `rp_filter all/eno1/lte: 0/2/0`, so eno1 stays loose and LTE replies aren't dropped;
+- `unit limit` names `eno1`, as a deny-list;
 - `main` is via `dev eno1`;
 - `fenced` is `dev wwp…`;
 - `rules4: 1 rules6: 1`, which confirms on this kernel that the minute-by-minute `ip rule add` does not pile up rules;
@@ -1257,13 +1270,21 @@ ssh -t rpc@192.168.50.48 'I=$(ip -br link | awk "/^wwp/{print \$1}")
 
 Expected: both captures end at the timeout having captured **0 packets**.
 
+Then check that the fence survives networkd reconfiguring, which is what a package upgrade or `netplan apply` does:
+
+```bash
+ssh -t rpc@192.168.50.48 'sudo systemctl restart systemd-networkd; sleep 5; ip rule show | grep uidrange; ip -6 rule show | grep uidrange; ip route show table 4302'
+```
+
+Expected: the IPv4 `lookup 4302` rule, the IPv6 `prohibit` rule, and both routes in table 4302 (`default dev wwp… metric 100` and `unreachable default metric 65535`), all still present.
+
 - [ ] **Step 7: Operator runs the failure checks**
 
 1. **The fence holds with LTE down.**
    ```bash
    ssh -t rpc@192.168.50.48 'sudo mmcli -m any --simple-disconnect; sudo ip route del default dev $(ip -br link | awk "/^wwp/{print \$1}") table 4302; ip route get 204.210.210.200 uid $(id -u backchannel)'
    ```
-   Expected: `unreachable`, never `dev eno1`. Within a minute the timer reconnects, and the tunnel is back within about 3 minutes.
+   Expected: `RTNETLINK answers: No route to host`, which is the `unreachable` floor answering, and never `dev eno1`. Within a minute the timer reconnects, and the tunnel is back within about 3 minutes.
 2. **The friend's network vanishes.** Pull diamond's ethernet cable. From lightning, run `ssh -J rpc@192.168.50.128 -p 2201 rpc@localhost hostname`. Expected: `diamond`. The jump through riverboat still works, because riverboat is reached on the home LAN and diamond over LTE.
 3. **Reboot.** Run `ssh -t rpc@192.168.50.48 'sudo reboot'`, wait 3 minutes, then repeat the `ssh -J` command. Expected: `diamond`.
 4. **Key limits on riverboat**, run on diamond as the tunnel user:
@@ -1274,6 +1295,17 @@ Expected: both captures end at the timeout having captured **0 packets**.
     sudo -u backchannel timeout 15 ssh $K -N -o ExitOnForwardFailure=yes -R localhost:2299:localhost:22 backchannel@204.210.210.200; echo "-R other port: $?"'
    ```
    Expected: no `id` output (the shell is refused); a `-L` connection to `localhost:9999` is refused when tried during those 8 s; and `-R` on 2299 exits with `remote port forwarding failed`.
+5. **The unit limit holds with the fence gone.** This proves `RestrictNetworkInterfaces=~eno1` works on its own: with the routing rule deleted and the timer stopped, the tunnel's keepalives would route by main and leave by eno1 if anything let them.
+   ```bash
+   ssh -t rpc@192.168.50.48 'U=$(id -u backchannel)
+    sudo systemctl stop mesh-backchannel-link.timer
+    sudo ip rule del uidrange $U-$U lookup 4302 priority 1000
+    echo "fence removed; 75 s capture on eno1 (expect 0 packets)"
+    sudo timeout 75 tcpdump -ni eno1 tcp port 2302
+    sudo systemctl start mesh-backchannel-link.service mesh-backchannel-link.timer
+    ip rule show | grep uidrange'
+   ```
+   Expected: **0 packets** captured, a keepalive interval having passed, and the rule back at the end. The tunnel may then restart once and re-fence itself through `ExecStartPre`; the `ssh -J` command works again within about 3 minutes.
 
 - [ ] **Step 8: Record it in the plan, and commit**
 

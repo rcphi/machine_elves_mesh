@@ -20,6 +20,11 @@ ExecStart=/usr/bin/ssh -N -T \
 # forwarded connections land. Nothing else.
 IPAddressDeny=any
 IPAddressAllow=localhost @HOME_ADDR@
+# A third, also independent of routing, in the direction that matters most:
+# whatever happens to the fence, this process cannot send or receive on the
+# friend's ethernet. A deny-list of eno1, because the LTE name changes and an
+# allow-list would have to name it.
+RestrictNetworkInterfaces=~eno1
 Restart=always
 RestartSec=30
 

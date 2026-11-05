@@ -8,7 +8,8 @@
 #
 # Expects, beside itself: mesh-backchannel-link, mesh-backchannel-link.service,
 # mesh-backchannel-link.timer, mesh-backchannel.service.in, config,
-# riverboat-host-key.pub. Design:
+# riverboat-host-key.pub, 60-mesh-backchannel.sysctl.conf,
+# 60-mesh-backchannel.networkd.conf. Design:
 # docs/superpowers/specs/2026-11-05-lte-backchannel-design.md
 set -euo pipefail
 
@@ -31,6 +32,9 @@ case "${1:-}" in
         ip -6 rule del uidrange "$uid-$uid" prohibit priority 1000 2>/dev/null || true
     fi
     ip route flush table 4302 2>/dev/null || true
+    rm -f /etc/sysctl.d/60-mesh-backchannel.conf /etc/systemd/networkd.conf.d/60-mesh-backchannel.conf
+    sysctl --system -q
+    systemctl restart systemd-networkd
     echo "removed. Kept: user backchannel, its key, $ETC."
     echo "The modem stays connected until: mmcli -m any --simple-disconnect"
     exit 0 ;;
@@ -46,7 +50,8 @@ case "${1:-}" in
 esac
 
 for f in mesh-backchannel-link mesh-backchannel-link.service mesh-backchannel-link.timer \
-         mesh-backchannel.service.in config riverboat-host-key.pub; do
+         mesh-backchannel.service.in config riverboat-host-key.pub \
+         60-mesh-backchannel.sysctl.conf 60-mesh-backchannel.networkd.conf; do
     [[ -f "$DIR/$f" ]] || { echo "missing beside me: $f" >&2; exit 1; }
 done
 
@@ -66,6 +71,14 @@ done
 printf '[%s]:%s %s\n' "$HOME_ADDR" "$HOME_PORT" "$(cut -d' ' -f1,2 "$DIR/riverboat-host-key.pub")" \
     > "$ETC/known_hosts"
 chmod 0644 "$ETC/known_hosts"
+
+# Before the fence exists: networkd must stop treating it as foreign before
+# anything creates it, and a restart is how networkd.conf changes take effect.
+install -m 0644 "$DIR/60-mesh-backchannel.sysctl.conf" /etc/sysctl.d/60-mesh-backchannel.conf
+sysctl -q -p /etc/sysctl.d/60-mesh-backchannel.conf
+install -d -m 0755 /etc/systemd/networkd.conf.d
+install -m 0644 "$DIR/60-mesh-backchannel.networkd.conf" /etc/systemd/networkd.conf.d/60-mesh-backchannel.conf
+systemctl restart systemd-networkd
 
 install -m 0755 "$DIR/mesh-backchannel-link" "$BIN"
 install -m 0644 "$DIR/mesh-backchannel-link.service" "$DIR/mesh-backchannel-link.timer" "$UNITS/"

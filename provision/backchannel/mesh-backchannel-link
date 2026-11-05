@@ -123,6 +123,14 @@ def link_commands(link, current):
     iface = link.interface
     commands = [
         ["sysctl", "-qw", f"net.ipv6.conf.{iface}.disable_ipv6=1"],
+        # The kernel checks an arriving packet's source against the main table
+        # as uid 0, so the tunnel user's rule never applies to that check. With
+        # no route home in main - the friend's network down, the one case this
+        # link exists for - the tunnel's replies would be dropped as martians.
+        # Set every run: the name changes, and udev resets it on a new device.
+        # It only counts because 60-mesh-backchannel.sysctl.conf sets all=0;
+        # the effective value is max(all, interface).
+        ["sysctl", "-qw", f"net.ipv4.conf.{iface}.rp_filter=0"],
         ["ip", "link", "set", "dev", iface, "up", "mtu", str(link.mtu)],
     ]
     commands += [["ip", "addr", "del", stale, "dev", iface] for stale in current if stale != want]

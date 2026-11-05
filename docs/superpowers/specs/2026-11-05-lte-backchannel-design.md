@@ -153,6 +153,15 @@ silent fallback the contamination rule names.
 and every other process route as they do today, and they cannot reach LTE
 because no route they will ever look up points at it.
 
+### Two things on the box that would undo the fence
+
+*Added 2026-11-05 after the branch review, before anything was installed.*
+
+- **Reverse-path filtering.** The kernel checks an arriving packet's source against the main table *as uid 0*, so the tunnel user's rule never applies to that check. While eno1 has a default route the check passes, but with no route home in main — the friend's network down, the one case this exists for — the tunnel's replies are dropped as martians. The reviewer reproduced this in a network namespace on diamond's kernel. Fix: `rp_filter=0` on the LTE interface, set every run, plus `net.ipv4.conf.all.rp_filter = 0` in `/etc/sysctl.d/60-mesh-backchannel.conf`, because the effective value is max(all, interface) and Ubuntu sets all=2. eno1 keeps its own 2.
+- **networkd deletes foreign rules and routes.** With its defaults (`ManageForeignRoutingPolicyRules=yes`, `ManageForeignRoutes=yes`), systemd-networkd removes every rule and route it did not create whenever it starts or reconfigures: a package upgrade, a `netplan apply`. That deletes the fence, and until the next minute's run the tunnel user routes by main and leaves by eno1. Fix: `/etc/systemd/networkd.conf.d/60-mesh-backchannel.conf` turns both off, installed and applied before the fence first exists.
+
+**And a third limit, independent of routing:** `RestrictNetworkInterfaces=~eno1` on the tunnel unit, so whatever happens to the fence, the tunnel process cannot use the friend's ethernet. This first draft rejected `RestrictNetworkInterfaces=` because the LTE name changes. A deny-list of the stable name `eno1` avoids that objection, and it covers exactly the direction the networkd finding threatened.
+
 ### 3. The link
 
 `provision/backchannel/mesh-backchannel-link` (Python, standard library only,
@@ -323,10 +332,6 @@ there counts.
   path. Revisit if the address moves.
 - **`riverboat` or home internet being down.** That leaves no way in. With one
   jump host this is unavoidable, and accepted.
-- **`RestrictNetworkInterfaces=`** in the unit would be a third limit. It is not
-  used unless this box's systemd is verified to accept an interface name that
-  changes. A limit that quietly accepts a pattern it does not support is
-  worse than none.
 
 ## Unknowns the first manual connect answers
 
