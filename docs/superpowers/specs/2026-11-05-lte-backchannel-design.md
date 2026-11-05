@@ -193,9 +193,18 @@ down,** because `wwp0s20f0u8i5` encodes the USB port.
 A thin runner executes the commands. The fixtures are real `mmcli` output,
 captured from this modem on its first manual connect.
 
-`systemd-networkd` leaves the LTE interface alone, because no `.network` file
-matches it. ModemManager connects the bearer but does not configure the IP
-itself.
+`systemd-networkd` must leave the LTE interface alone, and **on this box it
+does not by default.** *Corrected 2026-11-05 in Task 8.* This first said no
+`.network` file matches the interface. The install found otherwise: dracut
+leaves a catch-all, `/run/systemd/network/zzzz-dracut-default.network`, which
+runs DHCP on every link that is not loopback. networkd took a DHCP lease on
+the modem and put an LTE default route into the main table at metric 1024,
+one eno1 failure away from carrying everything. It also handed the carrier's
+DNS servers to resolved, which then sent some name lookups over LTE.
+`/etc/systemd/network/10-mesh-backchannel-wwan.network` matches `Type=wwan`
+and sets `Unmanaged=yes`. It sorts first, and networkd uses the first file
+that matches. ModemManager connects the bearer; this script alone configures
+its IP.
 
 ### 4. The tunnel
 

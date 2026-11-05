@@ -288,6 +288,16 @@ class WhatShipsToTheBoxes(unittest.TestCase):
         self.assertIn("60-mesh-backchannel.sysctl.conf", script)
         self.assertIn("60-mesh-backchannel.networkd.conf", script)
 
+    def test_networkd_never_runs_dhcp_on_the_modem(self):
+        # Found on the box in Task 8: dracut leaves a catch-all .network in
+        # /run that runs DHCP on every link, the modem included. That put an
+        # LTE default route in main (metric 1024, one eno1 failure from
+        # carrying everything) and the carrier's DNS servers into resolved.
+        conf = shipped("10-mesh-backchannel-wwan.network")
+        self.assertIn("Type=wwan", conf)
+        self.assertIn("Unmanaged=yes", conf)
+        self.assertIn("10-mesh-backchannel-wwan.network", shipped("install-diamond.sh"))
+
     def test_the_tunnel_may_never_use_the_friends_ethernet(self):
         self.assertIn("RestrictNetworkInterfaces=~eno1", shipped("mesh-backchannel.service.in"))
 

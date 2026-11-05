@@ -9,7 +9,7 @@
 # Expects, beside itself: mesh-backchannel-link, mesh-backchannel-link.service,
 # mesh-backchannel-link.timer, mesh-backchannel.service.in, config,
 # riverboat-host-key.pub, 60-mesh-backchannel.sysctl.conf,
-# 60-mesh-backchannel.networkd.conf. Design:
+# 60-mesh-backchannel.networkd.conf, 10-mesh-backchannel-wwan.network. Design:
 # docs/superpowers/specs/2026-11-05-lte-backchannel-design.md
 set -euo pipefail
 
@@ -32,7 +32,8 @@ case "${1:-}" in
         ip -6 rule del uidrange "$uid-$uid" prohibit priority 1000 2>/dev/null || true
     fi
     ip route flush table 4302 2>/dev/null || true
-    rm -f /etc/sysctl.d/60-mesh-backchannel.conf /etc/systemd/networkd.conf.d/60-mesh-backchannel.conf
+    rm -f /etc/sysctl.d/60-mesh-backchannel.conf /etc/systemd/networkd.conf.d/60-mesh-backchannel.conf \
+          /etc/systemd/network/10-mesh-backchannel-wwan.network
     sysctl --system -q
     systemctl restart systemd-networkd
     echo "removed. Kept: user backchannel, its key, $ETC."
@@ -51,7 +52,8 @@ esac
 
 for f in mesh-backchannel-link mesh-backchannel-link.service mesh-backchannel-link.timer \
          mesh-backchannel.service.in config riverboat-host-key.pub \
-         60-mesh-backchannel.sysctl.conf 60-mesh-backchannel.networkd.conf; do
+         60-mesh-backchannel.sysctl.conf 60-mesh-backchannel.networkd.conf \
+         10-mesh-backchannel-wwan.network; do
     [[ -f "$DIR/$f" ]] || { echo "missing beside me: $f" >&2; exit 1; }
 done
 
@@ -78,7 +80,17 @@ install -m 0644 "$DIR/60-mesh-backchannel.sysctl.conf" /etc/sysctl.d/60-mesh-bac
 sysctl -q -p /etc/sysctl.d/60-mesh-backchannel.conf
 install -d -m 0755 /etc/systemd/networkd.conf.d
 install -m 0644 "$DIR/60-mesh-backchannel.networkd.conf" /etc/systemd/networkd.conf.d/60-mesh-backchannel.conf
+install -m 0644 "$DIR/10-mesh-backchannel-wwan.network" /etc/systemd/network/10-mesh-backchannel-wwan.network
 systemctl restart systemd-networkd
+# If networkd configured the modem before it was told not to - dracut's
+# catch-all runs DHCP on every link - take back what it left: its routes in
+# main, its address, and the carrier's DNS servers in resolved. The link
+# script below puts back only what belongs.
+for lte in $(networkctl list --no-legend 2>/dev/null | awk '$3 == "wwan" {print $2}'); do
+    ip -4 route flush table main dev "$lte" 2>/dev/null || true
+    ip -4 addr flush dev "$lte" 2>/dev/null || true
+    resolvectl revert "$lte" 2>/dev/null || true
+done
 
 install -m 0755 "$DIR/mesh-backchannel-link" "$BIN"
 install -m 0644 "$DIR/mesh-backchannel-link.service" "$DIR/mesh-backchannel-link.timer" "$UNITS/"

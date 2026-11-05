@@ -1183,7 +1183,7 @@ cd /home/ubuntu/workspace/machine_elves_mesh/provision/backchannel
 scp -q mesh-backchannel-link mesh-backchannel-link.service mesh-backchannel-link.timer \
        mesh-backchannel.service.in config riverboat-host-key.pub install-diamond.sh \
        60-mesh-backchannel.sysctl.conf 60-mesh-backchannel.networkd.conf \
-       rpc@192.168.50.48:backchannel/
+       10-mesh-backchannel-wwan.network rpc@192.168.50.48:backchannel/
 ssh rpc@192.168.50.48 'cd ~/backchannel && sha256sum *' ; sha256sum *
 ```
 
@@ -1236,6 +1236,8 @@ ssh rpc@192.168.50.48 'U=$(id -u backchannel); I=$(ip -br link | awk "/^wwp/{pri
  echo "fenced: $(ip route get 204.210.210.200 uid $U | head -1)"
  echo "rules4: $(ip rule show | grep -c uidrange)  rules6: $(ip -6 rule show | grep -c uidrange)"
  echo "main has LTE: $(ip route show table main | grep -c wwp)"
+ echo "networkd on LTE: $(networkctl list --no-legend | awk "\$3==\"wwan\"{print \$5}")"
+ echo "resolved on LTE: $(resolvectl dns $I | cut -d: -f2-)"
  systemctl is-active mesh-backchannel.service mesh-backchannel-link.timer'
 ssh rpc@192.168.50.128 'ss -ltn | grep 2201'
 ssh -J rpc@192.168.50.128 -p 2201 rpc@localhost 'hostname; echo "came in over: $SSH_CLIENT"'
@@ -1248,6 +1250,7 @@ Expected:
 - `fenced` is `dev wwp…`;
 - `rules4: 1 rules6: 1`, which confirms on this kernel that the minute-by-minute `ip rule add` does not pile up rules;
 - `main has LTE: 0`;
+- `networkd on LTE: unmanaged`, and `resolved on LTE` is empty (added in Task 8, when dracut's catch-all was found running DHCP on the modem);
 - both units `active`;
 - riverboat listens on `127.0.0.1:2201` and **not** `0.0.0.0`;
 - the last command prints `diamond`.

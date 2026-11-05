@@ -1,0 +1,16 @@
+# /etc/systemd/network/10-mesh-backchannel-wwan.network - installed by
+# install-diamond.sh.
+#
+# The modem's interface belongs to mesh-backchannel-link and to nothing else.
+# This box carries a catch-all left by dracut in the initramfs,
+# /run/systemd/network/zzzz-dracut-default.network, which runs DHCP on every
+# link that is not loopback, the modem included. On 2026-11-05 that put an LTE
+# default route into the main table (metric 1024: one eno1 failure away from
+# carrying everything) and the carrier's DNS servers into resolved. networkd
+# uses the first file that matches, in lexical order across directories, and
+# this one sorts first. Matched by type, because the name changes.
+[Match]
+Type=wwan
+
+[Link]
+Unmanaged=yes
