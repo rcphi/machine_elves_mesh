@@ -118,10 +118,17 @@ network:
       dhcp6: true
 ```
 
-Applied with **`sudo netplan try`**, which rolls the change back by itself after
-120 s unless it is confirmed. That command is run over SSH on `eno1`, the link
-it changes, and the automatic rollback is what makes that safe. With the
-reservation the box should come back on `.48`.
+Applied with **`netplan apply` under a dead-man switch**: a `systemd-run`
+timer that restores the `.pre-dhcp` copy and re-applies it after 180 s unless
+it is cancelled. The change is made over SSH on `eno1`, the link it changes,
+and the automatic rollback is what makes that safe. With the reservation the
+box should come back on `.48`.
+
+*Corrected before use: this first said `netplan try`.* `netplan try` backs up
+`/etc/netplan` when it starts and restores that backup on revert, so with the
+file already replaced its "revert" would restore the new config. Passing the
+file with `--config-file` instead adds it beside the installer's, and the
+merge keeps the static address. The switch below depends on neither.
 
 ### 2. The fence
 

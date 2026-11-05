@@ -1,0 +1,13 @@
+# Replaces /etc/netplan/00-installer-config.yaml on diamond.
+#
+# It must replace that file rather than sit beside it: netplan merges files
+# and concatenates address lists, so a second file would keep the installer's
+# static 192.168.50.48 alongside the lease. At home the router reserves .48
+# for diamond, so this changes nothing there and makes the box work on any
+# other network. See docs/superpowers/specs/2026-11-05-lte-backchannel-design.md.
+network:
+  version: 2
+  ethernets:
+    eno1:
+      dhcp4: true
+      dhcp6: true
