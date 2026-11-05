@@ -150,5 +150,112 @@ class TheLink(unittest.TestCase):
         self.assertFalse([c for c in cmds if c[:3] == ["ip", "addr", "del"]])
 
 
+MODEM = "/org/freedesktop/ModemManager1/Modem/2"
+
+
+class Box:
+    """A fake `run`. Answers by command prefix, records every call."""
+
+    def __init__(self, connected_after_connect=True, modem=True, already_connected=False):
+        self.calls, self.tolerant = [], []
+        self.connected = already_connected
+        self.connected_after_connect = connected_after_connect
+        self.modem = modem
+
+    def __call__(self, cmd, tolerate_exists=False):
+        self.calls.append(cmd)
+        if tolerate_exists:
+            self.tolerant.append(cmd)
+        key = " ".join(cmd)
+        if key == "mmcli -L -K":
+            return f"modem-list.length : 1\nmodem-list.value[1] : {MODEM}\n" if self.modem \
+                else "modem-list.length : 0\n"
+        if key == f"mmcli -m {MODEM} -K":
+            return ("modem.generic.bearers.length : 1\n"
+                    "modem.generic.bearers.value[1] : /org/freedesktop/ModemManager1/Bearer/3\n"
+                    if self.connected else "modem.generic.bearers : --\n")
+        if key.startswith(f"mmcli -m {MODEM} --simple-connect="):
+            self.connected = self.connected_after_connect
+            return ""
+        if key.startswith("mmcli -b "):
+            return BEARER_CONNECTED
+        if key.startswith("ip -j -4 addr show dev "):
+            return "[]"
+        return ""
+
+    def index(self, prefix):
+        return next(i for i, c in enumerate(self.calls) if c[:len(prefix)] == prefix)
+
+
+class TheRunner(unittest.TestCase):
+    def test_fence_only_runs_the_fence_and_nothing_else(self):
+        box = Box()
+        self.assertEqual(link.ensure(box, 997, "vzwinternet", fence_only=True, say=lambda m: None), 0)
+        self.assertEqual(box.calls, link.fence_commands(997))
+
+    def test_every_fence_command_tolerates_already_existing(self):
+        box = Box()
+        link.ensure(box, 997, "vzwinternet", fence_only=True, say=lambda m: None)
+        self.assertEqual(box.tolerant, link.fence_commands(997))
+
+    def test_the_fence_goes_up_before_the_modem_is_touched(self):
+        box = Box()
+        link.ensure(box, 997, "vzwinternet", say=lambda m: None)
+        self.assertLess(box.index(["ip", "rule", "add"]), box.index(["mmcli"]))
+
+    def test_no_modem_leaves_the_fence_and_succeeds(self):
+        box = Box(modem=False)
+        self.assertEqual(link.ensure(box, 997, "vzwinternet", say=lambda m: None), 0)
+        self.assertFalse([c for c in box.calls if c[:2] == ["ip", "addr"]])
+
+    def test_uses_the_listed_modem_path_not_an_index(self):
+        box = Box()
+        link.ensure(box, 997, "vzwinternet", say=lambda m: None)
+        self.assertIn(["mmcli", "-m", MODEM, "-K"], box.calls)
+        self.assertFalse([c for c in box.calls if c[:3] == ["mmcli", "-m", "0"]])
+
+    def test_a_disconnected_modem_is_connected_with_the_apn(self):
+        box = Box()
+        link.ensure(box, 997, "vzwinternet", say=lambda m: None)
+        self.assertIn(["mmcli", "-m", MODEM, "--simple-connect=apn=vzwinternet,ip-type=ipv4"], box.calls)
+        self.assertIn(["ip", "route", "replace", "default", "dev", "wwp0s20f0u8i5",
+                       "metric", "100", "table", "4302"], box.calls)
+
+    def test_an_already_connected_modem_is_not_reconnected(self):
+        box = Box(already_connected=True)
+        link.ensure(box, 997, "vzwinternet", say=lambda m: None)
+        self.assertFalse([c for c in box.calls if "--simple-connect" in " ".join(c)])
+
+    def test_a_connect_that_yields_no_link_is_a_failure(self):
+        box = Box(connected_after_connect=False)
+        self.assertEqual(link.ensure(box, 997, "vzwinternet", say=lambda m: None), 1)
+
+    def test_no_user_means_no_commands_and_a_failure(self):
+        box = Box()
+        self.assertNotEqual(link.main(["x"], user="no-such-user-here", run=box), 0)
+        self.assertEqual(box.calls, [])
+
+
+class RunningCommands(unittest.TestCase):
+    def test_already_exists_is_success_when_asked(self):
+        out = link.sh(["sh", "-c", "echo 'RTNETLINK answers: File exists' >&2; exit 2"],
+                      tolerate_exists=True)
+        self.assertEqual(out, "")
+
+    def test_already_exists_is_a_failure_otherwise(self):
+        with self.assertRaises(link.Failed):
+            link.sh(["sh", "-c", "echo 'RTNETLINK answers: File exists' >&2; exit 2"])
+
+    def test_other_failures_are_never_tolerated(self):
+        with self.assertRaises(link.Failed):
+            link.sh(["sh", "-c", "echo 'Operation not permitted' >&2; exit 2"], tolerate_exists=True)
+
+
+class Config(unittest.TestCase):
+    def test_keys_values_comments_and_blanks(self):
+        self.assertEqual(link.read_config("# c\n\nAPN=vzwinternet\nHOME_PORT=2302\n"),
+                         {"APN": "vzwinternet", "HOME_PORT": "2302"})
+
+
 if __name__ == "__main__":
     unittest.main()

@@ -14,7 +14,10 @@ added to the main table, so no other process can reach LTE.
 Design: docs/superpowers/specs/2026-11-05-lte-backchannel-design.md
 """
 import json
+import pwd
 import re
+import subprocess
+import sys
 from dataclasses import dataclass
 
 USER = "backchannel"
@@ -129,3 +132,85 @@ def link_commands(link, current):
          "metric", ROUTE_METRIC, "table", TABLE],
     ]
     return commands
+
+
+class Failed(Exception):
+    pass
+
+
+def sh(cmd, tolerate_exists=False):
+    """`ip rule add` of a rule that already exists fails with "File exists";
+    for the fence, run every minute, that is the answer we want."""
+    result = subprocess.run(cmd, capture_output=True, text=True, timeout=90)
+    if result.returncode != 0:
+        if tolerate_exists and "File exists" in result.stderr:
+            return ""
+        raise Failed(f"{' '.join(cmd)}: {result.stderr.strip() or result.returncode}")
+    return result.stdout
+
+
+def read_config(text):
+    config = {}
+    for line in text.splitlines():
+        line = line.strip()
+        if line and not line.startswith("#") and "=" in line:
+            key, _, value = line.partition("=")
+            config[key.strip()] = value.strip()
+    return config
+
+
+def find_link(run, path):
+    modem = parse_keyed(run(["mmcli", "-m", path, "-K"]))
+    for bearer in bearer_paths(modem):
+        found = connected_link(parse_keyed(run(["mmcli", "-b", bearer, "-K"])))
+        if found:
+            return found
+    return None
+
+
+def ensure(run, uid, apn, fence_only=False, say=print):
+    for cmd in fence_commands(uid):
+        run(cmd, tolerate_exists=True)
+    if fence_only:
+        return 0
+    path = modem_path(parse_keyed(run(["mmcli", "-L", "-K"])))
+    if not path:
+        say("no modem: the fence holds, and the tunnel will fail cleanly")
+        return 0
+    found = find_link(run, path)
+    if found is None:
+        say(f"connecting {path} with apn={apn}")
+        run(["mmcli", "-m", path, f"--simple-connect=apn={apn},ip-type=ipv4"])
+        found = find_link(run, path)
+    if found is None:
+        say(f"{path} connected but offers no usable IPv4 bearer")
+        return 1
+    current = parse_addresses(run(["ip", "-j", "-4", "addr", "show", "dev", found.interface]))
+    for cmd in link_commands(found, current):
+        run(cmd)
+    return 0
+
+
+def main(argv, user=USER, run=None, config=CONFIG):
+    run = run or sh
+    fence_only = argv[1:] == ["--fence"]
+    try:
+        uid = pwd.getpwnam(user).pw_uid
+    except KeyError:
+        print(f"no user {user!r}: refusing to run, because without it there is no fence",
+              file=sys.stderr)
+        return 2
+    try:
+        with open(config) as f:
+            apn = read_config(f.read()).get("APN", "vzwinternet")
+    except FileNotFoundError:
+        apn = "vzwinternet"
+    try:
+        return ensure(run, uid, apn, fence_only=fence_only)
+    except Failed as failure:
+        print(failure, file=sys.stderr)
+        return 1
+
+
+if __name__ == "__main__":
+    sys.exit(main(sys.argv))
