@@ -56,7 +56,7 @@ Read from both boxes on 2026-11-05, without changing anything:
 |---|---|
 | Modem | SIMCOM SIM7600G-H, USB `1e0e:9001`, drivers `qmi_wwan` + `option` |
 | Network interface | `wwp0s20f0u8i5` today. The name encodes the USB port, so it changes if the dongle moves |
-| SIM | active, operator `311480` (Verizon), number `5550100000` |
+| SIM | active, US Mobile on Verizon's network (operator `311480`); APN `vzwinternet` confirmed 2026-11-05 |
 | Modem state | `disabled`. Nothing brings it up; there is no NetworkManager |
 | Network stack | `systemd-networkd` via netplan, plus `ModemManager`, both active |
 | `eno1` | **static** `192.168.50.48/24`, gateway `192.168.50.1`, from `/etc/netplan/00-installer-config.yaml` |
