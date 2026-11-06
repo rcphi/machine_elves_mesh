@@ -439,6 +439,19 @@ class WhatShipsToTheBoxes(unittest.TestCase):
         self.assertIn("Unmanaged=yes", conf)
         self.assertIn("10-mesh-backchannel-wwan.network", shipped("install-diamond.sh"))
 
+    def test_remove_drops_the_bearer_before_networkd_may_take_the_modem(self):
+        # Final review: --remove deleted the Unmanaged file and restarted
+        # networkd with the bearer still up, so dracut's catch-all took a
+        # DHCP lease on it again: an LTE default in main, carrier DNS in
+        # resolved. The bearer has to go down first.
+        script = shipped("install-diamond.sh")
+        remove = script[script.index("--remove)"):script.index(";;", script.index("--remove)"))]
+        disconnect = remove.find("mmcli -m any --simple-disconnect")
+        self.assertNotEqual(disconnect, -1)
+        self.assertNotIn("echo", remove[disconnect - 40:disconnect])
+        self.assertLess(disconnect, remove.index("10-mesh-backchannel-wwan.network"))
+        self.assertLess(disconnect, remove.index("systemctl restart systemd-networkd"))
+
     def test_the_tunnel_may_never_use_the_friends_ethernet(self):
         self.assertIn("RestrictNetworkInterfaces=~eno1", shipped("mesh-backchannel.service.in"))
 

@@ -32,12 +32,15 @@ case "${1:-}" in
         ip -6 rule del uidrange "$uid-$uid" prohibit priority 1000 2>/dev/null || true
     fi
     ip route flush table 4302 2>/dev/null || true
+    # Down before the Unmanaged file goes: networkd would otherwise take a
+    # DHCP lease on the live bearer via dracut's catch-all, putting an LTE
+    # default in main and the carrier's DNS in resolved.
+    mmcli -m any --simple-disconnect >/dev/null 2>&1 || true
     rm -f /etc/sysctl.d/60-mesh-backchannel.conf /etc/systemd/networkd.conf.d/60-mesh-backchannel.conf \
           /etc/systemd/network/10-mesh-backchannel-wwan.network
     sysctl --system -q
     systemctl restart systemd-networkd
-    echo "removed. Kept: user backchannel, its key, $ETC."
-    echo "The modem stays connected until: mmcli -m any --simple-disconnect"
+    echo "removed, and the modem disconnected. Kept: user backchannel, its key, $ETC."
     exit 0 ;;
 --start)
     [[ -f "$ETC/known_hosts" && -x "$BIN" ]] || { echo "install first: sudo $0" >&2; exit 1; }
