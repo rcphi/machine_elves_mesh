@@ -56,7 +56,7 @@ Read from both boxes on 2026-11-05, without changing anything:
 |---|---|
 | Modem | SIMCOM SIM7600G-H, USB `1e0e:9001`, drivers `qmi_wwan` + `option` |
 | Network interface | `wwp0s20f0u8i5` today. The name encodes the USB port, so it changes if the dongle moves |
-| SIM | active, operator `311480` (Verizon), number `5550100000` |
+| SIM | active, US Mobile on Verizon's network (operator `311480`); APN `vzwinternet` confirmed 2026-11-05 |
 | Modem state | `disabled`. Nothing brings it up; there is no NetworkManager |
 | Network stack | `systemd-networkd` via netplan, plus `ModemManager`, both active |
 | `eno1` | **static** `192.168.50.48/24`, gateway `192.168.50.1`, from `/etc/netplan/00-installer-config.yaml` |
@@ -153,6 +153,15 @@ silent fallback the contamination rule names.
 and every other process route as they do today, and they cannot reach LTE
 because no route they will ever look up points at it.
 
+### Two things on the box that would undo the fence
+
+*Added 2026-11-05 after the branch review, before anything was installed.*
+
+- **Reverse-path filtering.** The kernel checks an arriving packet's source against the main table *as uid 0*, so the tunnel user's rule never applies to that check. While eno1 has a default route the check passes, but with no route home in main — the friend's network down, the one case this exists for — the tunnel's replies are dropped as martians. The reviewer reproduced this in a network namespace on diamond's kernel. Fix: `rp_filter=0` on the LTE interface, set every run, plus `net.ipv4.conf.all.rp_filter = 0` in `/etc/sysctl.d/60-mesh-backchannel.conf`, because the effective value is max(all, interface) and Ubuntu sets all=2. eno1 keeps its own 2.
+- **networkd deletes foreign rules and routes.** With its defaults (`ManageForeignRoutingPolicyRules=yes`, `ManageForeignRoutes=yes`), systemd-networkd removes every rule and route it did not create whenever it starts or reconfigures: a package upgrade, a `netplan apply`. That deletes the fence, and until the next minute's run the tunnel user routes by main and leaves by eno1. Fix: `/etc/systemd/networkd.conf.d/60-mesh-backchannel.conf` turns both off, installed and applied before the fence first exists.
+
+**And a third limit, independent of routing:** `RestrictNetworkInterfaces=~eno1` on the tunnel unit, so whatever happens to the fence, the tunnel process cannot use the friend's ethernet. This first draft rejected `RestrictNetworkInterfaces=` because the LTE name changes. A deny-list of the stable name `eno1` avoids that objection, and it covers exactly the direction the networkd finding threatened.
+
 ### 3. The link
 
 `provision/backchannel/mesh-backchannel-link` (Python, standard library only,
@@ -184,9 +193,56 @@ down,** because `wwp0s20f0u8i5` encodes the USB port.
 A thin runner executes the commands. The fixtures are real `mmcli` output,
 captured from this modem on its first manual connect.
 
-`systemd-networkd` leaves the LTE interface alone, because no `.network` file
-matches it. ModemManager connects the bearer but does not configure the IP
-itself.
+`systemd-networkd` must leave the LTE interface alone, and **on this box it
+does not by default.** *Corrected 2026-11-05 in Task 8.* This first said no
+`.network` file matches the interface. The install found otherwise: dracut
+leaves a catch-all, `/run/systemd/network/zzzz-dracut-default.network`, which
+runs DHCP on every link that is not loopback. networkd took a DHCP lease on
+the modem and put an LTE default route into the main table at metric 1024,
+one eno1 failure away from carrying everything. It also handed the carrier's
+DNS servers to resolved, which then sent some name lookups over LTE.
+`/etc/systemd/network/10-mesh-backchannel-wwan.network` matches `Type=wwan`
+and sets `Unmanaged=yes`. It sorts first, and networkd uses the first file
+that matches. ModemManager connects the bearer; this script alone configures
+its IP.
+
+**A connected bearer is not the same as a working one.** *Added 2026-11-06,
+from Task 8.* After a forced reconnect, the bearer said `connected` and pinged
+8.8.8.8 fine. For 15 minutes, though, every SYN to 204.210.210.200:2302 went
+unanswered. No ufw block, no UniFi threat and no riverboat log explains it. A
+fresh bearer with a new address cleared it at once. So the script also watches
+the tunnel, through `ss` for an established socket to `HOME_ADDR:HOME_PORT`.
+It does this only while `mesh-backchannel.service` wants to run (`active` or
+`activating`, which includes waiting between restarts):
+
+- When the tunnel has been down for WAIT, the script disconnects the bearer and
+  reconnects it at once.
+- WAIT starts at 5 minutes and doubles after each forced reconnect, up to an
+  hour, so a home that is down does not churn the modem.
+- A healthy tunnel, or a stopped unit, resets WAIT.
+- The state lives in `/run/mesh-backchannel-link.state`, so a reboot starts
+  clean. It is timed on `CLOCK_BOOTTIME`, so a wrong or jumping wall clock
+  cannot move it.
+- Each forced reconnect is written to the journal.
+
+**Recovering fast.** *Added 2026-11-06, from the unplug and no-modem boot tests.*
+
+- **WAIT starts at 2 minutes, not 5.** The black-hole showed up on 2 of the
+  first 6 fresh bearers, and a good bearer has the tunnel up in seconds.
+- **A fresh bearer starts the clock.** Whether it comes from plug-in, boot or a
+  forced reconnect, the watchdog's clock runs from that bearer. A stale count
+  can no longer tear it down in the same run.
+- **The tunnel unit is restarted at once:**
+  - after any fresh bearer;
+  - when the tunnel's established socket is on an address LTE no longer has.
+
+  It is never started if it was stopped. Before this, ssh waited out its
+  keepalives on a dead connection (up to 3 minutes) or its connect timeout and
+  restart delay.
+- **The timer runs every 30 s, at 1 s accuracy.** It is local mmcli calls only,
+  so it costs no data.
+- **With no modem, mmcli prints `modem-list : 0`.** That is a count, which the
+  script once read as a modem path. Only D-Bus modem and bearer paths count now.
 
 ### 4. The tunnel
 
@@ -266,6 +322,15 @@ the home LAN, cannot listen on any other port, and cannot listen on a public
 address. The limits are set twice, in the key line and in sshd, so either alone
 holds. `sshd -t` checks the config before any reload.
 
+**riverboat drops dead sessions** (`ClientAliveInterval 30`,
+`ClientAliveCountMax 3`). This was found on the box. When the modem reconnects
+with a new CGNAT address, diamond's socket dies with no FIN. riverboat's sshd
+default (`ClientAliveInterval 0`) leaves only TCP keepalive to notice, which
+takes about two hours. Until then the dead session holds `localhost:2201`, and
+every new tunnel fails its forward and exits. With the setting, the port frees in
+about 90 s. Idle keepalives cost a few hundred bytes a minute, roughly 25 MB a
+month of the 2 GB.
+
 ### 6. Install scripts
 
 `install-riverboat.sh` and `install-diamond.sh`, idempotent, each with
@@ -323,10 +388,6 @@ there counts.
   path. Revisit if the address moves.
 - **`riverboat` or home internet being down.** That leaves no way in. With one
   jump host this is unavoidable, and accepted.
-- **`RestrictNetworkInterfaces=`** in the unit would be a third limit. It is not
-  used unless this box's systemd is verified to accept an interface name that
-  changes. A limit that quietly accepts a pattern it does not support is
-  worse than none.
 
 ## Unknowns the first manual connect answers
 

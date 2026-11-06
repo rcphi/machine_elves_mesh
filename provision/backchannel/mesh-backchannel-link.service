@@ -1,0 +1,8 @@
+[Unit]
+Description=Keep the LTE management link up, fenced to the backchannel user
+Wants=ModemManager.service
+After=ModemManager.service
+
+[Service]
+Type=oneshot
+ExecStart=/usr/local/sbin/mesh-backchannel-link

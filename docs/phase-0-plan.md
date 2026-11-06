@@ -806,6 +806,53 @@ Remote management of machines behind NAT is *the same problem Phase 0 exists to 
 
 **A management jump host is not the rented infrastructure that was ruled out.** The no-VPS decision is about the architecture under test, not about operations tooling. Something outside the measured path is a different category — but it must be genuinely outside it, which is what the rule above enforces.
 
+### diamond's LTE back channel — built and verified 2026-11-05/06
+
+`diamond` now carries its own management path: a USB LTE modem (US Mobile on Verizon, 2 GB a month) holding a reverse SSH tunnel to `riverboat`. The router forwards external port 2302 to riverboat's port 22. The operator reaches diamond with `ssh -J rpc@riverboat -p 2201 rpc@localhost`. There is no WireGuard, no Tailscale and no rented host. Design: `docs/superpowers/specs/2026-11-05-lte-backchannel-design.md`. Code: `provision/backchannel/`.
+
+**The contamination rule is enforced, not intended.** Only the `backchannel` user can reach LTE, through a uid rule into table 4302, which has an `unreachable` floor. Nothing is ever added to the main table, so the mesh, and everything else on the box, can only use the friend's ethernet. The tunnel unit is also barred from eno1 (`RestrictNetworkInterfaces=~eno1`), so either limit alone keeps the tunnel off the friend's network. What was measured on the box:
+
+- **Five minutes, both directions:**
+  - **0 packets** of tunnel traffic on eno1;
+  - **0 packets** on LTE other than the tunnel.
+- **Fence removed, unit limit alone:** 0 tunnel packets on eno1 in 75 s.
+- **What riverboat lets the key do:** no shell, no `-R` on any other port, and an `-L` that opens but carries nothing ("administratively prohibited").
+- **LTE down:** the tunnel user gets `No route to host` and never falls through to eno1.
+- **Ethernet pulled:**
+  - the main table is **empty**;
+  - ordinary processes get "Network is unreachable";
+  - the operator still logs in.
+- **Rebooted with the ethernet still out:** it came back over LTE alone, with:
+  - the fence in place;
+  - the modem unmanaged by networkd;
+  - no LTE DNS.
+- **Ethernet back:** DHCP on eno1. The tunnel user still routes via LTE, and everyone else via eno1.
+
+**Three things only the box could show, each now fixed:**
+
+1. **networkd was configuring the modem.** dracut leaves a catch-all `.network` file in `/run` that runs DHCP on every link. It put an LTE default route into main at metric 1024, one eno1 failure from carrying everything, and sent some DNS over LTE. The modem is now `Unmanaged=yes`.
+2. **riverboat kept dead sessions.** When the modem changed address, riverboat's sshd (`ClientAliveInterval 0`) held port 2201 for the dead session for about two hours, so every reconnect was refused. It now drops dead sessions in about 90 s.
+3. **The bearer was connected but useless.** After a reconnect, the bearer passed pings, yet SYNs to home went unanswered for 15 minutes. The cause is unknown: not ufw, and UniFi logged nothing. A fresh bearer cleared it. The link script now reconnects the bearer when the tunnel has been down for 5 minutes, doubling the wait up to an hour. Tested by blocking the tunnel on purpose: it reconnected at exactly 300 s, with a new address. That wait was later cut to 2 minutes; see below.
+
+**Unplugging the modem, and booting without it.** Both recover with nobody at the box.
+
+- **With no modem,** the fence stays up and the script logs "no modem: the fence holds" every 30 s.
+- **When the modem is plugged in,** in any port:
+  - ModemManager takes about 24 s to find it, under a new index and a new interface name.
+  - The script, which reads both fresh every run, connects it on its next run and restarts the tunnel at once.
+  - networkd's `Type=wwan` match keeps it unmanaged.
+- **Measured from plug-in to login:**
+  - **about 35 s** when the bearer is good;
+  - **2 min 38 s** when the carrier black-holes it, because the watchdog now gives a fresh bearer 2 minutes before reconnecting.
+- **The black-hole hit 3 of the 9 fresh bearers seen,** each time the first bearer after the modem attached. All four watchdog reconnects worked straight away.
+- **Bugs this testing found, now fixed:**
+  - the script read mmcli's no-modem reply, `modem-list : 0`, as a modem path;
+  - a blocking `systemctl restart` from inside the link oneshot deadlocked for 90 s on the tunnel unit's `After=`.
+
+**One limitation for the operator.** sshd only checks for a dead session when that session has been idle for 30 s, and a login attempt through 2201 counts as activity. So retrying the login in a tight loop keeps a dead session alive. After a reboot this held recovery to 9 minutes instead of about 1. **After diamond drops off, wait 2 minutes before trying.**
+
+**Data cost.** It's small: tens of KB an hour while idle, and about 25 MB a month of keepalives against the 2 GB plan.
+
 ### On the volunteer's household
 
 The box sits on someone else's home network. **Firewall it away from their LAN**, permitting only outbound internet and the mesh ports. This is partly courtesy and partly correctness: a friend's other devices are not part of the experiment, and their household should not have to think about what the box can see.

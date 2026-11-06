@@ -1,0 +1,351 @@
+#!/usr/bin/env python3
+"""Keeps diamond's LTE management link up, and fences the tunnel user onto it.
+
+    mesh-backchannel-link           fence, then connect the modem and apply its address
+    mesh-backchannel-link --fence   fence only: run before every start of the tunnel
+
+It also watches the tunnel. A bearer can say connected, and pass pings, while
+every SYN to home goes unanswered; a fresh bearer with a new address clears
+it. So if the tunnel unit wants to run but has had no established socket home
+for WAIT seconds, the bearer is reconnected. WAIT starts at 2 minutes and
+doubles to an hour, so a home that is simply down does not churn the modem.
+
+And it hurries the tunnel along. After any fresh bearer, or when the tunnel's
+connection is on an address LTE no longer has, the tunnel unit is restarted
+at once rather than left to find out through its own timeouts.
+
+The fence is what makes the back channel management-only. The `backchannel`
+user's IPv4 traffic looks up table 4302 and nothing else; that table holds a
+default route out the LTE interface and, beneath it, an `unreachable` default,
+so a lookup with LTE down fails here instead of falling through to the main
+table and leaving by eno1. Its IPv6 is prohibited outright. Nothing is ever
+added to the main table, so no other process can reach LTE.
+
+Design: docs/superpowers/specs/2026-11-05-lte-backchannel-design.md
+"""
+import json
+import os
+import pwd
+import re
+import subprocess
+import sys
+import time
+from dataclasses import dataclass
+
+USER = "backchannel"
+CONFIG = "/etc/mesh-backchannel/config"
+TABLE = "4302"
+PRIORITY = "1000"
+ROUTE_METRIC = "100"
+UNREACHABLE_METRIC = "65535"
+# LTE paths commonly carry less than 1500; too large a value shows up as an
+# SSH session that hangs on large output, which is a miserable thing to debug
+# over the very link that is misbehaving.
+DEFAULT_MTU = 1428
+TUNNEL_UNIT = "mesh-backchannel.service"
+STATE = "/run/mesh-backchannel-link.state"
+# A good bearer has the tunnel up in seconds; one that black-holes SYNs to
+# home (2 of the first 6 seen) never will.
+FIRST_WAIT = 120
+MAX_WAIT = 3600
+
+MODEM_PATH = "/org/freedesktop/ModemManager1/Modem/"
+BEARER_PATH = "/org/freedesktop/ModemManager1/Bearer/"
+
+LIST_ITEM = re.compile(r"^(.*)\.value\[(\d+)\]$")
+
+
+def parse_keyed(text):
+    """`mmcli -K` output as {key: value}. A `x.length` / `x.value[n]` family
+    becomes a list under `x`; mmcli prints `--` for empty."""
+    out, lists = {}, {}
+    for line in text.splitlines():
+        key, sep, value = line.partition(":")
+        if not sep:
+            continue
+        key, value = key.strip(), value.strip()
+        if value == "--":
+            value = ""
+        item = LIST_ITEM.match(key)
+        if item:
+            lists.setdefault(item.group(1), []).append((int(item.group(2)), value))
+        elif key.endswith(".length"):
+            lists.setdefault(key[: -len(".length")], [])
+        else:
+            out[key] = value
+    for key, items in lists.items():
+        out[key] = [value for _, value in sorted(items)]
+    return out
+
+
+def as_list(value):
+    """mmcli prints an empty list as a scalar `--`, which parses to ""."""
+    if isinstance(value, list):
+        return [v for v in value if v]
+    return [value] if value else []
+
+
+def modem_path(modem_list):
+    """With no modem, mmcli says `modem-list : 0`, which is a count, not a
+    path; so only a D-Bus modem path counts."""
+    paths = [p for p in as_list(modem_list.get("modem-list", [])) if p.startswith(MODEM_PATH)]
+    return paths[0] if paths else None
+
+
+def bearer_paths(modem):
+    return [p for p in as_list(modem.get("modem.generic.bearers", [])) if p.startswith(BEARER_PATH)]
+
+
+@dataclass(frozen=True)
+class Link:
+    interface: str
+    address: str
+    prefix: str
+    mtu: int
+
+
+def connected_link(bearer):
+    if bearer.get("bearer.status.connected") != "yes":
+        return None
+    interface = bearer.get("bearer.status.interface", "")
+    address = bearer.get("bearer.ipv4-config.address", "")
+    prefix = bearer.get("bearer.ipv4-config.prefix", "")
+    if not (interface and address and prefix):
+        return None
+    mtu = bearer.get("bearer.ipv4-config.mtu", "")
+    return Link(interface, address, prefix, int(mtu) if mtu.isdigit() else DEFAULT_MTU)
+
+
+def fence_commands(uid):
+    """The floor first, so the rule never points at an empty table: an empty
+    table falls through to main, and main leaves by eno1."""
+    uids = f"{uid}-{uid}"
+    return [
+        ["ip", "route", "replace", "unreachable", "default",
+         "metric", UNREACHABLE_METRIC, "table", TABLE],
+        ["ip", "rule", "add", "uidrange", uids, "lookup", TABLE, "priority", PRIORITY],
+        ["ip", "-6", "rule", "add", "uidrange", uids, "prohibit", "priority", PRIORITY],
+    ]
+
+
+def parse_addresses(ip_json):
+    addresses = []
+    for iface in json.loads(ip_json or "[]"):
+        for info in iface.get("addr_info", []):
+            if info.get("family") == "inet":
+                addresses.append(f"{info['local']}/{info['prefixlen']}")
+    return addresses
+
+
+def link_commands(link, current):
+    """`noprefixroute` because the kernel otherwise adds the carrier's subnet
+    to the main table, which is a route via LTE that every process can see.
+    IPv6 off because a router advertisement from the carrier would put a
+    default IPv6 route via LTE into main by itself."""
+    want = f"{link.address}/{link.prefix}"
+    iface = link.interface
+    commands = [
+        ["sysctl", "-qw", f"net.ipv6.conf.{iface}.disable_ipv6=1"],
+        # The kernel checks an arriving packet's source against the main table
+        # as uid 0, so the tunnel user's rule never applies to that check. With
+        # no route home in main - the friend's network down, the one case this
+        # link exists for - the tunnel's replies would be dropped as martians.
+        # Set every run: the name changes, and udev resets it on a new device.
+        # It only counts because 60-mesh-backchannel.sysctl.conf sets all=0;
+        # the effective value is max(all, interface).
+        ["sysctl", "-qw", f"net.ipv4.conf.{iface}.rp_filter=0"],
+        ["ip", "link", "set", "dev", iface, "up", "mtu", str(link.mtu)],
+    ]
+    commands += [["ip", "addr", "del", stale, "dev", iface] for stale in current if stale != want]
+    commands += [
+        ["ip", "addr", "replace", want, "dev", iface, "noprefixroute"],
+        ["ip", "route", "replace", "default", "dev", iface,
+         "metric", ROUTE_METRIC, "table", TABLE],
+    ]
+    return commands
+
+
+def watchdog(state, now, tunnel_up, wanted):
+    """(new state, reconnect now?). The state is {} while all is well, else
+    when the tunnel was last seen down from scratch and how long to give it."""
+    if tunnel_up or not wanted:
+        return {}, False
+    if "down_since" not in state:
+        return {"down_since": now, "wait": state.get("wait", FIRST_WAIT)}, False
+    if now - state["down_since"] < state["wait"]:
+        return state, False
+    return {"down_since": now, "wait": min(state["wait"] * 2, MAX_WAIT)}, True
+
+
+def tunnel_wanted(active_state):
+    """`activating` is Restart=always waiting out RestartSec between tries."""
+    return active_state.strip() in ("active", "activating", "reloading")
+
+
+def tunnel_socket_command(home):
+    addr, port = home
+    return ["ss", "-Htn", "state", "established", "dst", addr, "dport", "=", f":{port}"]
+
+
+def tunnel_sockets(ss_output):
+    """Local addresses of established sockets home, from `ss -Htn`."""
+    return [line.split()[2].rsplit(":", 1)[0]
+            for line in ss_output.splitlines() if len(line.split()) >= 4]
+
+
+class StateFile:
+    """In /run, so a reboot starts clean; timed on CLOCK_BOOTTIME, which a
+    wrong or jumping wall clock cannot move."""
+
+    def __init__(self, path=STATE):
+        self.path = path
+
+    def load(self):
+        try:
+            with open(self.path) as f:
+                state = json.load(f)
+            return state if isinstance(state, dict) else {}
+        except (OSError, ValueError):
+            return {}
+
+    def save(self, state):
+        os.makedirs(os.path.dirname(self.path), exist_ok=True)
+        tmp = self.path + ".tmp"
+        with open(tmp, "w") as f:
+            json.dump(state, f)
+        os.replace(tmp, self.path)
+
+    def now(self):
+        return time.clock_gettime(time.CLOCK_BOOTTIME)
+
+
+def say(message):
+    """Flushed, so the journal stamps each line when it happens."""
+    print(message, flush=True)
+
+
+class Failed(Exception):
+    pass
+
+
+def sh(cmd, tolerate_exists=False):
+    """`ip rule add` of a rule that already exists fails with "File exists";
+    for the fence, run every minute, that is the answer we want."""
+    result = subprocess.run(cmd, capture_output=True, text=True, timeout=90)
+    if result.returncode != 0:
+        if tolerate_exists and "File exists" in result.stderr:
+            return ""
+        raise Failed(f"{' '.join(cmd)}: {result.stderr.strip() or result.returncode}")
+    return result.stdout
+
+
+def read_config(text):
+    config = {}
+    for line in text.splitlines():
+        line = line.strip()
+        if line and not line.startswith("#") and "=" in line:
+            key, _, value = line.partition("=")
+            config[key.strip()] = value.strip()
+    return config
+
+
+def find_link(run, path):
+    modem = parse_keyed(run(["mmcli", "-m", path, "-K"]))
+    for bearer in bearer_paths(modem):
+        found = connected_link(parse_keyed(run(["mmcli", "-b", bearer, "-K"])))
+        if found:
+            return found
+    return None
+
+
+def connect(run, path, apn, say):
+    say(f"connecting {path} with apn={apn}")
+    run(["mmcli", "-m", path, f"--simple-connect=apn={apn},ip-type=ipv4"])
+    return find_link(run, path)
+
+
+def apply(run, found):
+    current = parse_addresses(run(["ip", "-j", "-4", "addr", "show", "dev", found.interface]))
+    for cmd in link_commands(found, current):
+        run(cmd)
+
+
+def ensure(run, uid, apn, fence_only=False, say=say, home=None, watch=None):
+    for cmd in fence_commands(uid):
+        run(cmd, tolerate_exists=True)
+    if fence_only:
+        return 0
+    path = modem_path(parse_keyed(run(["mmcli", "-L", "-K"])))
+    if not path:
+        say("no modem: the fence holds, and the tunnel will fail cleanly")
+        return 0
+    found, fresh = find_link(run, path), False
+    if found is None:
+        found, fresh = connect(run, path, apn, say), True
+    if found is None:
+        say(f"{path} connected but offers no usable IPv4 bearer")
+        return 1
+    apply(run, found)
+    if home is None or watch is None:
+        return 0
+    return watch_tunnel(run, path, apn, found, fresh, home, watch, say)
+
+
+def watch_tunnel(run, path, apn, found, fresh, home, watch, say):
+    wanted = tunnel_wanted(run(["systemctl", "show", "-p", "ActiveState", "--value", TUNNEL_UNIT]))
+    sockets = tunnel_sockets(run(tunnel_socket_command(home)))
+    live = found.address in sockets
+    stale = [a for a in sockets if a != found.address]
+    now = watch.now()
+    before = watch.load()
+    if fresh:
+        # The clock runs from this bearer, not from whatever went before it.
+        before = {"down_since": now, "wait": before.get("wait", FIRST_WAIT)}
+    state, force = watchdog(before, now, tunnel_up=live, wanted=wanted)
+    watch.save(state)
+    if force:
+        say(f"no tunnel home for {before['wait']} s with the bearer up: "
+            f"reconnecting for a fresh address; next try after {state['wait']} s")
+        run(["mmcli", "-m", path, "--simple-disconnect"])
+        found = connect(run, path, apn, say)
+        if found is None:
+            say(f"{path} reconnected but offers no usable IPv4 bearer")
+            return 1
+        apply(run, found)
+        fresh, live = True, False
+    if wanted and not live and (fresh or stale):
+        reason = "a fresh bearer" if fresh else f"its connection is on {stale[0]}, which LTE no longer has"
+        say(f"restarting the tunnel on {found.address}: {reason}")
+        # --no-block: the tunnel unit is After= this oneshot, so waiting for
+        # its start job from in here waits on ourselves.
+        run(["systemctl", "restart", "--no-block", TUNNEL_UNIT])
+    return 0
+
+
+def main(argv, user=USER, run=None, config=CONFIG):
+    run = run or sh
+    fence_only = argv[1:] == ["--fence"]
+    try:
+        uid = pwd.getpwnam(user).pw_uid
+    except KeyError:
+        print(f"no user {user!r}: refusing to run, because without it there is no fence",
+              file=sys.stderr)
+        return 2
+    try:
+        with open(config) as f:
+            settings = read_config(f.read())
+    except FileNotFoundError:
+        settings = {}
+    apn = settings.get("APN", "vzwinternet")
+    home = None
+    if settings.get("HOME_ADDR") and settings.get("HOME_PORT"):
+        home = (settings["HOME_ADDR"], settings["HOME_PORT"])
+    try:
+        return ensure(run, uid, apn, fence_only=fence_only, home=home, watch=StateFile())
+    except Failed as failure:
+        print(failure, file=sys.stderr)
+        return 1
+
+
+if __name__ == "__main__":
+    sys.exit(main(sys.argv))

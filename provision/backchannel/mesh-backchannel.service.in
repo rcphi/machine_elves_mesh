@@ -1,0 +1,32 @@
+# Written by install-diamond.sh from /etc/mesh-backchannel/config.
+[Unit]
+Description=Management back channel to riverboat over LTE
+After=mesh-backchannel-link.service
+StartLimitIntervalSec=0
+
+[Service]
+User=backchannel
+# `+` runs it as root. Before every start, so the tunnel never runs unfenced.
+ExecStartPre=+/usr/local/sbin/mesh-backchannel-link --fence
+ExecStart=/usr/bin/ssh -N -T \
+    -o BatchMode=yes -o IdentitiesOnly=yes \
+    -o ExitOnForwardFailure=yes -o ConnectTimeout=30 \
+    -o ServerAliveInterval=60 -o ServerAliveCountMax=3 \
+    -o StrictHostKeyChecking=yes -o UserKnownHostsFile=/etc/mesh-backchannel/known_hosts \
+    -i /var/lib/backchannel/.ssh/id_ed25519 \
+    -R localhost:@LISTEN_PORT@:localhost:22 \
+    -p @HOME_PORT@ backchannel@@HOME_ADDR@
+# A second limit that does not depend on routing: home, and loopback where
+# forwarded connections land. Nothing else.
+IPAddressDeny=any
+IPAddressAllow=localhost @HOME_ADDR@
+# A third, also independent of routing, in the direction that matters most:
+# whatever happens to the fence, this process cannot send or receive on the
+# friend's ethernet. A deny-list of eno1, because the LTE name changes and an
+# allow-list would have to name it.
+RestrictNetworkInterfaces=~eno1
+Restart=always
+RestartSec=30
+
+[Install]
+WantedBy=multi-user.target

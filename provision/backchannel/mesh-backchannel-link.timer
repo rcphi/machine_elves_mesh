@@ -1,0 +1,10 @@
+[Unit]
+Description=Check the LTE management link every 30 seconds
+
+[Timer]
+OnBootSec=20
+OnUnitActiveSec=30
+AccuracySec=1s
+
+[Install]
+WantedBy=timers.target
