@@ -4,6 +4,12 @@
     mesh-backchannel-link           fence, then connect the modem and apply its address
     mesh-backchannel-link --fence   fence only: run before every start of the tunnel
 
+It also watches the tunnel. A bearer can say connected, and pass pings, while
+every SYN to home goes unanswered; a fresh bearer with a new address clears
+it. So if the tunnel unit wants to run but has had no established socket home
+for WAIT seconds, the bearer is reconnected. WAIT starts at 5 minutes and
+doubles to an hour, so a home that is simply down does not churn the modem.
+
 The fence is what makes the back channel management-only. The `backchannel`
 user's IPv4 traffic looks up table 4302 and nothing else; that table holds a
 default route out the LTE interface and, beneath it, an `unreachable` default,
@@ -14,10 +20,12 @@ added to the main table, so no other process can reach LTE.
 Design: docs/superpowers/specs/2026-11-05-lte-backchannel-design.md
 """
 import json
+import os
 import pwd
 import re
 import subprocess
 import sys
+import time
 from dataclasses import dataclass
 
 USER = "backchannel"
@@ -30,6 +38,10 @@ UNREACHABLE_METRIC = "65535"
 # SSH session that hangs on large output, which is a miserable thing to debug
 # over the very link that is misbehaving.
 DEFAULT_MTU = 1428
+TUNNEL_UNIT = "mesh-backchannel.service"
+STATE = "/run/mesh-backchannel-link.state"
+FIRST_WAIT = 300
+MAX_WAIT = 3600
 
 LIST_ITEM = re.compile(r"^(.*)\.value\[(\d+)\]$")
 
@@ -142,6 +154,54 @@ def link_commands(link, current):
     return commands
 
 
+def watchdog(state, now, tunnel_up, wanted):
+    """(new state, reconnect now?). The state is {} while all is well, else
+    when the tunnel was last seen down from scratch and how long to give it."""
+    if tunnel_up or not wanted:
+        return {}, False
+    if "down_since" not in state:
+        return {"down_since": now, "wait": state.get("wait", FIRST_WAIT)}, False
+    if now - state["down_since"] < state["wait"]:
+        return state, False
+    return {"down_since": now, "wait": min(state["wait"] * 2, MAX_WAIT)}, True
+
+
+def tunnel_wanted(active_state):
+    """`activating` is Restart=always waiting out RestartSec between tries."""
+    return active_state.strip() in ("active", "activating", "reloading")
+
+
+def tunnel_socket_command(home):
+    addr, port = home
+    return ["ss", "-Htn", "state", "established", "dst", addr, "dport", "=", f":{port}"]
+
+
+class StateFile:
+    """In /run, so a reboot starts clean; timed on CLOCK_BOOTTIME, which a
+    wrong or jumping wall clock cannot move."""
+
+    def __init__(self, path=STATE):
+        self.path = path
+
+    def load(self):
+        try:
+            with open(self.path) as f:
+                state = json.load(f)
+            return state if isinstance(state, dict) else {}
+        except (OSError, ValueError):
+            return {}
+
+    def save(self, state):
+        os.makedirs(os.path.dirname(self.path), exist_ok=True)
+        tmp = self.path + ".tmp"
+        with open(tmp, "w") as f:
+            json.dump(state, f)
+        os.replace(tmp, self.path)
+
+    def now(self):
+        return time.clock_gettime(time.CLOCK_BOOTTIME)
+
+
 class Failed(Exception):
     pass
 
@@ -176,7 +236,19 @@ def find_link(run, path):
     return None
 
 
-def ensure(run, uid, apn, fence_only=False, say=print):
+def connect(run, path, apn, say):
+    say(f"connecting {path} with apn={apn}")
+    run(["mmcli", "-m", path, f"--simple-connect=apn={apn},ip-type=ipv4"])
+    return find_link(run, path)
+
+
+def apply(run, found):
+    current = parse_addresses(run(["ip", "-j", "-4", "addr", "show", "dev", found.interface]))
+    for cmd in link_commands(found, current):
+        run(cmd)
+
+
+def ensure(run, uid, apn, fence_only=False, say=print, home=None, watch=None):
     for cmd in fence_commands(uid):
         run(cmd, tolerate_exists=True)
     if fence_only:
@@ -185,17 +257,29 @@ def ensure(run, uid, apn, fence_only=False, say=print):
     if not path:
         say("no modem: the fence holds, and the tunnel will fail cleanly")
         return 0
-    found = find_link(run, path)
-    if found is None:
-        say(f"connecting {path} with apn={apn}")
-        run(["mmcli", "-m", path, f"--simple-connect=apn={apn},ip-type=ipv4"])
-        found = find_link(run, path)
+    found = find_link(run, path) or connect(run, path, apn, say)
     if found is None:
         say(f"{path} connected but offers no usable IPv4 bearer")
         return 1
-    current = parse_addresses(run(["ip", "-j", "-4", "addr", "show", "dev", found.interface]))
-    for cmd in link_commands(found, current):
-        run(cmd)
+    apply(run, found)
+    if home is None or watch is None:
+        return 0
+    before = watch.load()
+    state, force = watchdog(
+        before, watch.now(),
+        tunnel_up=bool(run(tunnel_socket_command(home)).strip()),
+        wanted=tunnel_wanted(run(["systemctl", "show", "-p", "ActiveState", "--value", TUNNEL_UNIT])))
+    watch.save(state)
+    if not force:
+        return 0
+    say(f"no tunnel home for {before['wait']} s with the bearer up: "
+        f"reconnecting for a fresh address; next try after {state['wait']} s")
+    run(["mmcli", "-m", path, "--simple-disconnect"])
+    found = connect(run, path, apn, say)
+    if found is None:
+        say(f"{path} reconnected but offers no usable IPv4 bearer")
+        return 1
+    apply(run, found)
     return 0
 
 
@@ -210,11 +294,15 @@ def main(argv, user=USER, run=None, config=CONFIG):
         return 2
     try:
         with open(config) as f:
-            apn = read_config(f.read()).get("APN", "vzwinternet")
+            settings = read_config(f.read())
     except FileNotFoundError:
-        apn = "vzwinternet"
+        settings = {}
+    apn = settings.get("APN", "vzwinternet")
+    home = None
+    if settings.get("HOME_ADDR") and settings.get("HOME_PORT"):
+        home = (settings["HOME_ADDR"], settings["HOME_PORT"])
     try:
-        return ensure(run, uid, apn, fence_only=fence_only)
+        return ensure(run, uid, apn, fence_only=fence_only, home=home, watch=StateFile())
     except Failed as failure:
         print(failure, file=sys.stderr)
         return 1

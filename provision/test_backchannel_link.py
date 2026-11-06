@@ -156,9 +156,11 @@ MODEM = "/org/freedesktop/ModemManager1/Modem/2"
 class Box:
     """A fake `run`. Answers by command prefix, records every call."""
 
-    def __init__(self, connected_after_connect=True, modem=True, already_connected=False):
+    def __init__(self, connected_after_connect=True, modem=True, already_connected=False,
+                 tunnel_up=True, tunnel_unit="active"):
         self.calls, self.tolerant = [], []
         self.connected = already_connected
+        self.tunnel_up, self.tunnel_unit = tunnel_up, tunnel_unit
         self.connected_after_connect = connected_after_connect
         self.modem = modem
 
@@ -174,6 +176,13 @@ class Box:
             return ("modem.generic.bearers.length : 1\n"
                     "modem.generic.bearers.value[1] : /org/freedesktop/ModemManager1/Bearer/3\n"
                     if self.connected else "modem.generic.bearers : --\n")
+        if key == f"mmcli -m {MODEM} --simple-disconnect":
+            self.connected = False
+            return ""
+        if key == "systemctl show -p ActiveState --value mesh-backchannel.service":
+            return self.tunnel_unit + "\n"
+        if key.startswith("ss -Htn state established "):
+            return ("0 0 100.66.12.9:49104 204.210.210.200:2302\n" if self.tunnel_up else "")
         if key.startswith(f"mmcli -m {MODEM} --simple-connect="):
             self.connected = self.connected_after_connect
             return ""
@@ -234,6 +243,138 @@ class TheRunner(unittest.TestCase):
         box = Box()
         self.assertNotEqual(link.main(["x"], user="no-such-user-here", run=box), 0)
         self.assertEqual(box.calls, [])
+
+
+HOME = ("204.210.210.200", "2302")
+
+
+class Watch:
+    """A fake state file and clock."""
+
+    def __init__(self, state=None, now=10_000.0):
+        self.state, self.now_value, self.saved = dict(state or {}), now, []
+
+    def load(self):
+        return dict(self.state)
+
+    def save(self, state):
+        self.state = dict(state)
+        self.saved.append(dict(state))
+
+    def now(self):
+        return self.now_value
+
+
+class TheWatchdog(unittest.TestCase):
+    """Found in Task 8: the bearer said connected and pings worked, yet every
+    SYN to home went unanswered for 15 minutes. A fresh bearer, with a new
+    address, cleared it at once. At a friend's house nobody is there to do
+    that by hand."""
+
+    def test_a_healthy_tunnel_keeps_no_state(self):
+        self.assertEqual(link.watchdog({"down_since": 1.0, "wait": 600}, 5000.0, True, True), ({}, False))
+
+    def test_a_stopped_tunnel_unit_is_not_a_reason_to_touch_the_modem(self):
+        self.assertEqual(link.watchdog({"down_since": 1.0, "wait": 300}, 5000.0, False, False), ({}, False))
+
+    def test_the_first_minute_down_only_starts_the_clock(self):
+        self.assertEqual(link.watchdog({}, 100.0, False, True), ({"down_since": 100.0, "wait": 300}, False))
+
+    def test_down_less_than_the_wait_is_left_alone(self):
+        state = {"down_since": 100.0, "wait": 300}
+        self.assertEqual(link.watchdog(state, 399.0, False, True), (state, False))
+
+    def test_down_for_the_wait_forces_a_reconnect_and_doubles_it(self):
+        self.assertEqual(link.watchdog({"down_since": 100.0, "wait": 300}, 400.0, False, True),
+                         ({"down_since": 400.0, "wait": 600}, True))
+
+    def test_the_wait_stops_at_an_hour(self):
+        state, force = link.watchdog({"down_since": 0.0, "wait": 2400}, 2400.0, False, True)
+        self.assertTrue(force)
+        self.assertEqual(state["wait"], 3600)
+        state, force = link.watchdog(state, 2400.0 + 3600, False, True)
+        self.assertTrue(force)
+        self.assertEqual(state["wait"], 3600)
+
+    def test_a_tunnel_waiting_to_restart_still_counts_as_wanted(self):
+        self.assertTrue(link.tunnel_wanted("activating\n"))
+        self.assertTrue(link.tunnel_wanted("active\n"))
+        self.assertFalse(link.tunnel_wanted("inactive\n"))
+        self.assertFalse(link.tunnel_wanted("failed\n"))
+
+    def test_the_socket_check_names_home_exactly(self):
+        self.assertEqual(link.tunnel_socket_command(HOME),
+                         ["ss", "-Htn", "state", "established",
+                          "dst", "204.210.210.200", "dport", "=", ":2302"])
+
+
+class TheWatchdogOnTheBox(unittest.TestCase):
+    def test_a_tunnel_down_long_enough_gets_a_fresh_bearer(self):
+        box = Box(already_connected=True, tunnel_up=False)
+        watch = Watch({"down_since": 100.0, "wait": 300}, now=400.0)
+        self.assertEqual(link.ensure(box, 997, "vzwinternet", say=lambda m: None,
+                                     home=HOME, watch=watch), 0)
+        disconnect = box.index(["mmcli", "-m", MODEM, "--simple-disconnect"])
+        connect = box.index(["mmcli", "-m", MODEM, "--simple-connect=apn=vzwinternet,ip-type=ipv4"])
+        self.assertLess(disconnect, connect)
+        route = ["ip", "route", "replace", "default", "dev", "wwp0s20f0u8i5",
+                 "metric", "100", "table", "4302"]
+        self.assertLess(connect, len(box.calls) - 1 - box.calls[::-1].index(route))
+        self.assertEqual(watch.state, {"down_since": 400.0, "wait": 600})
+
+    def test_a_healthy_tunnel_leaves_the_bearer_alone(self):
+        box = Box(already_connected=True, tunnel_up=True)
+        watch = Watch({"down_since": 100.0, "wait": 1200}, now=99_999.0)
+        link.ensure(box, 997, "vzwinternet", say=lambda m: None, home=HOME, watch=watch)
+        self.assertFalse([c for c in box.calls if "--simple-disconnect" in c])
+        self.assertEqual(watch.state, {})
+
+    def test_a_stopped_tunnel_unit_leaves_the_bearer_alone(self):
+        box = Box(already_connected=True, tunnel_up=False, tunnel_unit="inactive")
+        watch = Watch({"down_since": 100.0, "wait": 300}, now=99_999.0)
+        link.ensure(box, 997, "vzwinternet", say=lambda m: None, home=HOME, watch=watch)
+        self.assertFalse([c for c in box.calls if "--simple-disconnect" in c])
+
+    def test_the_forced_reconnect_is_said_in_the_journal(self):
+        box = Box(already_connected=True, tunnel_up=False)
+        said = []
+        link.ensure(box, 997, "vzwinternet", say=said.append, home=HOME,
+                    watch=Watch({"down_since": 100.0, "wait": 300}, now=400.0))
+        self.assertTrue([m for m in said if "300 s" in m and "600 s" in m])
+
+    def test_without_a_home_the_watchdog_does_not_run(self):
+        box = Box(already_connected=True, tunnel_up=False)
+        watch = Watch({"down_since": 100.0, "wait": 300}, now=400.0)
+        link.ensure(box, 997, "vzwinternet", say=lambda m: None, home=None, watch=watch)
+        self.assertFalse([c for c in box.calls if c[0] in ("ss", "systemctl")])
+
+
+class TheStateFile(unittest.TestCase):
+    def setUp(self):
+        import tempfile
+        self.dir = tempfile.TemporaryDirectory()
+        self.path = os.path.join(self.dir.name, "sub", "state.json")
+
+    def tearDown(self):
+        self.dir.cleanup()
+
+    def test_missing_is_empty(self):
+        self.assertEqual(link.StateFile(self.path).load(), {})
+
+    def test_round_trip(self):
+        link.StateFile(self.path).save({"down_since": 1.5, "wait": 600})
+        self.assertEqual(link.StateFile(self.path).load(), {"down_since": 1.5, "wait": 600})
+
+    def test_garbage_is_empty_not_a_crash(self):
+        os.makedirs(os.path.dirname(self.path))
+        with open(self.path, "w") as f:
+            f.write("{not json")
+        self.assertEqual(link.StateFile(self.path).load(), {})
+
+    def test_the_clock_survives_between_runs_and_ignores_wall_time(self):
+        import time
+        self.assertAlmostEqual(link.StateFile(self.path).now(),
+                               time.clock_gettime(time.CLOCK_BOOTTIME), delta=1.0)
 
 
 class RunningCommands(unittest.TestCase):

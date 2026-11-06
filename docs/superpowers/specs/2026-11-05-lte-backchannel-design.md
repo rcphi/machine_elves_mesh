@@ -206,6 +206,25 @@ and sets `Unmanaged=yes`. It sorts first, and networkd uses the first file
 that matches. ModemManager connects the bearer; this script alone configures
 its IP.
 
+**A connected bearer is not the same as a working one.** *Added 2026-11-06,
+from Task 8.* After a forced reconnect, the bearer said `connected` and pinged
+8.8.8.8 fine. For 15 minutes, though, every SYN to 204.210.210.200:2302 went
+unanswered. No ufw block, no UniFi threat and no riverboat log explains it. A
+fresh bearer with a new address cleared it at once. So the script also watches
+the tunnel, through `ss` for an established socket to `HOME_ADDR:HOME_PORT`.
+It does this only while `mesh-backchannel.service` wants to run (`active` or
+`activating`, which includes waiting between restarts):
+
+- When the tunnel has been down for WAIT, the script disconnects the bearer and
+  reconnects it at once.
+- WAIT starts at 5 minutes and doubles after each forced reconnect, up to an
+  hour, so a home that is down does not churn the modem.
+- A healthy tunnel, or a stopped unit, resets WAIT.
+- The state lives in `/run/mesh-backchannel-link.state`, so a reboot starts
+  clean. It is timed on `CLOCK_BOOTTIME`, so a wrong or jumping wall clock
+  cannot move it.
+- Each forced reconnect is written to the journal.
+
 ### 4. The tunnel
 
 `mesh-backchannel.service` on `diamond`:
