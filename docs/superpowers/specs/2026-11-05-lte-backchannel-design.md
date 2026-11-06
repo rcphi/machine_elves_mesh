@@ -225,6 +225,25 @@ It does this only while `mesh-backchannel.service` wants to run (`active` or
   cannot move it.
 - Each forced reconnect is written to the journal.
 
+**Recovering fast.** *Added 2026-11-06, from the unplug and no-modem boot tests.*
+
+- **WAIT starts at 2 minutes, not 5.** The black-hole showed up on 2 of the
+  first 6 fresh bearers, and a good bearer has the tunnel up in seconds.
+- **A fresh bearer starts the clock.** Whether it comes from plug-in, boot or a
+  forced reconnect, the watchdog's clock runs from that bearer. A stale count
+  can no longer tear it down in the same run.
+- **The tunnel unit is restarted at once:**
+  - after any fresh bearer;
+  - when the tunnel's established socket is on an address LTE no longer has.
+
+  It is never started if it was stopped. Before this, ssh waited out its
+  keepalives on a dead connection (up to 3 minutes) or its connect timeout and
+  restart delay.
+- **The timer runs every 30 s, at 1 s accuracy.** It is local mmcli calls only,
+  so it costs no data.
+- **With no modem, mmcli prints `modem-list : 0`.** That is a count, which the
+  script once read as a modem path. Only D-Bus modem and bearer paths count now.
+
 ### 4. The tunnel
 
 `mesh-backchannel.service` on `diamond`:

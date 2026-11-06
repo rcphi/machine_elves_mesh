@@ -7,8 +7,12 @@
 It also watches the tunnel. A bearer can say connected, and pass pings, while
 every SYN to home goes unanswered; a fresh bearer with a new address clears
 it. So if the tunnel unit wants to run but has had no established socket home
-for WAIT seconds, the bearer is reconnected. WAIT starts at 5 minutes and
+for WAIT seconds, the bearer is reconnected. WAIT starts at 2 minutes and
 doubles to an hour, so a home that is simply down does not churn the modem.
+
+And it hurries the tunnel along. After any fresh bearer, or when the tunnel's
+connection is on an address LTE no longer has, the tunnel unit is restarted
+at once rather than left to find out through its own timeouts.
 
 The fence is what makes the back channel management-only. The `backchannel`
 user's IPv4 traffic looks up table 4302 and nothing else; that table holds a
@@ -40,8 +44,13 @@ UNREACHABLE_METRIC = "65535"
 DEFAULT_MTU = 1428
 TUNNEL_UNIT = "mesh-backchannel.service"
 STATE = "/run/mesh-backchannel-link.state"
-FIRST_WAIT = 300
+# A good bearer has the tunnel up in seconds; one that black-holes SYNs to
+# home (2 of the first 6 seen) never will.
+FIRST_WAIT = 120
 MAX_WAIT = 3600
+
+MODEM_PATH = "/org/freedesktop/ModemManager1/Modem/"
+BEARER_PATH = "/org/freedesktop/ModemManager1/Bearer/"
 
 LIST_ITEM = re.compile(r"^(.*)\.value\[(\d+)\]$")
 
@@ -77,12 +86,14 @@ def as_list(value):
 
 
 def modem_path(modem_list):
-    paths = as_list(modem_list.get("modem-list", []))
+    """With no modem, mmcli says `modem-list : 0`, which is a count, not a
+    path; so only a D-Bus modem path counts."""
+    paths = [p for p in as_list(modem_list.get("modem-list", [])) if p.startswith(MODEM_PATH)]
     return paths[0] if paths else None
 
 
 def bearer_paths(modem):
-    return as_list(modem.get("modem.generic.bearers", []))
+    return [p for p in as_list(modem.get("modem.generic.bearers", [])) if p.startswith(BEARER_PATH)]
 
 
 @dataclass(frozen=True)
@@ -176,6 +187,12 @@ def tunnel_socket_command(home):
     return ["ss", "-Htn", "state", "established", "dst", addr, "dport", "=", f":{port}"]
 
 
+def tunnel_sockets(ss_output):
+    """Local addresses of established sockets home, from `ss -Htn`."""
+    return [line.split()[2].rsplit(":", 1)[0]
+            for line in ss_output.splitlines() if len(line.split()) >= 4]
+
+
 class StateFile:
     """In /run, so a reboot starts clean; timed on CLOCK_BOOTTIME, which a
     wrong or jumping wall clock cannot move."""
@@ -257,29 +274,44 @@ def ensure(run, uid, apn, fence_only=False, say=print, home=None, watch=None):
     if not path:
         say("no modem: the fence holds, and the tunnel will fail cleanly")
         return 0
-    found = find_link(run, path) or connect(run, path, apn, say)
+    found, fresh = find_link(run, path), False
+    if found is None:
+        found, fresh = connect(run, path, apn, say), True
     if found is None:
         say(f"{path} connected but offers no usable IPv4 bearer")
         return 1
     apply(run, found)
     if home is None or watch is None:
         return 0
+    return watch_tunnel(run, path, apn, found, fresh, home, watch, say)
+
+
+def watch_tunnel(run, path, apn, found, fresh, home, watch, say):
+    wanted = tunnel_wanted(run(["systemctl", "show", "-p", "ActiveState", "--value", TUNNEL_UNIT]))
+    sockets = tunnel_sockets(run(tunnel_socket_command(home)))
+    live = found.address in sockets
+    stale = [a for a in sockets if a != found.address]
+    now = watch.now()
     before = watch.load()
-    state, force = watchdog(
-        before, watch.now(),
-        tunnel_up=bool(run(tunnel_socket_command(home)).strip()),
-        wanted=tunnel_wanted(run(["systemctl", "show", "-p", "ActiveState", "--value", TUNNEL_UNIT])))
+    if fresh:
+        # The clock runs from this bearer, not from whatever went before it.
+        before = {"down_since": now, "wait": before.get("wait", FIRST_WAIT)}
+    state, force = watchdog(before, now, tunnel_up=live, wanted=wanted)
     watch.save(state)
-    if not force:
-        return 0
-    say(f"no tunnel home for {before['wait']} s with the bearer up: "
-        f"reconnecting for a fresh address; next try after {state['wait']} s")
-    run(["mmcli", "-m", path, "--simple-disconnect"])
-    found = connect(run, path, apn, say)
-    if found is None:
-        say(f"{path} reconnected but offers no usable IPv4 bearer")
-        return 1
-    apply(run, found)
+    if force:
+        say(f"no tunnel home for {before['wait']} s with the bearer up: "
+            f"reconnecting for a fresh address; next try after {state['wait']} s")
+        run(["mmcli", "-m", path, "--simple-disconnect"])
+        found = connect(run, path, apn, say)
+        if found is None:
+            say(f"{path} reconnected but offers no usable IPv4 bearer")
+            return 1
+        apply(run, found)
+        fresh, live = True, False
+    if wanted and not live and (fresh or stale):
+        reason = "a fresh bearer" if fresh else f"its connection is on {stale[0]}, which LTE no longer has"
+        say(f"restarting the tunnel on {found.address}: {reason}")
+        run(["systemctl", "restart", TUNNEL_UNIT])
     return 0
 
 

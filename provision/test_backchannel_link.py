@@ -52,6 +52,13 @@ class ParsingTheModemsOwnWords(unittest.TestCase):
         path = link.modem_path(link.parse_keyed(fixture("modem-list.txt")))
         self.assertTrue(path.startswith("/org/freedesktop/ModemManager1/Modem/"))
 
+    def test_a_value_that_is_not_a_modem_path_is_no_modem(self):
+        # The real no-modem answer is `modem-list : 0`; the script once read
+        # that 0 as a modem and ran `mmcli -m 0` every minute.
+        self.assertIsNone(link.modem_path({"modem-list": "0"}))
+        self.assertEqual(link.bearer_paths({"modem.generic.bearers": ["3", "/org/freedesktop/ModemManager1/Bearer/3"]}),
+                         ["/org/freedesktop/ModemManager1/Bearer/3"])
+
     def test_no_modem_means_no_path(self):
         self.assertIsNone(link.modem_path(link.parse_keyed(fixture("modem-list-empty.txt"))))
 
@@ -157,10 +164,10 @@ class Box:
     """A fake `run`. Answers by command prefix, records every call."""
 
     def __init__(self, connected_after_connect=True, modem=True, already_connected=False,
-                 tunnel_up=True, tunnel_unit="active"):
+                 tunnel_up=True, tunnel_unit="active", tunnel_from="100.66.12.9"):
         self.calls, self.tolerant = [], []
         self.connected = already_connected
-        self.tunnel_up, self.tunnel_unit = tunnel_up, tunnel_unit
+        self.tunnel_up, self.tunnel_unit, self.tunnel_from = tunnel_up, tunnel_unit, tunnel_from
         self.connected_after_connect = connected_after_connect
         self.modem = modem
 
@@ -182,7 +189,7 @@ class Box:
         if key == "systemctl show -p ActiveState --value mesh-backchannel.service":
             return self.tunnel_unit + "\n"
         if key.startswith("ss -Htn state established "):
-            return ("0 0 100.66.12.9:49104 204.210.210.200:2302\n" if self.tunnel_up else "")
+            return (f"0 0 {self.tunnel_from}:49104 204.210.210.200:2302\n" if self.tunnel_up else "")
         if key.startswith(f"mmcli -m {MODEM} --simple-connect="):
             self.connected = self.connected_after_connect
             return ""
@@ -278,7 +285,7 @@ class TheWatchdog(unittest.TestCase):
         self.assertEqual(link.watchdog({"down_since": 1.0, "wait": 300}, 5000.0, False, False), ({}, False))
 
     def test_the_first_minute_down_only_starts_the_clock(self):
-        self.assertEqual(link.watchdog({}, 100.0, False, True), ({"down_since": 100.0, "wait": 300}, False))
+        self.assertEqual(link.watchdog({}, 100.0, False, True), ({"down_since": 100.0, "wait": 120}, False))
 
     def test_down_less_than_the_wait_is_left_alone(self):
         state = {"down_since": 100.0, "wait": 300}
@@ -347,6 +354,72 @@ class TheWatchdogOnTheBox(unittest.TestCase):
         watch = Watch({"down_since": 100.0, "wait": 300}, now=400.0)
         link.ensure(box, 997, "vzwinternet", say=lambda m: None, home=None, watch=watch)
         self.assertFalse([c for c in box.calls if c[0] in ("ss", "systemctl")])
+
+
+RESTART = ["systemctl", "restart", "mesh-backchannel.service"]
+
+
+class FasterRecovery(unittest.TestCase):
+    """Measured on the box: a replugged modem was up 80 s before ssh gave up
+    on its dead connection, and a fresh bearer that black-holed SYNs cost the
+    full 5-minute wait."""
+
+    def test_the_local_addresses_of_tunnel_sockets_are_read(self):
+        self.assertEqual(link.tunnel_sockets("0 0 100.90.9.118:56298 204.210.210.200:2302\n"
+                                             "0 0 100.90.140.25:40194 204.210.210.200:2302\n"),
+                         ["100.90.9.118", "100.90.140.25"])
+        self.assertEqual(link.tunnel_sockets(""), [])
+
+    def test_a_tunnel_on_an_address_lte_no_longer_has_is_restarted(self):
+        box = Box(already_connected=True, tunnel_up=True, tunnel_from="100.90.9.118")
+        link.ensure(box, 997, "vzwinternet", say=lambda m: None, home=HOME, watch=Watch())
+        self.assertIn(RESTART, box.calls)
+
+    def test_a_dead_address_socket_is_not_a_live_tunnel(self):
+        box = Box(already_connected=True, tunnel_up=True, tunnel_from="100.90.9.118")
+        watch = Watch()
+        link.ensure(box, 997, "vzwinternet", say=lambda m: None, home=HOME, watch=watch)
+        self.assertIn("down_since", watch.state)
+
+    def test_a_live_tunnel_is_not_restarted(self):
+        box = Box(already_connected=True, tunnel_up=True)
+        link.ensure(box, 997, "vzwinternet", say=lambda m: None, home=HOME, watch=Watch())
+        self.assertNotIn(RESTART, box.calls)
+
+    def test_a_fresh_bearer_restarts_the_tunnel_after_its_route_is_in(self):
+        box = Box(tunnel_up=False)
+        link.ensure(box, 997, "vzwinternet", say=lambda m: None, home=HOME, watch=Watch())
+        route = ["ip", "route", "replace", "default", "dev", "wwp0s20f0u8i5",
+                 "metric", "100", "table", "4302"]
+        self.assertLess(box.index(route), box.index(RESTART))
+
+    def test_a_watchdog_reconnect_restarts_the_tunnel(self):
+        box = Box(already_connected=True, tunnel_up=False)
+        link.ensure(box, 997, "vzwinternet", say=lambda m: None, home=HOME,
+                    watch=Watch({"down_since": 100.0, "wait": 120}, now=220.0))
+        self.assertLess(box.index(["mmcli", "-m", MODEM, "--simple-disconnect"]), box.index(RESTART))
+
+    def test_a_stopped_tunnel_unit_is_never_started_by_a_restart(self):
+        box = Box(tunnel_up=False, tunnel_unit="inactive")
+        link.ensure(box, 997, "vzwinternet", say=lambda m: None, home=HOME, watch=Watch())
+        self.assertNotIn(RESTART, box.calls)
+
+    def test_a_fresh_bearer_starts_the_clock_and_keeps_the_backoff(self):
+        # Review 2's minor: a stale down_since let the watchdog tear down a
+        # bearer the same run had just made.
+        box = Box(tunnel_up=False)
+        watch = Watch({"down_since": 0.0, "wait": 480}, now=10_000.0)
+        link.ensure(box, 997, "vzwinternet", say=lambda m: None, home=HOME, watch=watch)
+        self.assertFalse([c for c in box.calls if "--simple-disconnect" in c])
+        self.assertEqual(watch.state, {"down_since": 10_000.0, "wait": 480})
+
+    def test_a_fresh_bearer_gets_two_minutes(self):
+        self.assertEqual(link.FIRST_WAIT, 120)
+
+    def test_the_timer_runs_every_30_s_on_time(self):
+        timer = shipped("mesh-backchannel-link.timer")
+        self.assertIn("OnUnitActiveSec=30", timer)
+        self.assertIn("AccuracySec=1s", timer)
 
 
 class TheStateFile(unittest.TestCase):
