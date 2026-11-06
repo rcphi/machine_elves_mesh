@@ -832,7 +832,22 @@ Remote management of machines behind NAT is *the same problem Phase 0 exists to 
 
 1. **networkd was configuring the modem.** dracut leaves a catch-all `.network` file in `/run` that runs DHCP on every link. It put an LTE default route into main at metric 1024, one eno1 failure from carrying everything, and sent some DNS over LTE. The modem is now `Unmanaged=yes`.
 2. **riverboat kept dead sessions.** When the modem changed address, riverboat's sshd (`ClientAliveInterval 0`) held port 2201 for the dead session for about two hours, so every reconnect was refused. It now drops dead sessions in about 90 s.
-3. **The bearer was connected but useless.** After a reconnect, the bearer passed pings, yet SYNs to home went unanswered for 15 minutes. The cause is unknown: not ufw, and UniFi logged nothing. A fresh bearer cleared it. The link script now reconnects the bearer when the tunnel has been down for 5 minutes, doubling the wait up to an hour. Tested by blocking the tunnel on purpose: it reconnected at exactly 300 s, with a new address.
+3. **The bearer was connected but useless.** After a reconnect, the bearer passed pings, yet SYNs to home went unanswered for 15 minutes. The cause is unknown: not ufw, and UniFi logged nothing. A fresh bearer cleared it. The link script now reconnects the bearer when the tunnel has been down for 5 minutes, doubling the wait up to an hour. Tested by blocking the tunnel on purpose: it reconnected at exactly 300 s, with a new address. That wait was later cut to 2 minutes; see below.
+
+**Unplugging the modem, and booting without it.** Both recover with nobody at the box.
+
+- **With no modem,** the fence stays up and the script logs "no modem: the fence holds" every 30 s.
+- **When the modem is plugged in,** in any port:
+  - ModemManager takes about 24 s to find it, under a new index and a new interface name.
+  - The script, which reads both fresh every run, connects it on its next run and restarts the tunnel at once.
+  - networkd's `Type=wwan` match keeps it unmanaged.
+- **Measured from plug-in to login:**
+  - **about 35 s** when the bearer is good;
+  - **2 min 38 s** when the carrier black-holes it, because the watchdog now gives a fresh bearer 2 minutes before reconnecting.
+- **The black-hole hit 3 of the 9 fresh bearers seen,** each time the first bearer after the modem attached. All four watchdog reconnects worked straight away.
+- **Bugs this testing found, now fixed:**
+  - the script read mmcli's no-modem reply, `modem-list : 0`, as a modem path;
+  - a blocking `systemctl restart` from inside the link oneshot deadlocked for 90 s on the tunnel unit's `After=`.
 
 **One limitation for the operator.** sshd only checks for a dead session when that session has been idle for 30 s, and a login attempt through 2201 counts as activity. So retrying the login in a tight loop keeps a dead session alive. After a reboot this held recovery to 9 minutes instead of about 1. **After diamond drops off, wait 2 minutes before trying.**
 
