@@ -219,6 +219,11 @@ class StateFile:
         return time.clock_gettime(time.CLOCK_BOOTTIME)
 
 
+def say(message):
+    """Flushed, so the journal stamps each line when it happens."""
+    print(message, flush=True)
+
+
 class Failed(Exception):
     pass
 
@@ -265,7 +270,7 @@ def apply(run, found):
         run(cmd)
 
 
-def ensure(run, uid, apn, fence_only=False, say=print, home=None, watch=None):
+def ensure(run, uid, apn, fence_only=False, say=say, home=None, watch=None):
     for cmd in fence_commands(uid):
         run(cmd, tolerate_exists=True)
     if fence_only:
@@ -311,7 +316,9 @@ def watch_tunnel(run, path, apn, found, fresh, home, watch, say):
     if wanted and not live and (fresh or stale):
         reason = "a fresh bearer" if fresh else f"its connection is on {stale[0]}, which LTE no longer has"
         say(f"restarting the tunnel on {found.address}: {reason}")
-        run(["systemctl", "restart", TUNNEL_UNIT])
+        # --no-block: the tunnel unit is After= this oneshot, so waiting for
+        # its start job from in here waits on ourselves.
+        run(["systemctl", "restart", "--no-block", TUNNEL_UNIT])
     return 0
 
 

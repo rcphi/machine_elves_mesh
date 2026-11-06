@@ -356,7 +356,9 @@ class TheWatchdogOnTheBox(unittest.TestCase):
         self.assertFalse([c for c in box.calls if c[0] in ("ss", "systemctl")])
 
 
-RESTART = ["systemctl", "restart", "mesh-backchannel.service"]
+# --no-block, found on the box: the tunnel unit is After= this oneshot, so a
+# blocking restart from inside it waits on itself until the 90 s timeout.
+RESTART = ["systemctl", "restart", "--no-block", "mesh-backchannel.service"]
 
 
 class FasterRecovery(unittest.TestCase):
@@ -412,6 +414,24 @@ class FasterRecovery(unittest.TestCase):
         link.ensure(box, 997, "vzwinternet", say=lambda m: None, home=HOME, watch=watch)
         self.assertFalse([c for c in box.calls if "--simple-disconnect" in c])
         self.assertEqual(watch.state, {"down_since": 10_000.0, "wait": 480})
+
+    def test_what_it_says_reaches_the_journal_when_it_happens(self):
+        # Buffered, every line was stamped with the time the run ended,
+        # 90 s late in the deadlock, which hid the deadlock.
+        import io
+        class Out(io.StringIO):
+            flushes = 0
+            def flush(self):
+                Out.flushes += 1
+        out, saved = Out(), link.sys.stdout
+        link.sys.stdout = out
+        try:
+            link.say("hello")
+        finally:
+            link.sys.stdout = saved
+        self.assertEqual(out.getvalue(), "hello\n")
+        self.assertGreaterEqual(Out.flushes, 1)
+        self.assertIs(link.ensure.__defaults__[1], link.say)
 
     def test_a_fresh_bearer_gets_two_minutes(self):
         self.assertEqual(link.FIRST_WAIT, 120)
