@@ -284,6 +284,15 @@ the home LAN, cannot listen on any other port, and cannot listen on a public
 address. The limits are set twice, in the key line and in sshd, so either alone
 holds. `sshd -t` checks the config before any reload.
 
+**riverboat drops dead sessions** (`ClientAliveInterval 30`,
+`ClientAliveCountMax 3`). This was found on the box. When the modem reconnects
+with a new CGNAT address, diamond's socket dies with no FIN. riverboat's sshd
+default (`ClientAliveInterval 0`) leaves only TCP keepalive to notice, which
+takes about two hours. Until then the dead session holds `localhost:2201`, and
+every new tunnel fails its forward and exits. With the setting, the port frees in
+about 90 s. Idle keepalives cost a few hundred bytes a minute, roughly 25 MB a
+month of the 2 GB.
+
 ### 6. Install scripts
 
 `install-riverboat.sh` and `install-diamond.sh`, idempotent, each with

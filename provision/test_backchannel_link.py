@@ -305,6 +305,16 @@ class WhatShipsToTheBoxes(unittest.TestCase):
         self.assertIn('permitopen="127.0.0.1:1"', shipped("install-riverboat.sh"))
         self.assertIn("PermitOpen none", shipped("40-backchannel.conf"))
 
+    def test_riverboat_drops_a_dead_session_so_the_port_comes_free(self):
+        # Found in Task 8 step 4: the modem reconnected with a new CGNAT
+        # address, diamond's old socket died silently, and riverboat's sshd
+        # (ClientAliveInterval 0) kept the dead session holding 2201. Every
+        # reconnect then failed ExitOnForwardFailure until TCP keepalive
+        # reaped it, about two hours later. 30 s x 3 frees it in ~90 s.
+        conf = shipped("40-backchannel.conf")
+        self.assertIn("ClientAliveInterval 30", conf)
+        self.assertIn("ClientAliveCountMax 3", conf)
+
 
 if __name__ == "__main__":
     unittest.main()
