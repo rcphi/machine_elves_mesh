@@ -726,6 +726,15 @@ class WhatShipsToTheBoxes(unittest.TestCase):
         self.assertLess(disconnect, remove.index("10-mesh-backchannel-wwan.network"))
         self.assertLess(disconnect, remove.index("systemctl restart systemd-networkd"))
 
+    def test_the_mesh_node_may_never_use_the_lte_link(self):
+        # The other half of the separation, found needed 2026-11-14 when the
+        # node's mDNS was seen leaving by the LTE interface.
+        self.assertIn("RestrictNetworkInterfaces=lo eno1", shipped("mesh-node-lan-only.conf"))
+        script = shipped("install-diamond.sh")
+        self.assertIn("mesh-node.service.d/lan-only.conf", script)
+        remove = script[script.index("--remove)"):script.index(";;", script.index("--remove)"))]
+        self.assertIn("lan-only.conf", remove)
+
     def test_the_tunnel_may_never_use_the_friends_ethernet(self):
         self.assertIn("RestrictNetworkInterfaces=~eno1", shipped("mesh-backchannel.service.in"))
 

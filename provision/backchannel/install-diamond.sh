@@ -25,7 +25,7 @@ case "${1:-}" in
 --remove)
     systemctl disable --now mesh-backchannel.service mesh-backchannel-link.timer 2>/dev/null || true
     rm -f "$UNITS/mesh-backchannel.service" "$UNITS/mesh-backchannel-link.service" \
-          "$UNITS/mesh-backchannel-link.timer" "$BIN"
+          "$UNITS/mesh-backchannel-link.timer" "$BIN" "$UNITS/mesh-node.service.d/lan-only.conf"
     systemctl daemon-reload
     if uid="$(id -u backchannel 2>/dev/null)"; then
         ip rule del uidrange "$uid-$uid" lookup 4302 priority 1000 2>/dev/null || true
@@ -94,6 +94,10 @@ for lte in $(networkctl list --no-legend 2>/dev/null | awk '$3 == "wwan" {print 
     ip -4 addr flush dev "$lte" 2>/dev/null || true
     resolvectl revert "$lte" 2>/dev/null || true
 done
+
+# The mesh node's half of the separation: ethernet and loopback only.
+install -d -m 0755 "$UNITS/mesh-node.service.d"
+install -m 0644 "$DIR/mesh-node-lan-only.conf" "$UNITS/mesh-node.service.d/lan-only.conf"
 
 install -m 0755 "$DIR/mesh-backchannel-link" "$BIN"
 install -m 0644 "$DIR/mesh-backchannel-link.service" "$DIR/mesh-backchannel-link.timer" "$UNITS/"
