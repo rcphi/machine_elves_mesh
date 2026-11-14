@@ -34,14 +34,21 @@ pub const ATTEMPT_TIMEOUT: Duration = Duration::from_secs(2);
 /// How many times to ask before concluding the router will not answer.
 pub const ATTEMPTS: u32 = 3;
 
-/// The longest a request can take: every attempt timing out in turn.
+/// The longest a request can take: every attempt of both exchanges timing
+/// out in turn.
 ///
-/// This is the number that matters to the caller. A router that does not speak
-/// NAT-PMP at all — a phone's hotspot, most notably — never replies, so this
-/// full budget is spent on every single renewal rather than being a rare worst
-/// case. Anything awaiting a request inline is therefore unresponsive for this
-/// long, every `RENEW_EVERY`, forever.
-pub const WORST_CASE: Duration = Duration::from_secs(ATTEMPT_TIMEOUT.as_secs() * ATTEMPTS as u64);
+/// `request` asks two things — the router's public address, then the mapping —
+/// and each exchange spends up to `ATTEMPTS × ATTEMPT_TIMEOUT`. A router that
+/// never replies fails the first and costs half this; one that answers the
+/// first and ignores the second costs all of it. This said one exchange until
+/// review D6 pointed out the second.
+///
+/// The number that matters to the caller: a router that does not speak
+/// NAT-PMP — a phone's hotspot, most notably — spends this budget on every
+/// renewal, so anything awaiting a request inline would be unresponsive for
+/// this long every `RENEW_EVERY`. Only the test that pins the spawn uses it.
+#[cfg(test)]
+pub const WORST_CASE: Duration = Duration::from_secs(2 * ATTEMPT_TIMEOUT.as_secs() * ATTEMPTS as u64);
 
 #[derive(Debug, Clone, Copy, PartialEq)]
 pub struct Mapping {

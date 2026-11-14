@@ -7,31 +7,34 @@ use std::path::{Path, PathBuf};
 // The runner is a module of the binary crate, so the test compiles it directly
 // rather than depending on a library that does not exist yet.
 #[path = "../src/job.rs"]
+#[allow(dead_code)] // the job's id is used by the node, not by these tests
 mod job;
 
 use job::{Job, DEFAULT_FUEL};
 
-fn wasm(name: &str) -> Option<PathBuf> {
+/// A compiled job, which must exist.
+///
+/// These tests used to skip themselves, and pass, when a job had not been
+/// built, so a checkout without the jobs reported every one of them as
+/// passing coverage that never ran (review T1). A missing job is now a
+/// failure that says how to fix it — not a bug in the runner, but not a pass.
+fn wasm(name: &str) -> PathBuf {
     let path = Path::new(env!("CARGO_MANIFEST_DIR"))
         .join("../jobs")
         .join(name)
         .join("target/wasm32-unknown-unknown/release")
         .join(format!("{}_job.wasm", name));
-    path.exists().then_some(path)
+    assert!(
+        path.exists(),
+        "{} is not built, so the tests that run it cannot. Run ../jobs/build.sh first.",
+        path.display()
+    );
+    path
 }
 
-/// Jobs are built by a separate script, so a missing file means "not built"
-/// rather than "broken". Failing loudly here would send anyone reading it
-/// hunting for a bug in the runner.
-macro_rules! job_or_skip {
+macro_rules! job {
     ($name:expr, $fuel:expr) => {
-        match wasm($name) {
-            Some(path) => Job::load(path, $fuel).expect("loads"),
-            None => {
-                eprintln!("skipping: {} not built — run ../jobs/build.sh", $name);
-                return;
-            }
-        }
+        Job::load(wasm($name), $fuel).expect("loads")
     };
 }
 
@@ -45,7 +48,7 @@ fn inputs(world_time: u64, steel: u32, workers: u32) -> Vec<u8> {
 
 #[test]
 fn a_factory_turns_steel_into_widgets_over_time() {
-    let factory = job_or_skip!("factory", DEFAULT_FUEL);
+    let factory = job!("factory", DEFAULT_FUEL);
 
     let mut state = Vec::new();
     let mut produced = 0;
@@ -67,7 +70,7 @@ fn the_same_tick_from_the_same_state_gives_identical_bytes() {
     // The property the whole design rests on. Checkpoint-and-resume,
     // speculative execution on a second machine, and verification by re-running
     // are all only sound if this holds byte for byte.
-    let factory = job_or_skip!("factory", DEFAULT_FUEL);
+    let factory = job!("factory", DEFAULT_FUEL);
 
     let mut state = Vec::new();
     for tick in 0..10u64 {
@@ -86,7 +89,7 @@ fn a_job_cannot_smuggle_anything_between_ticks() {
     // A fresh instance every tick means globals and heap do not carry over, so
     // the rule that only state survives is a fact about how jobs are run rather
     // than something a job could choose to break.
-    let factory = job_or_skip!("factory", DEFAULT_FUEL);
+    let factory = job!("factory", DEFAULT_FUEL);
 
     let empty = Vec::new();
     let a = factory.tick(&empty, &inputs(0, 5, 2)).expect("tick");
@@ -104,10 +107,7 @@ fn a_job_cannot_smuggle_anything_between_ticks() {
 fn resuming_from_a_checkpoint_matches_never_having_stopped() {
     // Migration in miniature: carry the state to a freshly loaded runner and
     // the world continues exactly as if nothing happened.
-    let path = match wasm("factory") {
-        Some(p) => p,
-        None => return,
-    };
+    let path = wasm("factory");
 
     let uninterrupted = Job::load(&path, DEFAULT_FUEL).expect("loads");
     let mut straight = Vec::new();
@@ -141,7 +141,7 @@ fn resuming_from_a_checkpoint_matches_never_having_stopped() {
 
 #[test]
 fn a_runaway_job_is_stopped_rather_than_taking_the_machine() {
-    let runaway = job_or_skip!("runaway", 5_000_000);
+    let runaway = job!("runaway", 5_000_000);
 
     let error = runaway
         .tick(b"", b"")
@@ -158,10 +158,7 @@ fn the_ceiling_is_on_work_rather_than_on_time() {
     // Fuel counts instructions, so a busy host and an idle one stop the same
     // job at the same point. A wall-clock limit would make two machines
     // disagree about whether a tick completed.
-    let path = match wasm("runaway") {
-        Some(p) => p,
-        None => return,
-    };
+    let path = wasm("runaway");
     for fuel in [1_000_000u64, 3_000_000, 9_000_000] {
         let job = Job::load(&path, fuel).expect("loads");
         assert!(job.tick(b"", b"").is_err(), "{fuel} fuel was not a ceiling");
@@ -202,13 +199,7 @@ fn a_greedy_job_is_stopped_before_it_exhausts_the_host() {
     // ceiling a job can stay well inside its CPU budget and still take the
     // machine down, which for a volunteer running this on their own hardware is
     // the same outcome as a successful attack.
-    let path = match wasm("glutton") {
-        Some(p) => p,
-        None => {
-            eprintln!("skipping: glutton not built — run ../jobs/build.sh");
-            return;
-        }
-    };
+    let path = wasm("glutton");
 
     // Generous fuel on purpose: this must fail for running out of memory, not
     // for running out of instructions, or the test proves the wrong thing.
@@ -223,10 +214,7 @@ fn a_greedy_job_is_stopped_before_it_exhausts_the_host() {
 
 #[test]
 fn the_memory_ceiling_holds_at_several_sizes() {
-    let path = match wasm("glutton") {
-        Some(p) => p,
-        None => return,
-    };
+    let path = wasm("glutton");
     for limit in [8 * 1024 * 1024usize, 32 * 1024 * 1024, 64 * 1024 * 1024] {
         let job = job::Job::load_with(&path, 5_000_000_000, limit).expect("loads");
         assert!(job.tick(b"", b"").is_err(), "{limit} bytes was not a ceiling");
@@ -236,10 +224,7 @@ fn the_memory_ceiling_holds_at_several_sizes() {
 #[test]
 fn an_ordinary_job_is_untroubled_by_the_ceiling() {
     // A limit that also stops honest work is not a limit, it is a bug.
-    let path = match wasm("factory") {
-        Some(p) => p,
-        None => return,
-    };
+    let path = wasm("factory");
     let job = job::Job::load_with(&path, DEFAULT_FUEL, 2 * 1024 * 1024).expect("loads");
     let mut state = Vec::new();
     for tick in 0..30u64 {
