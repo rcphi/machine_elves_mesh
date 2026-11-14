@@ -1,0 +1,40 @@
+[Unit]
+Description=Machine Elves inbound responder: sends a packet in after a client's silence
+Documentation=file:/usr/local/share/mesh-probe/README.md
+After=network-online.target
+Wants=network-online.target
+
+[Service]
+Type=simple
+User=meshprobe
+Group=meshprobe
+# RESPONDER_PORT and MESH_PROBE_INBOUND_TOKEN. Readable by root and meshprobe only.
+EnvironmentFile=/etc/mesh-probe/inbound
+ExecStart=/usr/local/bin/mesh-probe --inbound-responder --port ${RESPONDER_PORT}
+Restart=always
+RestartSec=5
+
+StandardOutput=journal
+StandardError=journal
+
+NoNewPrivileges=true
+PrivateTmp=true
+PrivateDevices=true
+ProtectSystem=strict
+ProtectHome=true
+ReadWritePaths=/var/log/mesh-probe
+ProtectKernelTunables=true
+ProtectKernelModules=true
+ProtectKernelLogs=true
+ProtectControlGroups=true
+ProtectClock=true
+ProtectHostname=true
+RestrictAddressFamilies=AF_INET AF_INET6 AF_UNIX AF_NETLINK
+RestrictNamespaces=true
+RestrictRealtime=true
+RestrictSUIDSGID=true
+LockPersonality=true
+MemoryDenyWriteExecute=true
+SystemCallArchitectures=native
+SystemCallFilter=@system-service
+CapabilityBoundingSet=

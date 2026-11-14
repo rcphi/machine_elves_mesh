@@ -1,0 +1,42 @@
+[Unit]
+Description=Machine Elves inbound mapping-lifetime test (a peer sends in after the silence)
+Documentation=file:/usr/local/share/mesh-probe/README.md
+After=network-online.target
+Wants=network-online.target
+
+[Service]
+Type=oneshot
+User=meshprobe
+Group=meshprobe
+EnvironmentFile=/etc/mesh-probe/config
+# RESPONDER and MESH_PROBE_INBOUND_TOKEN. Readable by root and meshprobe only.
+EnvironmentFile=/etc/mesh-probe/inbound
+ExecStart=/usr/local/bin/mesh-probe --mapping-inbound --responder ${RESPONDER} --json --label ${LABEL}
+
+# Silent for up to 600 s, plus the flow before it and the probes after.
+TimeoutStartSec=900
+
+StandardOutput=append:/var/log/mesh-probe/results.jsonl
+StandardError=journal
+
+NoNewPrivileges=true
+PrivateTmp=true
+PrivateDevices=true
+ProtectSystem=strict
+ProtectHome=true
+ReadWritePaths=/var/log/mesh-probe
+ProtectKernelTunables=true
+ProtectKernelModules=true
+ProtectKernelLogs=true
+ProtectControlGroups=true
+ProtectClock=true
+ProtectHostname=true
+RestrictAddressFamilies=AF_INET AF_INET6 AF_UNIX AF_NETLINK
+RestrictNamespaces=true
+RestrictRealtime=true
+RestrictSUIDSGID=true
+LockPersonality=true
+MemoryDenyWriteExecute=true
+SystemCallArchitectures=native
+SystemCallFilter=@system-service
+CapabilityBoundingSet=

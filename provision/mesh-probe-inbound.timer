@@ -1,0 +1,12 @@
+[Unit]
+Description=Measure, from outside, how long this router remembers an idle flow
+Documentation=file:/usr/local/share/mesh-probe/README.md
+
+[Timer]
+OnBootSec=7min
+OnUnitActiveSec=25min
+RandomizedDelaySec=10min
+Persistent=true
+
+[Install]
+WantedBy=timers.target
