@@ -35,28 +35,29 @@ cargo run --release
 It takes under a minute and prints a summary line to send back, of the form:
 
 ```
-PROBE v0.1 | ipv4=nat-endpoint-independent | ipv6=none | relay-capable=no
+PROBE v0.1 | ipv4=nat-endpoint-independent | ipv6=none | relay-candidate=no
 ```
 
 ## Reading the result
 
 | `ipv4=` | Meaning |
 |---|---|
-| `public` | No translation. Can accept incoming connections and can carry relay duty. |
+| `public` | No translation. A candidate to accept incoming connections and carry relay duty; a firewall may still drop them. |
 | `nat-endpoint-independent` | Behind NAT, but predictable. Hole punching should work. |
 | `nat-address-dependent` | Behind NAT that varies the external port per destination. Hole punching unreliable; needs a relay. |
 | `cgnat` | Carrier-grade NAT. No incoming connections on IPv4 at all. |
 | `double-nat` | Two or more layers of translation. Treat as `cgnat`. |
+| `nat-unclassified` | Behind NAT, but only one STUN operator answered, so the mapping could not be classified. |
 | `unreachable` | No STUN server answered — outbound UDP is likely blocked. |
 
-**`relay-capable=yes` on at least one volunteer is what Phase 0 needs.** With no
-rented infrastructure, a peer that cannot be reached directly needs a peer that
-can, and that has to be one of the participants.
-
-If every volunteer reports `relay-capable=no` and `ipv6=none`, the stop
-criterion in `../docs/phase-0-plan.md` has been met on day one. That is a
-genuine finding rather than a failure, and it arrives for the cost of one
-afternoon instead of one year.
+**`relay-candidate` is a candidate, not a confirmation.** STUN shows how an
+address is translated, not whether anything can get in: a firewall can drop
+every inbound packet to a global address, and a router that opens a port on
+request turns a translated machine into a reachable one. Phase 0 needs at
+least one participant that is *actually* reachable, and that is shown by peer
+evidence (a mesh node's incoming connections, a granted port mapping), never
+by this field alone. In practice the deciding route was a port mapping on a
+machine this probe reports as `relay-candidate=no`.
 
 ## Mapping lifetime
 
@@ -80,7 +81,12 @@ the mesh is waking machines and burning battery for nothing.
 
 **The method:** learn the external port, send absolutely nothing for a set
 interval, then ask the same server again through the same socket. An unchanged
-port means the mapping survived.
+port means the mapping survived — **unless the router preserves port numbers.**
+The second question is itself outbound, so an expired mapping is recreated by
+it, and a port-preserving router gives the new one the old number. On those
+routers this method cannot see expiry at all, and the probe now reports such a
+result as `inconclusive` with that reason (it compares against its own local
+port). Both routers measured in Phase 0 preserve ports; see the next section.
 
 Two details that make the answer trustworthy:
 
@@ -110,6 +116,24 @@ range from about 30 seconds to many minutes.
 confirmed-safe value, **taken across machines rather than averaged.** A peer
 whose mapping has expired is unreachable no matter how patient the others are,
 so the mesh is governed by the worst router among the players.
+
+## Mapping lifetime, measured from outside
+
+```
+MESH_PROBE_INBOUND_TOKEN=… mesh-probe --inbound-responder --port 3479   # reachable machine
+MESH_PROBE_INBOUND_TOKEN=… mesh-probe --mapping-inbound --responder HOST:3479
+```
+
+The same question, answered without speaking after the silence. A cooperating
+peer — one of the participants, never a rented server — reports the address it
+observes, exchanges a three-second flow with the client so the router treats
+it like a real connection, waits out the silence, and then sends a packet
+*in*. Arrival is survival. Silence is expiry, once a check afterwards confirms
+the path itself works. While it waits, the responder keeps its own router's
+half alive with keepalives whose TTL lets them die a hop past that router;
+one that reaches the client voids the run instead of being counted. Full
+reasoning in `src/inbound.rs`; `inbound-rig.sh` checks it against real Linux
+NAT in network namespaces, where the right answers are known.
 
 ## What it deliberately does not test
 

@@ -82,17 +82,31 @@ This is the measurement that most rewards shipping the boxes early: it costs an
 hour to build and produces nothing but time, which a box in someone's house has
 in abundance and a development machine does not.
 
+**On a router that preserves port numbers it cannot see expiry**, and both
+routers measured so far do. So a third, optional measurement asks from
+outside: `--mapping-inbound`, on its own timer, against a responder on a
+reachable participant. Install the two halves with `install-inbound.sh`
+(`--responder` on the reachable box, which also needs its router to forward
+the UDP port; `--client HOST:PORT` on the measured one). `summarise.py`
+counts only results that can tell survival from expiry, per network.
+
 ## Isolating the box from the household
 
 `--isolate-lan` additionally blocks the box from reaching the volunteer's other
 devices, permitting only the gateway and the internet, with public DNS
-configured so that name resolution survives losing the router's resolver.
+configured so that name resolution survives losing the router's resolver. It
+runs `isolate-lan`, which can also be run on its own, and covers both address
+families: IPv4 private, link-local and multicast ranges; IPv6 unique-local,
+link-local, and the mDNS and LLMNR groups; and any other route on the LAN
+interface. It then **proves** the result: one test packet into every rejected
+destination, each of which must be counted by its rule.
 
 **It is opt-in, and deliberately so.** A firewall rule that strands a box in
-someone else's house is not remotely recoverable. The script therefore verifies
-that the box can still reach a STUN server after applying the rules, and rolls
-the whole change back automatically if it cannot. **Run it while the box is
-still on your bench**, not after it has shipped.
+someone else's house is not remotely recoverable unless the box has its own
+back channel, as diamond does. The script therefore checks that the internet
+still answers after applying the rules, and rolls the whole change back
+automatically if it does not. Without a back channel, **run it while the box
+is still on your bench**.
 
 It is worth doing anyway: a friend's other devices are not part of the
 experiment, and their household should not have to think about what the box can

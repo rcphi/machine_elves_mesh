@@ -297,6 +297,8 @@ A laptop on a phone hotspot, which is a genuinely different path from the home l
 
 Diamond has now run 45 measurements over about a day without a single expiry, so its router's limit is somewhere past ten minutes and has never been found. The hotspot's sits **between 120 and 300 seconds**.
 
+> **Corrected 2026-11-14: diamond's column proves nothing.** The test asks a STUN server again after the silence, and that question is itself outbound. If the mapping had expired, it makes a new one, and a router that preserves port numbers gives the new one the old number, so "unchanged" cannot tell survival from expiry. The home router preserves ports: the probe's fixed port 41999 came back as 41999 in 3,251 of 3,380 readings. So none of the "survived" rows above, and none of the ~3,650 that followed, is evidence, and "past ten minutes" is unproven. The hotspot's column stands, because its finding is an *expiry*, and a changed port is expiry on any router. So does the 55 s keepalive drawn from it. Raised by the external review of 2026-11-07 (finding 3). I first disputed it from a truncated count, and was wrong. Fixed in `319307e`; see "Measuring idle timeouts properly" below.
+
 The keepalive the mesh may use is governed by the worst connection among the players rather than the average, so the mobile figure decides it: **120 s confirmed safe, halved to 60 s**, because the measured value is where the mapping was still alive rather than where it dies, and a keepalive that only just makes it is one dropped packet away from not making it.
 
 **Shipped: 55 s**, leaving better than a twofold margin on the shorter of the two connections measured.
@@ -814,7 +816,7 @@ Remote management of machines behind NAT is *the same problem Phase 0 exists to 
 
 - **Five minutes, both directions:**
   - **0 packets** of tunnel traffic on eno1;
-  - **0 packets** on LTE other than the tunnel.
+  - **0 packets** on LTE other than the tunnel. *(Not the whole story; see "The mesh node was announcing itself over LTE" below.)*
 - **Fence removed, unit limit alone:** 0 tunnel packets on eno1 in 75 s.
 - **What riverboat lets the key do:** no shell, no `-R` on any other port, and an `-L` that opens but carries nothing ("administratively prohibited").
 - **LTE down:** the tunnel user gets `No route to host` and never falls through to eno1.
@@ -877,9 +879,24 @@ Remote management of machines behind NAT is *the same problem Phase 0 exists to 
 
 **Data cost.** It's small: tens of KB an hour while idle, and about 25 MB a month of keepalives against the 2 GB plan.
 
+**The mesh node was announcing itself over LTE — found and fixed 2026-11-14.** `--no-mdns` kept libp2p's mDNS behaviour with a year-long query interval, on the theory that it would never speak. It still joined the mDNS group on every interface, the LTE link included, and probed at 0.5 s, 1 s, 2 s, 4 s and so on after every node start and every new address on an interface, which is what a fresh bearer gives the modem.
+
+- **Before** (tcpdump on the LTE interface while the node restarted): 20 packets in 56 s. These were queries, plus 1,400-byte answers listing the node's own addresses.
+- **After** (`de6ec47`, the behaviour is absent under `--no-mdns`): 0 packets in 70 s. No sockets on 5353, and no membership of 224.0.0.251 on any interface.
+
+The 5-minute capture above could not have seen it: nothing restarted and no bearer changed inside it. The data was trivial, but it broke the contamination rule, which this section had said was "enforced, not intended". It is now, for this path. Raised by the external review (finding 10) and confirmed live on the box.
+
 ### On the volunteer's household
 
 The box sits on someone else's home network. **Firewall it away from their LAN**, permitting only outbound internet and the mesh ports. This is partly courtesy and partly correctness: a friend's other devices are not part of the experiment, and their household should not have to think about what the box can see.
+
+**Applied to diamond at the friend's house, 2026-11-14,** by `provision/isolate-lan`. The first, hand-applied version blocked four IPv4 ranges only. The friend's LAN carries two unique-local IPv6 prefixes, one of them behind a second router that looks like a smart-home hub, and multicast was open, which is how the node's mDNS reached their network. It now rejects outbound traffic to:
+
+- the IPv4 private, link-local and multicast ranges;
+- IPv6 unique-local and link-local addresses, and the mDNS and LLMNR groups;
+- any other route on the LAN interface.
+
+The gateway is allowed first. Applying it proves it: one test packet goes into every rejected destination, and the rule meant to catch it must count it. On the box: "verified: the internet answers, and every rejected destination was caught".
 
 Volunteers should be told plainly what the machine does, that it can be remotely accessed by the operator, and that unplugging it at any time is fine and breaks nothing.
 
@@ -890,6 +907,29 @@ Volunteers should be told plainly what the machine does, that it can be remotely
 **The cost is representativeness, and it must not be forgotten later.** Real players will run Windows, macOS, or a desktop Linux, on machines they are also using for other things — machines that sleep when the lid closes, that lose wifi when someone microwaves lunch, that share bandwidth with a video call. A dedicated always-on server on a wired connection is the *best* case in every one of those dimensions.
 
 **Phase 0 therefore measures the network, not the player's machine.** Its results are an upper bound on how well the real thing will behave. Desktop-OS behaviour, contention with other applications, and sleep/wake cycles are deferred to a phase where there is a game to run on them, and any conclusion drawn here should be stated as "at best."
+
+## Measuring idle timeouts properly — 2026-11-14
+
+`--mapping-lifetime` cannot see expiry on a router that preserves port numbers, and both routers measured so far do (see the correction under "First results from a second internet connection"). So `--mapping-inbound` never speaks after the silence. A cooperating peer, one of our own machines and never a rented server, sends a packet in once the silence is over. If it arrives, the mapping survived without being refreshed. That is the property a peer-to-peer connection needs, because it is the peer's packet that must get through.
+
+**How a run goes, on one socket:**
+- The responder (riverboat, `mesh-probe-responder.service`, UDP 3479 forwarded by the home router) reports the address it observes, so no STUN server is involved.
+- The two sides exchange a 3-second two-way flow, so the router treats it like a mesh connection rather than a single request.
+- After the silence, the responder sends three probes, a second apart. If none arrives, a check confirms that the path itself still works before the run counts as an expiry.
+
+**riverboat's own router must not forget its half meanwhile.** That router randomises ports. If it forgot the flow, the probe would leave from a new port and be filtered out at the client: a false expiry. So during the silence the responder sends keepalives with TTL 2. They refresh its own router and die one hop later, long before the client's router. If one ever arrives, the run is inconclusive, so the assumption checks itself.
+
+**Checked against real Linux NAT in namespaces** (`probe/inbound-rig.sh`), with a port-preserving client router timing out at 20 s and a port-randomising responder router at 12 s:
+
+| Case | Result |
+|---|---|
+| 8 s silence | survived |
+| 30 s silence | **expired**, which `--mapping-lifetime` could never report on that router |
+| 16 s silence, keepalives on | survived |
+| 16 s silence, keepalives off | expired, falsely |
+| Keepalive TTL of 5 | caught, reported inconclusive |
+
+**First result from the friend's router, 2026-11-14 01:53 UTC:** 60 s of silence, survived. The probe arrived 60,008 ms after the last packet diamond heard; all 3 flow echoes came back; local port 59228 came back unchanged as 75.118.77.81:59228. `summarise.py` now counts only evidence that can tell survival from expiry, and reports separately for each network a machine has been on. Until each site has confirmed evidence, it gives no mesh-wide keepalive interval.
 
 ## Provisioning
 
@@ -906,7 +946,7 @@ Household isolation (`--isolate-lan`) is opt-in, verifies internet reachability 
 ## What gets built, in order
 
 1. **Connection probe** (above) — *done*. Ship to volunteers, collect results.
-1a. **Mapping lifetime** — *done*. How long a consumer router holds an idle mapping open before dropping it. Each run tests one idle interval chosen from a list, and the answer accumulates over days. Determines the keepalive interval the mesh will need, which is set by the **worst** router among the players rather than the average one.
+1a. **Mapping lifetime** — *done, then found blind on port-preserving routers (2026-11-14), and replaced by an inbound test.* How long a consumer router holds an idle mapping open before dropping it. Each run tests one idle interval chosen from a list, and the answer accumulates over days. Determines the keepalive interval the mesh will need, which is set by the **worst** router among the players rather than the average one. Both routers measured so far preserve ports, so only `--mapping-inbound` results count for them; see "Measuring idle timeouts properly".
 2. **Local rig** — *done*. Several nodes forming an overlay, gossiping membership, and noticing departures. `node/rig.sh` runs it and checks the result. Processes rather than containers for now: they share one host and reach each other trivially, so this tests the logic and nothing about real networks.
 3. **Job execution** — *done*. Sandboxed WebAssembly with a CPU ceiling, in `node/src/job.rs`. Sample jobs in `jobs/`, built by `jobs/build.sh`.
 4. **Checkpoint and migrate** — *done*. A job whose host disappears is continued by a survivor, from the last checkpoint. `node/migration-rig.sh` runs it and checks the result.

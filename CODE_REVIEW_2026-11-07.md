@@ -352,3 +352,35 @@ The temporary harnesses and their outputs did not survive `/tmp`. Recreate the d
 ## Completion record for Claude Code
 
 For each numbered finding and cleanup item, record whether it was fixed, superseded, disputed with evidence, or accepted as an explicit Phase 0 limitation. Include changed paths, tests actually run and their results, any protocol/data compatibility impact, and remaining physical-rig validation. Keep implementation diffs separate from this original review specification.
+
+---
+
+# Completion record
+
+Kept separate from the review above, which is unchanged from what was received. Each finding is checked against the code before anything changes. "Verified" means checked in the code or on the boxes, not taken from the review.
+
+## Group 1: done 2026-11-14, because the measurement in progress at the friend's house depended on it
+
+| # | Status | What was found, what changed, and the evidence |
+|---|---|---|
+| 3 | **Fixed.** I disputed this first; the review was right. | Verified: both routers measured preserve ports. At home, port 41999 came back unchanged in 3,251 of 3,380 readings for diamond and 2,692 of 2,734 for riverboat; most of the rest are the two boxes clashing on one local port. At the friend's house, 49 of 49. So every `--mapping-lifetime` "survived" from either router, about 3,700 of them, is unproven. Expiries stay valid: the hotspot's 120–300 s bracket and the 55 s keepalive drawn from it stand. I first disputed the claim about the home router from a count that printed only its first twelve categories; that was my error. **Changes:** `--mapping-lifetime` records its local port and reports a preserved port as inconclusive (`judge_mapping`). New `--mapping-inbound` / `--inbound-responder` (`probe/src/inbound.rs`): a peer sends a packet in after the silence, after a 3 s two-way flow, with TTL-limited keepalives guarding the responder's own router, and a check that voids the run if one leaks through. `319307e`. **Tests:** probe tests went from 13 to 29. `probe/inbound-rig.sh` runs against real Linux NAT in namespaces, 5 of 5: survived, expired, kept alive, a false expiry without keepalives, and a leak caught. **On the boxes:** riverboat's responder, with UDP 3479 forwarded by the home router; diamond's timer. First result, 2026-11-14 01:53 UTC: 60 s, survived, probe arrived after 60,008 ms. Historical raw data kept; the plan's conclusions are qualified in place. |
+| 10 | **Fixed** | Verified live on diamond under `--no-mdns`: two sockets on udp/5353 owned by `meshnode`, and 224.0.0.251 joined on eno1 **and on the LTE interface**. libp2p-mdns probes at 0.5, 1, 2, 4 s and onward after every start or new interface address. **Change:** `Toggle<mdns>`, `None` when disabled. `de6ec47`. **Evidence on the box:** a tcpdump on LTE during a node restart showed 20 packets in 56 s before the change and 0 in 70 s after. No 5353 sockets and no mDNS group membership remain. |
+| 12 | **Fixed** | Verified: a machine with no successful interval was left out of the recommendation, and there was a 15 s floor. Every site must now have confirmed evidence, or no interval is given; the floor is removed. The review's case is now a test. `d1c0a5a`. |
+| 13 | **Fixed** | `relay_candidate` is now reported as a STUN-only candidate, and the proceed/stop verdicts are removed: STUN alone cannot meet or clear a stop criterion. `d1c0a5a`. The probe README is corrected (part of D3). |
+| 18 | **Fixed, and deployed on diamond** | Verified: the friend's LAN has two unique-local IPv6 prefixes (one behind a second router) and link-local neighbours, all reachable, and multicast was open. `provision/isolate-lan` covers both families plus multicast and other LAN routes, and verifies by counting each rule's hits. `dda3bc1`. **Tests:** 16 unit tests, plus `isolate-lan-rig.sh` against real iptables (including a negative control). **On the box:** "verified: the internet answers, and every rejected destination was caught". |
+
+Also changed in Group 1, beyond the review: `summarise.py` reports per network (diamond at home and at the friend's house are two routers), and decides port preservation from the majority of a site's readings rather than the nearest one.
+
+## Checked so far, no fix yet: does any historical number change?
+
+| # | Finding | Effect on past results |
+|---|---|---|
+| 4 | The "kept working elsewhere" rule is too loose | Across Night A run 2, Run C, Run D and Night B, only 2 disruptions were ever excused this way, both in Run D. In both, the survivor's tick count rose steadily (6270 → 6570 → 6870 and 21070 → 21370 → 21670, 300 per minute). The historical "0 orphaned" holds. The rule is still to be tightened in Group 2. |
+| 15 | Rotations `.10` and up are not discovered | Confirmed: `run-d/diamond/events.jsonl.10.gz`–`.14.gz` are skipped. All of them end before Run D was armed, so no Run D number moves. Still to be fixed in Group 2. |
+
+## Planned
+
+- **Group 2, before Run E:** 1, 2, 4, 5, 6, 7, 9, 11, 14, 15, 19, 20; D1, D3 (rest), D5, D6; T1.
+- **To be accepted as Phase 0 limitations and documented:** 8, logging an explicit `cold-start` event instead of building checkpoint persistence; 16, restarting an active node on re-run, without preserving hand-edited settings.
+- **Declined:** 17, because no more fresh boxes are planned and the documented path is a checkout. T2, because restructuring a spike meant to be thrown away costs more than the five tests running twice.
+- **One priority disputed:** 2 is hardening rather than P1, since Phase 0 only runs our own compiled job. It will be done anyway, because it is cheap.
