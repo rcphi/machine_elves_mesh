@@ -41,11 +41,13 @@ cleanup() {
 trap cleanup EXIT
 
 # Nodes find each other by broadcasting on the local network, so anything left
-# running from an earlier attempt joins this mesh and changes the result. Each
-# case also gets its own mesh name, since a node killed a moment ago may still
-# be exiting.
-pkill -x mesh-node 2>/dev/null || true
-sleep 1
+# running from an earlier attempt could join this mesh and change the result.
+# Each case therefore gets its own mesh name, and this run its own ports, so a
+# leftover can neither join nor hold a port this run needs. Nothing outside
+# the processes this rig started is ever signalled: it used to `pkill -x
+# mesh-node`, which also killed any node the user was running for real
+# (review finding 19).
+BASE=$(( 20000 + (RANDOM % 400) * 100 ))
 
 now_ms() { echo $(( $(date +%s%N) / 1000000 )); }
 fails=0
@@ -68,11 +70,11 @@ run_case() {
 
     # shellcheck disable=SC2046
     "$BIN" --label owner --mesh "$mesh" --job "$JOB" --own --detect-ms "$DETECT_MS" --json \
-        $(own_files 4201 owner) "${EXTRA[@]}" > "$OUT/owner.log" 2>&1 &
+        $(own_files $((BASE + 1)) owner) "${EXTRA[@]}" > "$OUT/owner.log" 2>&1 &
     local owner=$!
     pids+=($owner)
     sleep 1
-    local port=4202
+    local port=$((BASE + 2))
     for s in a b; do
         # shellcheck disable=SC2046
         "$BIN" --label "standby-$s" --mesh "$mesh" --job "$JOB" --detect-ms "$DETECT_MS" --json \
@@ -113,26 +115,46 @@ run_case() {
 
     local takeovers
     takeovers=$(cat "$OUT"/*.log | grep -c '"event":"took-over"') || takeovers=0
-    # At least one node must continue the work. More than one is wasteful
-    # rather than wrong — they run identical ticks from identical state — but it
-    # is worth seeing, because whatever applies effects has to tolerate it.
+    # Exactly one node must continue the work. Two is not merely wasteful: the
+    # timed runs count "more than one took over" among the things that must
+    # stay at zero, and a rig that only noted it would pass what a run fails.
     if (( takeovers < 1 )); then
         echo "  FAIL  $name: nobody continued the job"
         fails=$((fails+1)); cleanup; return
     fi
     if (( takeovers > 1 )); then
-        echo "  note  $name: $takeovers nodes continued it — duplicate work, and"
-        echo "        a reminder that effects must be identified by (job, tick)"
+        echo "  FAIL  $name: $takeovers nodes took over; the election must pick one"
+        fails=$((fails+1)); cleanup; return
     fi
 
-    local line ts delta tick
-    line=$(cat "$OUT"/*.log | grep '"event":"took-over"' | head -1)
+    local line ts delta tick successor
+    successor=$(grep -l '"event":"took-over"' "$OUT"/*.log | head -1)
+    line=$(grep '"event":"took-over"' "$successor" | head -1)
     ts=$(sed 's/.*"ts_unix_ms":\([0-9]*\).*/\1/' <<< "$line")
     tick=$(sed 's/.*"tick":"\([0-9]*\)".*/\1/' <<< "$line")
     delta=$(( ts - at ))
 
+    # Winning the election is not continuing the work. The successor must
+    # also have run a tick of it — its `resumed` — and not failed afterwards:
+    # a takeover whose first tick failed used to pass (review finding 19).
+    # Under speculation the resume comes before the takeover it belongs to,
+    # so it is looked for anywhere after the kill.
+    local resumed failed resumed_ms=""
+    resumed=$(awk -v at="$at" -F'"ts_unix_ms":' '/"event":"resumed"/ { split($2, t, ","); if (t[1] + 0 >= at) { print; exit } }' "$successor")
+    failed=$(awk -v at="$at" -F'"ts_unix_ms":' '/"event":"job-failed"/ { split($2, t, ","); if (t[1] + 0 >= at) { print; exit } }' "$successor")
+    if [[ -z "$resumed" ]]; then
+        echo "  FAIL  $name: $(basename "$successor" .log) took over but never ran a tick"
+        fails=$((fails+1)); cleanup; return
+    fi
+    if [[ -n "$failed" ]]; then
+        echo "  FAIL  $name: $(basename "$successor" .log) took over and then the job failed"
+        fails=$((fails+1)); cleanup; return
+    fi
+    resumed_ms=$(( $(sed 's/.*"ts_unix_ms":\([0-9]*\).*/\1/' <<< "$resumed") - at ))
+
     if (( delta <= budget )); then
-        printf '  ok    %-24s resumed at tick %-4s after %5d ms (budget %d)\n' "$name" "$tick" "$delta" "$budget"
+        printf '  ok    %-24s took over at tick %-4s after %5d ms (budget %d); first tick after %5d ms\n' \
+            "$name" "$tick" "$delta" "$budget" "$resumed_ms"
     else
         printf '  FAIL  %-24s took %d ms, over the %d ms budget\n' "$name" "$delta" "$budget"
         fails=$((fails+1))
@@ -161,8 +183,8 @@ return_case() {
             --identity "$OUT/$1.identity" --ledger "$OUT/$1.ledger" "${EXTRA[@]}" >> "$OUT/$1.log" 2>&1 &
         pids+=($!)
     }
-    start_node stays 4301 4302
-    start_node returns 4302 4301
+    start_node stays $((BASE + 11)) $((BASE + 12))
+    start_node returns $((BASE + 12)) $((BASE + 11))
     local returner=$!
 
     local deadline=$((SECONDS + 15))
@@ -178,7 +200,7 @@ return_case() {
     sleep 4
     local before
     before=$(grep -c '"event":"joined"' "$OUT/stays.log") || before=0
-    start_node returns 4302 4301
+    start_node returns $((BASE + 12)) $((BASE + 11))
     sleep $(( budget_ms / 1000 ))
 
     local after
