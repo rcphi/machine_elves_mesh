@@ -1,5 +1,7 @@
 # Speculative Resume Implementation Plan
 
+> **Historical — completed.** Kept for its reasoning and original targets; its unchecked boxes are not outstanding work. What was built, and what it measured, is in `docs/phase-0-plan.md`.
+
 > **For agentic workers:** REQUIRED SUB-SKILL: Use superpowers:subagent-driven-development (recommended) or superpowers:executing-plans to implement this plan task-by-task. Steps use checkbox (`- [ ]`) syntax for tracking.
 
 **Goal:** A standby continues a job as soon as its owner is *suspected* gone, so the player-visible stall falls from ~2.45 s to ~600 ms.

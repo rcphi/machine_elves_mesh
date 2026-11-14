@@ -45,20 +45,25 @@ Violating any of these silently invalidates the experiment.
 | | |
 |---|---|
 | `docs/phase-0-plan.md` | Scope, the two test rigs, thresholds, stop criteria, build order |
-| `probe/` | The connection probe. Rust, std-only, 13 tests |
-| `provision/` | Unattended box setup, systemd units, collection and analysis |
+| `probe/` | The connection probe, including the inbound idle-timeout test. Rust, std-only |
+| `node/` | The mesh node, and the local rigs (`rig.sh`, `migration-rig.sh`, `chaos-rig.sh`) |
+| `jobs/` | Sample WASM jobs; `build.sh` builds them, and the node's tests need them |
+| `provision/` | Unattended box setup, systemd units, the LTE back channel, collection and analysis |
 
 ## State
 
-Done: the connection probe (classification plus mapping lifetime) and the
-provisioning to run it unattended on volunteer boxes.
+Done: the connection probe, the provisioning, and the mesh node — overlay and
+gossip, sandboxed WASM jobs with fuel and memory limits, checkpointing, and
+takeover with speculative resume — measured on real boxes in Night A and Runs
+B–D. diamond has lived at a friend's house since 2026-11-12, managed over an
+LTE back channel; the inbound idle-timeout test runs there against riverboat.
+An external review (`CODE_REVIEW_2026-11-07.md`) is being worked through; its
+completion record says what is fixed.
 
-Next: the mesh node — overlay formation and gossip, sandboxed WASM job
-execution with fuel metering, checkpointing, and resume when a host vanishes.
-Start on the local container rig, which exercises the logic but tells you
-nothing about real networks.
+Next: Run E — diamond at the friend's house against riverboat at home, the
+first run across two households. `docs/phase-0-plan.md` is the record.
 
-Available: 3 home connections. No VPSs, by decision.
+Available: 3 home connections and one friend's. No VPSs, by decision.
 
 ## Conventions
 
