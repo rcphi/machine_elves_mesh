@@ -1,6 +1,6 @@
 # Phase 0 — Mesh Spike
 
-**Status:** Planning. No code yet.
+**Status:** Built and measured. Night A and Runs B–D are done; diamond has been at a friend's house since 2026-11-12; Run E, across two households, is next. Every result is an upper bound — see "Ubuntu Server, and what that costs". *(This line said "Planning. No code yet." until 2026-11-14.)*
 **Language:** Rust — Wasmtime is Rust-native and provides the fuel metering §11.4 requires, libp2p's Rust implementation covers §11.6's overlay and gossip, and it produces a single static binary volunteers can run without setup.
 **Started:** 2026-08-20
 **Design document:** `../machine_elves/docs/superpowers/specs/2026-07-31-machine-elves-design.md` — §11 (compute mesh), §9 (persistence and degradation), §19 (MVP scope). This repo implements only what §19.5 calls Phase 0.
@@ -930,6 +930,38 @@ Volunteers should be told plainly what the machine does, that it can be remotely
 | Keepalive TTL of 5 | caught, reported inconclusive |
 
 **First result from the friend's router, 2026-11-14 01:53 UTC:** 60 s of silence, survived. The probe arrived 60,008 ms after the last packet diamond heard; all 3 flow echoes came back; local port 59228 came back unchanged as 75.118.77.81:59228. `summarise.py` now counts only evidence that can tell survival from expiry, and reports separately for each network a machine has been on. Until each site has confirmed evidence, it gives no mesh-wide keepalive interval.
+
+## Before Run E: what the review's second group changed — 2026-11-14
+
+The external review of 2026-11-07 (`CODE_REVIEW_2026-11-07.md`, with its completion record) found faults that would have shaped Run E's numbers. They are fixed, and none of the earlier runs' numbers moved.
+
+**Changes that matter for Run E:**
+
+- **Only nodes holding the same job are candidates in the election.** Heartbeats now carry the job's code hash, and checkpoints name their job. Before this, a lower-identifier member with no job, or a different one, won every election and did nothing.
+  - **Both boxes must run this build.** Checkpoints are a new message kind (9; kind 3 is retired), so an older node ignores them rather than misreading a job id as a tick. Two builds in one mesh would each run the job: no items are duplicated, because serials repeat, but no checkpoints are exchanged.
+- **Every takeover names the owner it continued.** The summary matches each takeover to one disruption. Older logs fall back to timing, and are flagged when another disruption could have caused the takeover.
+- **A takeover with no previous owner names nobody.** A claim at tick 0 by a node whose ledger is not empty says `cold-start`, because progress is not kept on disk: a Phase 0 limitation, said rather than hidden.
+- **Production, checkpoints and ledger writes have stated limits and report their failures.** Before this, publish failures were dropped silently, a standby's failed ledger write was forgotten, and a torn ledger record corrupted every later append.
+- **On diamond, the mesh node can use only ethernet and loopback** (`RestrictNetworkInterfaces=lo eno1`). This is the mirror of the tunnel's ban on eno1. Routing alone had not kept the node's multicast off LTE.
+
+**The tools were re-checked against every earlier run.** The takeover summary now counts "kept working elsewhere" only when the tick count keeps its previous pace, uses each takeover once, and reads every rotation. On Night A, Night A run 2, Night B, Run C and Run D, the only difference in any output is the list of files read.
+
+**Re-checked on the local rigs with the new build:**
+
+| Rig | Result |
+|---|---|
+| `migration-rig.sh`, which now requires a resumed tick and fails on two takeovers | announced departure: took over in 2 ms, first tick at 150 ms; unannounced loss: took over in 1,942 ms, first tick at 542 ms |
+| `chaos-rig.sh`, 15 min | 20 disruptions; the four counts that must stay zero all stayed zero; detection p95 2,499 ms; resume p95 201 ms; visible gap p95 1,199 ms (September's figure); 13 suspicions, all confirmed |
+
+**The probe log had never rotated, on either box.** systemd creates the log as root, and the logrotate policy switched to `meshprobe` before opening it. On diamond, logrotate logged "Permission denied" every week. The policy is fixed, and `collect.sh` now reads rotations and adds to its archive, so the first real rotation cannot drop history from the dataset.
+
+**To install before Run E:**
+- the new node and probe on both boxes;
+- the logrotate policy on both;
+- the `lan-only` drop-in on diamond;
+- a UDP port forward for 4001 to riverboat. riverboat has to be the reachable member, because the friend's router does not answer NAT-PMP.
+
+The Run E handover will list these as commands.
 
 ## Provisioning
 

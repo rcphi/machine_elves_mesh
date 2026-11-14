@@ -371,16 +371,60 @@ Kept separate from the review above, which is unchanged from what was received. 
 
 Also changed in Group 1, beyond the review: `summarise.py` reports per network (diamond at home and at the friend's house are two routers), and decides port preservation from the majority of a site's readings rather than the nearest one.
 
-## Checked so far, no fix yet: does any historical number change?
+## Group 2: done 2026-11-14, before Run E
+
+| # | Status | What was found, what changed, and the evidence |
+|---|---|---|
+| 1 | **Fixed** | Verified. On load, a torn tail is cut off the file; a damaged record moves the file aside and writes the readable items to a fresh one; a failed append is cut back to where it began. Tested on real files with the review's sequence (write, tear, load, append, load) and at every torn boundary. `4109ed6` |
+| 2 | **Fixed.** Priority disputed: hardening, not P1. | Verified both halves. The store limits one table of 10,000 entries; the review's million-entry table is refused (`58c88bd`). A tick's effects are checked whole before anything is recorded: at most 4,096 items, a bounded kind length, numeric counts (`4109ed6`). Tests for each, checked to fail with the protection removed. |
+| 4 | **Fixed** | "Kept working elsewhere" now requires consecutive working lines with nothing between them that stops the work, at 97% of the earlier rate. Historical check: unchanged; Run D's two cases ran at 300 ticks/min either side. `eb8446b` |
+| 5 | **Fixed. Changes the protocol.** | Verified. Heartbeats carry the job hash; only holders of the same job are candidates; checkpoints name their job and use a new kind (9), so older builds ignore them. Tests: a jobless lowest member, a different-job member, and a suspect's successor. Both boxes need the new build before Run E. `4109ed6` |
+| 6 | **Fixed** | Counts are totalled per kind before serials are derived; the review's case now makes 5 items. The factory's single line derives the serials it always did. `4109ed6` |
+| 7 | **Fixed** | Local and peer additions both go through `ledger::persist`, which holds failed items and writes them first on the next attempt; both paths report the same way. Tested by blocking the ledger's directory, then restoring it. `4109ed6` |
+| 9 | **Fixed** | Gossip's 64 KiB limit is explicit, and checkpoint state, production chunks (by encoded size as well as count) and labels are sized from it. Publish failures other than "no peers" are reported once a minute. `4109ed6` |
+| 11 | **Fixed** | NaN canonicalization on; relaxed SIMD, threads and GC off (GC escapes the memory limit). Determinism is claimed up to the store's limits. Tests for NaN bits and for refused features. `58c88bd` |
+| 14 | **Fixed** | Each takeover is used once. `took-over` names its previous owner, and the summary matches on it; older logs fall back to timing, flagged when ambiguous. Detection is read from the successor. Historical check: unchanged. `eb8446b`, `4109ed6` |
+| 15 | **Fixed, and the logrotate sub-point confirmed on both boxes** | Shared `chaos.rotations` covers every numeric suffix; `chaos.situation` resets at `started`; `node-summary` reads every rotation, gzipped ones included. **Confirmed on the boxes:** `results.jsonl` is root-owned and logrotate switched to `meshprobe`, so it never rotated, with "Permission denied" in diamond's journal weekly since at least 2026-10-18; the policy is fixed. `collect.sh` reads rotations and merges into an archive. `eb8446b`, `1d49cbd` |
+| 19 | **Fixed** | The migration rig requires a resumed tick and no job failure, fails on two takeovers, and no longer runs `pkill -x mesh-node`; each run takes its own ports. `f16bdb8` |
+| 20 | **Fixed** | One shared description list (`node_events.py`), covering speculation and the new events. The summary reports ticks and inventory from `working`. The review's case is a test. `eb8446b` |
+| D1 | **Fixed** | CLAUDE.md, the plan's status line, and the node's module header. `26ae30f` and the plan commit. |
+| D2 | **Fixed** | Both plans are marked historical. The LTE design's chronology is left as written, with current values marked in place. `26ae30f` |
+| D3 | **Fixed** | `relay-candidate`, `nat-unclassified`, and the inbound modes are documented in the probe README. `c84122b` |
+| D5 | **Fixed** | NAT classification compares whole endpoints, with a test for an address pool on one port. The punch result "outbound-only" became "reply-only", since a PONG is a packet from them. `efde19a` |
+| D6 | **Fixed** | `Job::short_id` and `Serial::short` removed; `portmap::WORST_CASE` is test-only and counts both exchanges (12 s). `58c88bd`, `0412b6b`, `4109ed6` |
+| T1 | **Fixed** | A missing compiled job fails its tests with the build command; checked by hiding one. `0412b6b` |
+| T4 | **Done alongside each fix** | Node 67 → 87 unit tests, probe 13 → 30, provisioning Python 133 → 207. |
+
+Also changed, beyond the review: on diamond the mesh node may use only `lo` and `eno1` (`978ffd4`). The kernel's enforcement was checked on lightning.
+
+**Rigs on the new build.**
+- `rig.sh`: passes.
+- `migration-rig.sh`: passes, with its stricter checks.
+- `chaos-rig.sh`, 15 min: 20 disruptions; the zero counts all stayed zero; detection p95 2,499 ms; resume p95 201 ms; visible gap p95 1,199 ms; 13 suspicions, all confirmed.
+
+**Not deployed yet.** The new node, probe, logrotate policy and drop-in go on the boxes together before Run E.
+
+## Group 3: accepted as Phase 0 limitations
+
+| # | Status |
+|---|---|
+| 8 | **Accepted and made visible.** Progress is not kept on disk. A claim at tick 0 by a node whose ledger is not empty emits `cold-start`, instead of looking like recovered progress. `4109ed6` |
+| 16 | **Half fixed, half accepted.** A re-run restarts the node, so a new binary or settings actually take effect. Rewriting `/etc/mesh-node/config` from the flags is accepted and documented, and the old file is kept as `config.before-setup`. `20555f5` |
+
+## Not done
+
+| # | Status |
+|---|---|
+| 17 | **Declined.** No more fresh boxes are planned, and the documented path is a checkout. |
+| T2 | **Declined.** Not worth restructuring a spike meant to be thrown away. |
+| T3 | **Declined for now.** The gateway test is weak, but the renewal's spawn is pinned by an assertion and by field evidence: 96 false departures before it was spawned. A delayed fake router would be the better test. |
+| D4 | **Open.** `release.sh` falls back to a host-linked build with a warning, and records the actual target in `VERSION` and `BUILT-WITH`. Every build so far has been static. |
+| D7 | **Agreed.** Nothing to do: the runaway and glutton jobs, and the iroh spike, stay. |
+
+## Checked before fixing: does any historical number change?
 
 | # | Finding | Effect on past results |
 |---|---|---|
 | 4 | The "kept working elsewhere" rule is too loose | Across Night A run 2, Run C, Run D and Night B, only 2 disruptions were ever excused this way, both in Run D. In both, the survivor's tick count rose steadily (6270 → 6570 → 6870 and 21070 → 21370 → 21670, 300 per minute). The historical "0 orphaned" holds. The rule is still to be tightened in Group 2. |
 | 15 | Rotations `.10` and up are not discovered | Confirmed: `run-d/diamond/events.jsonl.10.gz`–`.14.gz` are skipped. All of them end before Run D was armed, so no Run D number moves. Still to be fixed in Group 2. |
 
-## Planned
-
-- **Group 2, before Run E:** 1, 2, 4, 5, 6, 7, 9, 11, 14, 15, 19, 20; D1, D3 (rest), D5, D6; T1.
-- **To be accepted as Phase 0 limitations and documented:** 8, logging an explicit `cold-start` event instead of building checkpoint persistence; 16, restarting an active node on re-run, without preserving hand-edited settings.
-- **Declined:** 17, because no more fresh boxes are planned and the documented path is a checkout. T2, because restructuring a spike meant to be thrown away costs more than the five tests running twice.
-- **One priority disputed:** 2 is hardening rather than P1, since Phase 0 only runs our own compiled job. It will be done anyway, because it is cheap.
