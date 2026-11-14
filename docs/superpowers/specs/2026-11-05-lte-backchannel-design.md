@@ -244,6 +244,27 @@ It does this only while `mesh-backchannel.service` wants to run (`active` or
 - **With no modem, mmcli prints `modem-list : 0`.** That is a count, which the
   script once read as a modem path. Only D-Bus modem and bearer paths count now.
 
+**A modem ModemManager has given up on.** *Added 2026-11-14, from the friend's
+house.* After a USB protocol error, ModemManager declared the modem unusable
+and never probed it again, though it never left USB. diamond was out of reach
+for 17.5 hours. Step 2 above no longer simply stops when no modem is listed:
+
+- **If the modem is not on USB** (no device `MODEM_USB`, default `1e0e:9001`,
+  under `/sys/bus/usb/devices`), it has been unplugged, and nothing is done.
+- **If it is on USB but unlisted for 2 minutes**, ModemManager is restarted
+  (`--no-block`, for the same reason as the tunnel restart).
+- **If it is still unlisted 2 minutes after that**, the USB device is reset by
+  writing 0, then 1, to its `authorized` file. The kernel unbinds every driver
+  and enumerates the device again, which ModemManager sees as a replug.
+- **Each round waits twice as long**, up to an hour. A listed modem clears it.
+- The state lives in `/run/mesh-backchannel-modem.state`, on `CLOCK_BOOTTIME`,
+  like the watchdog's. It is saved before each action, so a failed action
+  still moves the next round on.
+
+Tested on the box by holding the modem with `mmcli --inhibit-device`: the
+restart alone recovered it, and diamond was back 3 min 15 s after losing it.
+The USB reset is tested only in code.
+
 ### 4. The tunnel
 
 `mesh-backchannel.service` on `diamond`:

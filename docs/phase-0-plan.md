@@ -849,6 +849,30 @@ Remote management of machines behind NAT is *the same problem Phase 0 exists to 
   - the script read mmcli's no-modem reply, `modem-list : 0`, as a modem path;
   - a blocking `systemctl restart` from inside the link oneshot deadlocked for 90 s on the tunnel unit's `After=`.
 
+**At the friend's house, a failure the bench never showed — found and fixed 2026-11-13/14.** diamond went to the friend's house on 2026-11-12 and was out of reach for **17.5 hours** before a hand reboot brought it back.
+
+- **What happened.** At 04:40 UTC on 2026-11-13 the modem hit a USB protocol error (`qmi_wwan: Unexpected error -71`) and reset itself. ModemManager reprobed it, timed out, logged `fatal error initializing: modem is unusable`, and **never tried again.** The modem never left USB, so nothing told ModemManager to look again. The link script logged "no modem" every 30 s, 2,074 times, until the friend rebooted the box.
+- **Why the bench missed it.** The unplug test recovered because a replug makes ModemManager start over. Here ModemManager gave up on a modem that was still present, which is a different state from the script's point of view. This was the first such error in about 24 hours at the friend's, and there were none in the earlier boots at home.
+- **The fix.** If ModemManager lists no modem while the modem is still on USB (`1e0e:9001`), the link script now:
+  1. restarts ModemManager after 2 minutes;
+  2. if that fails, resets the USB device 2 minutes later (deauthorize, then reauthorize, which the kernel treats as a replug);
+  3. repeats both, doubling the wait each round, up to an hour.
+
+  A modem that is not on USB at all has been unplugged, and nothing is done. Each step goes to the journal.
+- **Tested on the box, 2026-11-14.** `mmcli --inhibit-device` made ModemManager let go of the modem while it stayed plugged in, which the script sees exactly as it saw the 04:40 failure. The test unit had a 10-minute limit as a safety net.
+
+  | UTC | |
+  |---|---|
+  | 00:38:12 | modem released, tunnel down |
+  | 00:38:16 | script: "modem on USB at 1-7 but ModemManager lists none" |
+  | 00:40:20 | script restarts ModemManager |
+  | 00:40:25 | modem listed again |
+  | 00:40:55 | fresh bearer; tunnel restarted |
+  | 00:41:26 | operator logged in |
+
+  **3 min 15 s from losing the modem to login, with nobody at the box**, against 17.5 hours before. The restart was enough, so the USB reset never ran.
+- **What this does not prove.** The test released the modem; it did not reproduce the USB error that started the real failure. If a ModemManager restart does not clear that error, the USB reset follows 2 minutes later, but that step has only been tested in code. The next real occurrence will show which step clears it.
+
 **One limitation for the operator.** sshd only checks for a dead session when that session has been idle for 30 s, and a login attempt through 2201 counts as activity. So retrying the login in a tight loop keeps a dead session alive. After a reboot this held recovery to 9 minutes instead of about 1. **After diamond drops off, wait 2 minutes before trying.**
 
 **Data cost.** It's small: tens of KB an hour while idle, and about 25 MB a month of keepalives against the 2 GB plan.

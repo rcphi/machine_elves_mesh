@@ -442,6 +442,187 @@ class FasterRecovery(unittest.TestCase):
         self.assertIn("AccuracySec=1s", timer)
 
 
+USB = "1-7"
+RESTART_MM = ["systemctl", "restart", "--no-block", "ModemManager.service"]
+
+
+class ModemManagerGaveUp(unittest.TestCase):
+    """Found at the friend's house, 2026-11-13 04:40 UTC: the modem hit a USB
+    protocol error (qmi_wwan: Unexpected error -71) and reset itself.
+    ModemManager reprobed it, timed out, logged "modem is unusable" and never
+    tried again. The modem stayed on USB, so nothing told ModemManager to look
+    again, and the link said "no modem" every 30 s for 17.5 hours until the box
+    was rebooted by hand. Unplugging the modem recovers on its own; this case
+    did not."""
+
+    def run_once(self, state=None, now=10_000.0, on_usb=True, modem=False, said=None):
+        box = Box(modem=modem, already_connected=True)
+        watch = Watch(state, now=now)
+        resets = []
+        code = link.ensure(box, 997, "vzwinternet",
+                           say=(said.append if said is not None else lambda m: None),
+                           modem_watch=watch, find_usb=lambda: USB if on_usb else None,
+                           reset_usb=resets.append)
+        return code, box, watch, resets
+
+    def test_the_first_miss_only_starts_the_clock(self):
+        state, action = link.recovery({}, 100.0, listed=False, on_usb=True)
+        self.assertIsNone(action)
+        self.assertEqual(state, {"since": 100.0, "wait": 120, "next": "restart-modemmanager"})
+
+    def test_a_modem_still_being_probed_is_left_alone(self):
+        # A replugged modem takes about 24 s to be listed, and ModemManager's
+        # own failed init took 90 s. Neither may trigger anything.
+        before = {"since": 100.0, "wait": 120, "next": "restart-modemmanager"}
+        state, action = link.recovery(before, 219.0, listed=False, on_usb=True)
+        self.assertIsNone(action)
+        self.assertEqual(state, before)
+
+    def test_two_minutes_unlisted_on_usb_restarts_modemmanager(self):
+        before = {"since": 100.0, "wait": 120, "next": "restart-modemmanager"}
+        state, action = link.recovery(before, 220.0, listed=False, on_usb=True)
+        self.assertEqual(action, "restart-modemmanager")
+        self.assertEqual(state, {"since": 220.0, "wait": 120, "next": "reset-usb"})
+
+    def test_if_a_restart_did_not_bring_it_back_the_usb_device_is_reset(self):
+        before = {"since": 220.0, "wait": 120, "next": "reset-usb"}
+        state, action = link.recovery(before, 340.0, listed=False, on_usb=True)
+        self.assertEqual(action, "reset-usb")
+        self.assertEqual(state, {"since": 340.0, "wait": 240, "next": "restart-modemmanager"})
+
+    def test_each_round_waits_twice_as_long_up_to_an_hour(self):
+        state, now, actions = {}, 0.0, []
+        for _ in range(2000):
+            now += 30
+            state, action = link.recovery(state, now, listed=False, on_usb=True)
+            if action:
+                actions.append((now, action))
+        gaps = [b[0] - a[0] for a, b in zip(actions, actions[1:])]
+        # The clock starts at the first run that sees it missing (t=30).
+        self.assertEqual(actions[0], (150.0, "restart-modemmanager"))
+        self.assertEqual(actions[1][1], "reset-usb")
+        self.assertLessEqual(max(gaps), link.MAX_WAIT)
+        self.assertEqual(state["wait"], link.MAX_WAIT)
+
+    def test_a_listed_modem_clears_everything(self):
+        before = {"since": 100.0, "wait": 960, "next": "reset-usb"}
+        self.assertEqual(link.recovery(before, 5000.0, listed=True, on_usb=True), ({}, None))
+
+    def test_a_modem_that_is_not_on_usb_is_unplugged_and_nothing_is_done(self):
+        # Unplugged is recovered by plugging in; restarting things achieves
+        # nothing and resetting a device that is not there is meaningless.
+        before = {"since": 100.0, "wait": 120, "next": "restart-modemmanager"}
+        self.assertEqual(link.recovery(before, 5000.0, listed=False, on_usb=False), ({}, None))
+
+    def test_on_the_box_modemmanager_is_restarted_without_blocking(self):
+        # --no-block for the same reason as the tunnel restart: this oneshot is
+        # After=ModemManager.service, and waiting on a job from inside a unit
+        # ordered against it is how the 90 s deadlock happened.
+        code, box, watch, resets = self.run_once(
+            {"since": 100.0, "wait": 120, "next": "restart-modemmanager"}, now=220.0)
+        self.assertEqual(code, 0)
+        self.assertIn(RESTART_MM, box.calls)
+        self.assertEqual(resets, [])
+
+    def test_on_the_box_the_usb_reset_names_the_modems_device(self):
+        code, box, watch, resets = self.run_once(
+            {"since": 220.0, "wait": 120, "next": "reset-usb"}, now=340.0)
+        self.assertEqual(resets, [USB])
+        self.assertNotIn(RESTART_MM, box.calls)
+
+    def test_the_fence_is_up_before_any_recovery(self):
+        code, box, watch, resets = self.run_once(
+            {"since": 100.0, "wait": 120, "next": "restart-modemmanager"}, now=220.0)
+        self.assertLess(box.index(["ip", "rule", "add"]), box.index(RESTART_MM))
+
+    def test_waiting_is_said_and_the_clock_is_kept(self):
+        said = []
+        code, box, watch, resets = self.run_once({}, now=100.0, said=said)
+        self.assertEqual(watch.state["since"], 100.0)
+        self.assertTrue([m for m in said if USB in m and "120 s" in m])
+        self.assertNotIn(RESTART_MM, box.calls)
+
+    def test_the_recovery_is_said_in_the_journal(self):
+        said = []
+        self.run_once({"since": 100.0, "wait": 120, "next": "restart-modemmanager"},
+                      now=220.0, said=said)
+        self.assertTrue([m for m in said if "restarting ModemManager" in m])
+
+    def test_unplugged_says_so_and_touches_nothing(self):
+        said = []
+        code, box, watch, resets = self.run_once(
+            {"since": 100.0, "wait": 120, "next": "restart-modemmanager"},
+            now=9_999.0, on_usb=False, said=said)
+        self.assertEqual((code, watch.state, resets), (0, {}, []))
+        self.assertNotIn(RESTART_MM, box.calls)
+        self.assertTrue([m for m in said if "no modem" in m])
+
+    def test_a_returned_modem_forgets_the_failure(self):
+        code, box, watch, resets = self.run_once(
+            {"since": 100.0, "wait": 480, "next": "reset-usb"}, now=9_999.0, modem=True)
+        self.assertEqual(watch.state, {})
+
+    def test_a_failed_usb_reset_is_reported_not_fatal_to_the_next_run(self):
+        box = Box(modem=False)
+        watch = Watch({"since": 220.0, "wait": 120, "next": "reset-usb"}, now=340.0)
+        def broken(device):
+            raise OSError("Permission denied")
+        code = link.ensure(box, 997, "vzwinternet", say=lambda m: None, modem_watch=watch,
+                           find_usb=lambda: USB, reset_usb=broken)
+        self.assertEqual(code, 1)
+        # The escalation is recorded before acting, so the next round goes on.
+        self.assertEqual(watch.state["next"], "restart-modemmanager")
+
+    def test_without_a_modem_watch_the_old_behaviour_stands(self):
+        box = Box(modem=False)
+        self.assertEqual(link.ensure(box, 997, "vzwinternet", say=lambda m: None), 0)
+        self.assertNotIn(RESTART_MM, box.calls)
+
+
+class FindingTheModemOnUsb(unittest.TestCase):
+    def make_sysfs(self, devices):
+        import tempfile
+        root = tempfile.mkdtemp()
+        for name, ids in devices.items():
+            os.makedirs(os.path.join(root, name))
+            if ids:
+                for field, value in zip(("idVendor", "idProduct"), ids):
+                    with open(os.path.join(root, name, field), "w") as f:
+                        f.write(value + "\n")
+        return root
+
+    def test_the_device_with_matching_ids_is_found(self):
+        root = self.make_sysfs({"usb1": ("1d6b", "0002"), "1-7": ("1e0e", "9001"),
+                                "1-7:1.5": None})
+        self.assertEqual(link.usb_device("1e0e:9001", root), "1-7")
+
+    def test_no_match_is_none(self):
+        root = self.make_sysfs({"usb1": ("1d6b", "0002"), "1-7:1.5": None})
+        self.assertIsNone(link.usb_device("1e0e:9001", root))
+
+    def test_a_missing_sysfs_is_none_not_a_crash(self):
+        self.assertIsNone(link.usb_device("1e0e:9001", "/nonexistent/sysfs"))
+
+    def test_a_reset_deauthorizes_then_authorizes(self):
+        root = self.make_sysfs({"1-7": ("1e0e", "9001")})
+        writes = []
+        real_open = open
+        def spy(path, mode="r", *a, **k):
+            f = real_open(path, mode, *a, **k)
+            if "w" in mode:
+                orig = f.write
+                def w(s):
+                    writes.append((os.path.basename(path), s))
+                    return orig(s)
+                f.write = w
+            return f
+        link.reset_usb("1-7", root, sleep=lambda s: None, opener=spy)
+        self.assertEqual(writes, [("authorized", "0"), ("authorized", "1")])
+
+    def test_the_modem_is_this_one_unless_configured(self):
+        self.assertEqual(link.MODEM_USB, "1e0e:9001")
+
+
 class TheStateFile(unittest.TestCase):
     def setUp(self):
         import tempfile
