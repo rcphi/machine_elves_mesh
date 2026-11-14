@@ -1,8 +1,10 @@
 #!/usr/bin/env python3
 """Summarise collected probe records.
 
-Answers the question Phase 0 actually asks: can these machines reach each
-other without renting a server, and is the answer stable over time?
+What the probe records show about each machine's connection, per network it
+has been on, and whether that is stable over time. It reports evidence; it
+does not decide Phase 0's go/no-go, which needs peer evidence these records
+cannot carry.
 
     ./summarise.py [results/all.jsonl]
 """
@@ -13,8 +15,9 @@ import sys
 
 DEFAULT_PATH = os.path.join(os.path.dirname(os.path.abspath(__file__)), "results", "all.jsonl")
 
-# Whether a machine could accept an incoming connection, which is what
-# decides whether it can carry relay duty for peers that cannot.
+# Addresses STUN reports as untranslated. A machine with one is a candidate to
+# accept incoming connections, and so to carry relay duty; whether a firewall
+# lets anything in is a separate question STUN cannot answer.
 REACHABLE = {"public", "global"}
 
 
@@ -32,88 +35,183 @@ def load(path):
     return records
 
 
-def report_mapping(records):
-    """How long each router remembers an idle connection.
+# setup.sh binds the scheduled connectivity probe to this port. Records from
+# before the probe wrote `local_port` are read as having used it.
+DEFAULT_PROBE_PORT = 41999
 
-    A connection nobody has spoken over for long enough is silently forgotten
-    by the router, and the mesh must send keepalives more often than that. The
-    interval it can use is set by the *worst* router among the players, so the
-    number that matters is the minimum across machines, not the average.
-    """
-    print("Mapping lifetime")
-    print("----------------")
+# A mapping test is placed on a network by the nearest connectivity reading of
+# the same machine; further away than this, nothing is assumed.
+NEAREST_MS = 2 * 3600 * 1000
 
-    by_label = collections.defaultdict(lambda: collections.defaultdict(collections.Counter))
-    for record in records:
-        label = record.get("label", "unlabelled")
-        idle = record.get("idle_seconds")
-        outcome = record.get("outcome", "inconclusive")
-        if isinstance(idle, int):
-            by_label[label][idle][outcome] += 1
+PRESERVING_NOTE = "preserves port numbers"
 
-    safe_per_machine = {}
 
-    for label, intervals in sorted(by_label.items()):
-        print(f"\n{label}")
-        # The largest interval such that this and every shorter interval always
-        # survived. Anything beyond it is not established as safe.
-        safe = 0
-        first_loss = None
-        for idle in sorted(intervals):
-            counts = intervals[idle]
-            survived = counts.get("survived", 0)
-            expired = counts.get("expired", 0)
-            unclear = counts.get("inconclusive", 0)
-            trials = survived + expired
+def subnet(ip):
+    parts = (ip or "").split(".")
+    return ".".join(parts[:3]) + ".0/24" if len(parts) == 4 else None
 
-            detail = f"  {idle:>4}s   survived {survived}/{trials or 0}"
-            if unclear:
-                detail += f"   ({unclear} inconclusive)"
-            if trials and survived and expired:
-                detail += "   VARIABLE — this router is not consistent"
-            print(detail)
 
-            if trials == 0:
-                continue
-            if expired:
-                # The first interval that ever failed bounds the timeout from
-                # above; nothing longer can be called safe.
-                if first_loss is None:
-                    first_loss = idle
-            elif first_loss is None:
-                # Still in the run of intervals that have always survived.
-                safe = idle
+def site_of(record):
+    """A machine on a particular network. diamond at home and diamond at a
+    friend's house are different routers, and averaging them describes
+    neither."""
+    label = record.get("label", "unlabelled")
+    lan = subnet(record.get("ipv4", {}).get("local"))
+    return f"{label} on {lan}" if lan else label
 
-        if first_loss is None and safe:
-            print(f"  → survived every tested interval up to {safe}s; "
-                  f"the timeout is longer than anything measured")
-        elif first_loss is not None:
-            print(f"  → the router forgets somewhere between {safe}s and {first_loss}s")
+
+def preserves_ports(connectivity_record):
+    """Whether the router kept the probe's local port as the external port.
+    None when the record cannot say."""
+    v4 = connectivity_record.get("ipv4", {})
+    local = v4.get("local_port") or DEFAULT_PROBE_PORT
+    ports = {o["mapped"].rsplit(":", 1)[1] for o in v4.get("observers") or [] if o.get("mapped")}
+    if not ports:
+        return None
+    return ports == {str(local)}
+
+
+def site_preserves(connectivity):
+    """{site: True/False} — whether the router preserves ports, by the
+    majority of that site's readings.
+
+    A property of the router, so it is decided over all of them. Single
+    readings mislead: at home, diamond and riverboat both send from local port
+    41999, so whenever both hold a live mapping one of them is bumped to a
+    random port. Those clashes are not evidence that the router randomises."""
+    votes = collections.defaultdict(collections.Counter)
+    for record in connectivity:
+        verdict = preserves_ports(record)
+        if verdict is not None:
+            votes[site_of(record)][verdict] += 1
+    return {site: v[True] > v[False] for site, v in votes.items()}
+
+
+def place(mapping, connectivity):
+    """Each mapping record with its site, found from the nearest connectivity
+    record of the same machine, and whether that site's router preserves
+    ports (None when unknown)."""
+    preserving = site_preserves(connectivity)
+    timeline = collections.defaultdict(list)
+    for record in connectivity:
+        timeline[record.get("label")].append(record)
+    placed = []
+    for record in mapping:
+        runs = timeline.get(record.get("label"), [])
+        at = record.get("ts_unix", 0)
+        nearest = min(runs, key=lambda r: abs(r.get("ts_unix", 0) - at), default=None)
+        if nearest is None or abs(nearest.get("ts_unix", 0) - at) * 1000 > NEAREST_MS:
+            placed.append((record, record.get("label", "unlabelled"), None))
         else:
-            print("  → not enough completed trials to say anything")
+            site = site_of(nearest)
+            placed.append((record, site, preserving.get(site)))
+    return placed
 
-        if safe:
-            safe_per_machine[label] = safe
 
-    print()
-    if not safe_per_machine:
-        print("  No usable keepalive interval yet. Let the boxes run longer.")
-        return
+def evidence(record, preserving):
+    """What one mapping record proves: survived, expired, unproven or
+    inconclusive.
 
-    worst_label = min(safe_per_machine, key=safe_per_machine.get)
-    worst = safe_per_machine[worst_label]
-    recommended = max(15, worst // 2)
-    print(f"  Shortest confirmed-safe idle across machines: {worst}s ({worst_label})")
-    print(f"  → keepalive interval for the mesh: {recommended}s")
-    print()
-    print("  Halved because the measured value is the point at which the mapping was")
-    print("  still alive, not the point at which it dies, and a keepalive that only")
-    print("  just makes it is one dropped packet away from not making it.")
-    print()
-    print("  This is set by the worst router among the players, not the average one:")
-    print("  a peer whose mapping expires is unreachable no matter how patient the")
-    print("  others are.")
-    print()
+    --mapping-lifetime's second query is itself outbound, so on a router that
+    preserves ports an expired mapping comes back on the same port and reads
+    as survival. Its "survived" counts only where the router demonstrably does
+    not preserve ports. Its "expired" always counts: a changed port is expiry
+    whatever the policy. --mapping-inbound never speaks after the silence, so
+    both its answers count."""
+    outcome = record.get("outcome", "inconclusive")
+    if PRESERVING_NOTE in (record.get("note") or ""):
+        return "unproven"
+    if record.get("test") == "mapping-inbound" or outcome != "survived":
+        return outcome if outcome in ("survived", "expired") else "inconclusive"
+    first = record.get("first") or ""
+    local = record.get("local_port")
+    if local:
+        return "unproven" if first.endswith(f":{local}") else "survived"
+    return "survived" if preserving is False else "unproven"
+
+
+def tally(placed):
+    """{site: {idle: Counter(evidence)}}"""
+    by_site = collections.defaultdict(lambda: collections.defaultdict(collections.Counter))
+    for record, site, preserving in placed:
+        idle = record.get("idle_seconds")
+        if isinstance(idle, int):
+            by_site[site][idle][evidence(record, preserving)] += 1
+    return by_site
+
+
+def safe_idle(intervals):
+    """The largest interval such that it and every shorter tested interval
+    always survived, on confirmed evidence only; None if nothing confirmed.
+    Also returns the first interval that ever expired."""
+    safe, first_loss = None, None
+    for idle in sorted(intervals):
+        counts = intervals[idle]
+        survived, expired = counts.get("survived", 0), counts.get("expired", 0)
+        if not survived + expired:
+            continue
+        if expired:
+            if first_loss is None:
+                first_loss = idle
+        elif first_loss is None:
+            safe = idle
+    return safe, first_loss
+
+
+def keepalive(by_site):
+    """(interval or None, sites without confirmed evidence).
+
+    Set by the worst router, so every site must have confirmed evidence; a
+    site that has none is not a site that is fine. Halved, because the
+    measured value is where the mapping was still alive, not where it dies.
+    No floor: a floor that rounds up erases the margin it exists to keep."""
+    missing = [site for site, intervals in sorted(by_site.items()) if safe_idle(intervals)[0] is None]
+    if missing or not by_site:
+        return None, missing
+    worst = min(safe_idle(intervals)[0] for intervals in by_site.values())
+    return worst // 2, []
+
+
+def report_mapping(mapping, connectivity, out=print):
+    """How long each router remembers an idle connection."""
+    out("Mapping lifetime")
+    out("----------------")
+    by_site = tally(place(mapping, connectivity))
+
+    for site, intervals in sorted(by_site.items()):
+        out(f"\n{site}")
+        for idle in sorted(intervals):
+            c = intervals[idle]
+            trials = c.get("survived", 0) + c.get("expired", 0)
+            detail = f"  {idle:>4}s   survived {c.get('survived', 0)}/{trials}"
+            if c.get("unproven"):
+                detail += f"   ({c['unproven']} unproven: router preserves ports)"
+            if c.get("inconclusive"):
+                detail += f"   ({c['inconclusive']} inconclusive)"
+            if c.get("survived") and c.get("expired"):
+                detail += "   VARIABLE — this router is not consistent"
+            out(detail)
+        safe, first_loss = safe_idle(intervals)
+        if safe is None and first_loss is None:
+            out("  → no confirmed evidence. Where the router preserves ports only")
+            out("    --mapping-inbound can measure it.")
+        elif first_loss is None:
+            out(f"  → survived every confirmed interval up to {safe}s; "
+                "the timeout is longer than anything measured")
+        else:
+            out(f"  → the router forgets somewhere between {safe or 0}s and {first_loss}s")
+
+    out("")
+    interval, missing = keepalive(by_site)
+    if interval is None:
+        out("  No mesh-wide keepalive interval: it is set by the worst router, and these")
+        out(f"  sites have no confirmed evidence: {', '.join(missing) or 'none'}.")
+    else:
+        worst_site = min(by_site, key=lambda s: safe_idle(by_site[s])[0])
+        out(f"  Shortest confirmed-safe idle: {safe_idle(by_site[worst_site])[0]}s ({worst_site})")
+        out(f"  → keepalive interval for the mesh: {interval}s (half of it)")
+    out(f"  This covers every site in these records: {', '.join(sorted(by_site))}.")
+    out("")
 
 
 def main():
@@ -145,17 +243,17 @@ def main():
         return 1
 
     connectivity = [r for r in records if r.get("test", "connectivity") == "connectivity"]
-    mapping = [r for r in records if r.get("test") == "mapping-lifetime"]
+    mapping = [r for r in records if r.get("test") in ("mapping-lifetime", "mapping-inbound")]
 
     by_label = collections.defaultdict(list)
     for record in connectivity:
-        by_label[record.get("label", "unlabelled")].append(record)
+        by_label[site_of(record)].append(record)
 
     print(f"{len(records)} records from "
           f"{len(set(r.get('label') for r in records))} machines "
           f"({len(connectivity)} connectivity, {len(mapping)} mapping)\n")
 
-    relay_capable = []
+    relay_candidates = []
     hole_punchable = []
     # A machine that speaks both families is the only route between members
     # that speak one and members that speak the other. Counting them is not
@@ -229,13 +327,13 @@ def main():
         bridge_readings.append(both / len(runs) if runs else 0.0)
 
         if latest.get("relay_candidate", latest.get("relay_capable")):
-            relay_capable.append(label)
+            relay_candidates.append(label)
         if v4 in REACHABLE or v6 in REACHABLE or v4 == "nat-endpoint-independent":
             hole_punchable.append(label)
         print()
 
     if mapping:
-        report_mapping(mapping)
+        report_mapping(mapping, connectivity)
 
     print("Verdict")
     print("-------")
@@ -243,7 +341,7 @@ def main():
     expected = sum(bridge_readings)
     print(f"  can bridge the address families:     "
           f"{', '.join(bridges) or 'NONE'}  ({expected:.1f} present on average)")
-    print(f"  can accept incoming (relay-capable): {', '.join(relay_capable) or 'NONE'}")
+    print(f"  relay candidates (STUN only):        {', '.join(relay_candidates) or 'NONE'}")
     print(f"  direct connection plausible:         {', '.join(hole_punchable) or 'NONE'}")
     print()
 
@@ -262,31 +360,15 @@ def main():
         print("  would split it into two halves unable to see one another.")
         print()
 
-    if not relay_capable:
-        print("  No machine here can accept an incoming connection. With no rented")
-        print("  infrastructure there is nowhere for a relay to live, so peers that")
-        print("  cannot hole-punch to each other would have no path at all.")
-        print()
-        if len(by_label) < 3:
-            # One or two machines cannot establish this. A single home
-            # connection describes a single router, and declaring the stop
-            # criterion met from it would kill the project on a sample too
-            # small to support the claim.
-            print(f"  BUT THIS IS ONLY {len(by_label)} MACHINE(S). That is not enough to conclude")
-            print("  anything. The stop criterion in docs/phase-0-plan.md is about the set")
-            print("  of volunteers, and one connection describes one router. Collect from")
-            print("  the others before treating this as a result.")
-        else:
-            print("  Per docs/phase-0-plan.md this meets the stop criterion. It is a")
-            print("  finding, not a failure — and it arrived for the cost of an afternoon.")
-    elif len(hole_punchable) < len(by_label):
-        print("  Some machines will need relaying through a peer. That is the design's")
-        print("  intent (§11.6's fifth contribution lever), so proceed — and measure")
-        print("  what relay duty actually costs the machine carrying it.")
-    else:
-        print("  Every machine can plausibly connect directly. Proceed to the mesh node,")
-        print("  and do not let this result make anyone complacent: three connections")
-        print("  establish that a problem class is absent here, not that it is rare.")
+    # STUN shows how a machine's address is translated, not whether anything
+    # can reach it: a firewall can drop every inbound packet to a "global"
+    # address, and a router that opens a port on request turns a NAT'd machine
+    # into a reachable one. So nothing here can decide the stop criterion.
+    print("  A relay candidate has an address STUN calls public or global. Whether it")
+    print("  actually accepts inbound connections is shown only by peer evidence: a mesh")
+    print("  node's incoming connections or port-mapped events, or a --mapping-inbound")
+    print("  survival. These records cannot meet or clear a stop criterion by themselves;")
+    print("  see docs/phase-0-plan.md for the evidence that has.")
     return 0
 
 
