@@ -238,6 +238,11 @@ MISSING
         echo "job installed at $NODE_JOB"
     fi
 
+    # Written whole from the flags given, every run: a re-run with --mesh is a
+    # statement of the node's whole configuration, not an amendment to it.
+    # Edits made by hand to this file do not survive one (review finding 16,
+    # accepted as a Phase 0 limitation). The previous file is kept beside it.
+    [[ -f /etc/mesh-node/config ]] && cp /etc/mesh-node/config /etc/mesh-node/config.before-setup
     {
         printf 'LABEL=%s\n' "$LABEL"
         printf 'MESH=%s\n' "$NODE_MESH"
@@ -254,7 +259,12 @@ MISSING
     install -m 0644 "$REPO_ROOT/provision/mesh-node.service" /etc/systemd/system/mesh-node.service
     install -m 0644 "$REPO_ROOT/provision/logrotate.mesh-node" /etc/logrotate.d/mesh-node
     systemctl daemon-reload
-    systemctl enable --now mesh-node.service
+    systemctl enable mesh-node.service >/dev/null 2>&1
+    # Restart, not `enable --now`: starting a service that is already running
+    # does nothing, so a re-run used to report success while the old process
+    # carried on with its old binary, label, mesh, peers and job (review
+    # finding 16). A restart also starts one that was stopped.
+    systemctl restart mesh-node.service
     sleep 2
     systemctl is-active --quiet mesh-node.service \
         && echo "node running on mesh \"$NODE_MESH\"" \

@@ -128,7 +128,10 @@ and the restart itself is data. A node restarting hourly is a finding; one that
 stays down leaves a gap in the record that looks exactly like a quiet network.
 
 Settings live in `/etc/mesh-node/config` and can be changed without re-running
-setup; `systemctl restart mesh-node` picks them up. Local discovery is off by
+setup; `systemctl restart mesh-node` picks them up. **Re-running setup with
+`--mesh` rewrites that file from its flags**, so hand edits do not survive it
+(the old file is kept as `config.before-setup`), and it restarts the node so
+the new binary and settings are actually in use. Local discovery is off by
 default and asking the router for a port is on, since a mesh with nobody
 reachable cannot admit anyone it is not already connected to.
 
@@ -230,14 +233,17 @@ From the operator's machine:
 ```
 
 `collect.sh` reads only; it writes nothing to the boxes. Hosts are whatever ssh
-understands, so `~/.ssh/config` aliases are the tidiest way to name them.
+understands, so `~/.ssh/config` aliases are the tidiest way to name them (a box
+behind a jump host, like diamond over its back channel, needs one). It reads
+each box's rotated logs as well as the current one, and **adds to** the local
+`results/<host>.jsonl` rather than replacing it, so history survives rotation.
 
-`summarise.py` reports each machine's current classification, **whether that
-classification has been stable across runs** — a connection that changes
-behaviour between measurements cannot be planned around, and matters as much as
-the current value — and then the verdict: whether any machine can accept an
-incoming connection, since with no rented infrastructure a relay has nowhere
-else to live.
+`summarise.py` reports, for each machine on each network it has been on, its
+classification and **whether that classification has been stable across
+runs** — a connection that changes behaviour between measurements cannot be
+planned around, and matters as much as the current value — and the idle
+timeouts it can actually vouch for. It reports evidence and decides nothing it
+cannot: STUN shows relay *candidates*, not machines anything can reach.
 
 ## The management channel must stay outside the measurement
 
