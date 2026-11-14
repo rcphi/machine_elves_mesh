@@ -16,6 +16,7 @@ use std::time::{Duration, Instant, SystemTime};
 
 use anyhow::{Context, Result};
 use futures::StreamExt;
+use libp2p::swarm::behaviour::toggle::Toggle;
 use libp2p::swarm::SwarmEvent;
 use libp2p::{gossipsub, identify, mdns, noise, ping, tcp, yamux, Multiaddr, PeerId};
 
@@ -430,11 +431,31 @@ struct MeshBehaviour {
     /// Finds other nodes on the same local network. Genuinely useful for the
     /// container rig and for a player's own machines, and incapable of finding
     /// anything across the internet (§11.6).
-    mdns: mdns::tokio::Behaviour,
+    ///
+    /// Absent, not idle, under `--no-mdns`: see [`mdns_behaviour`].
+    mdns: Toggle<mdns::tokio::Behaviour>,
     /// Exchanges addresses and protocol versions on connect.
     identify: identify::Behaviour,
     /// Round-trip timing, which is the latency floor for any takeover.
     ping: ping::Behaviour,
+}
+
+/// Local discovery, or nothing at all.
+///
+/// This used to keep the behaviour under `--no-mdns` with a year-long query
+/// interval, on the theory that it would then never speak. It still spoke.
+/// libp2p-mdns opens a multicast socket and joins 224.0.0.251 on every
+/// interface with an address, sends its first query as soon as an interface
+/// appears, and answers queries regardless of the interval. Found on diamond,
+/// 2026-11-14: the node held two sockets on 5353 and had joined the mDNS group
+/// on the friend's LAN and on the LTE interface, which is the management link
+/// the mesh must never touch. `Toggle` with `None` opens no sockets at all.
+fn mdns_behaviour(enabled: bool, me: PeerId) -> std::io::Result<Toggle<mdns::tokio::Behaviour>> {
+    Ok(Toggle::from(if enabled {
+        Some(mdns::tokio::Behaviour::new(mdns::Config::default(), me)?)
+    } else {
+        None
+    }))
 }
 
 struct Config {
@@ -1045,17 +1066,7 @@ async fn run(config: Config) -> Result<()> {
             )?;
             Ok(MeshBehaviour {
                 gossipsub,
-                mdns: mdns::tokio::Behaviour::new(
-                    if use_mdns {
-                        mdns::Config::default()
-                    } else {
-                        // Left in place but never speaking: a query interval
-                        // beyond any run's lifetime is simpler than making the
-                        // behaviour optional, and cannot half-work.
-                        mdns::Config { query_interval: Duration::from_secs(86_400 * 365), ..Default::default() }
-                    },
-                    key.public().to_peer_id(),
-                )?,
+                mdns: mdns_behaviour(use_mdns, key.public().to_peer_id())?,
                 identify: identify::Behaviour::new(identify::Config::new(
                     "/machine-elves/0.1".into(),
                     key.public(),
@@ -2418,6 +2429,15 @@ mod tests {
     /// every tick that elapsed unwatched. The healthier the mesh, the larger
     /// the burst — which is why two earlier runs looked clean: they began after
     /// runs full of disruptions, with backlogs seconds deep rather than days.
+    /// `--no-mdns` must mean no mDNS behaviour, not an idle one: the idle one
+    /// still joined 224.0.0.251 on every interface, LTE included.
+    #[tokio::test]
+    async fn no_mdns_builds_no_mdns_behaviour() {
+        let me = libp2p::identity::Keypair::generate_ed25519().public().to_peer_id();
+        assert!(!mdns_behaviour(false, me).expect("disabled always builds").is_enabled());
+        assert!(mdns_behaviour(true, me).expect("enabled builds on this host").is_enabled());
+    }
+
     #[tokio::test(start_paused = true)]
     async fn a_quiet_mesh_does_not_store_up_dial_retries() {
         // riverboat's own account of it: was_present_ms=148031679.
