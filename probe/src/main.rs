@@ -609,8 +609,12 @@ fn describe_v4(result: &FamilyResult) -> Verdict {
     distinct_servers.sort();
     distinct_servers.dedup();
 
-    let ports: Vec<u16> = result.observations.iter().map(|o| o.mapped.port()).collect();
-    let consistent = ports.windows(2).all(|w| w[0] == w[1]);
+    // The whole external endpoint, address and port. Comparing ports alone
+    // called a connection endpoint-independent when each destination saw a
+    // different public address on the same port number, which is what a
+    // carrier's pool of egress addresses does (review D5).
+    let endpoints: Vec<SocketAddr> = result.observations.iter().map(|o| o.mapped).collect();
+    let consistent = endpoints.windows(2).all(|w| w[0] == w[1]);
 
     let no_nat = local == Some(mapped.ip());
     let cgnat = matches!(mapped.ip(), IpAddr::V4(ip) if is_shared_address_space(ip));
@@ -1252,15 +1256,23 @@ fn punch(peer: Option<SocketAddr>, seconds: u64) -> io::Result<()> {
             "two-way"
         }
         (Some(_), None) => {
-            println!("  Their packets reach us; ours do not reach them. Their router is the");
-            println!("  stricter of the two — a path exists, but only one way, so a peer");
-            println!("  connection would need help from somewhere.");
-            "inbound-only"
+            // Their hello arrived. Whether ours, or our replies, reached them
+            // is not something this side can see.
+            println!("  Their packets reach us, but nothing of ours was ever acknowledged.");
+            println!("  Either their router refuses strangers or our replies were lost; this");
+            println!("  side cannot tell which. Run it again, and compare with their result.");
+            "inbound-heard"
         }
         (None, Some(_)) => {
-            println!("  Ours reach them; theirs do not reach us. This router is the stricter");
-            println!("  one. A path exists, but only one way.");
-            "outbound-only"
+            // Their reply to our hello arrived, which is itself a packet of
+            // theirs reaching us. Calling this one-way was wrong (review D5):
+            // a request and its answer crossed both routers. What never
+            // arrived is a packet they sent unprompted.
+            println!("  Ours reach them and their replies come back, so an exchange works when");
+            println!("  this side speaks first. Their unprompted packets never arrived: this");
+            println!("  router admits replies but not strangers. A connection works if this");
+            println!("  side is the one that dials.");
+            "reply-only"
         }
         (None, None) => {
             println!("  Nothing got through in either direction.");
@@ -1479,6 +1491,26 @@ mod tests {
         };
         let record = report_json("vol-1", &empty(Family::V4), &empty(Family::V6));
         assert!(record.contains(r#""test":"connectivity""#));
+    }
+
+    #[test]
+    fn different_public_addresses_on_one_port_are_not_endpoint_independent() {
+        let observation = |server: &str, mapped: &str| Observation {
+            server: server.to_string(),
+            server_ip: server.parse().unwrap(),
+            mapped: mapped.parse().unwrap(),
+        };
+        let result = |second: &str| FamilyResult {
+            family: Family::V4,
+            local: Some("192.168.1.125".parse().unwrap()),
+            local_port: Some(41999),
+            observations: vec![observation("192.0.2.1", "198.51.100.4:41999"),
+                               observation("192.0.2.2", second)],
+            errors: Vec::new(),
+        };
+        assert_eq!(describe_v4(&result("198.51.100.4:41999")).tag, "nat-endpoint-independent");
+        assert_ne!(describe_v4(&result("198.51.100.9:41999")).tag, "nat-endpoint-independent",
+                   "a pool of egress addresses on one port number");
     }
 
     #[test]
