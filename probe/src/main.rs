@@ -17,6 +17,8 @@ use std::net::{IpAddr, Ipv4Addr, Ipv6Addr, SocketAddr, ToSocketAddrs, UdpSocket}
 use std::thread;
 use std::time::{Duration, SystemTime};
 
+mod inbound;
+
 const MAGIC_COOKIE: u32 = 0x2112_A442;
 const BINDING_REQUEST: u16 = 0x0001;
 const BINDING_SUCCESS: u16 = 0x0101;
@@ -57,6 +59,10 @@ fn main() {
     let mut map_port_mode = false;
     let mut punch_peer: Option<SocketAddr> = None;
     let mut local_port: u16 = 0;
+    let mut mapping_inbound = false;
+    let mut responder_mode = false;
+    let mut responder: Option<String> = None;
+    let mut keep_ttl: u32 = 2;
     let mut args = env::args().skip(1);
 
     while let Some(arg) = args.next() {
@@ -66,6 +72,21 @@ fn main() {
             "--mapping-lifetime" => mapping_lifetime = true,
             "--punch" => punch_mode = true,
             "--map-port" => map_port_mode = true,
+            "--mapping-inbound" => mapping_inbound = true,
+            "--inbound-responder" => responder_mode = true,
+            "--responder" => {
+                responder = args.next();
+                if responder.is_none() {
+                    eprintln!("--responder needs host:port");
+                    std::process::exit(2);
+                }
+            }
+            "--keep-ttl" => {
+                keep_ttl = args.next().and_then(|v| v.parse().ok()).unwrap_or_else(|| {
+                    eprintln!("--keep-ttl needs a number (0 turns keepalives off)");
+                    std::process::exit(2);
+                })
+            }
             "--port" => {
                 local_port = args
                     .next()
@@ -99,6 +120,37 @@ fn main() {
                 std::process::exit(2);
             }
         }
+    }
+
+    if responder_mode || mapping_inbound {
+        let token = env::var(inbound::TOKEN_ENV).unwrap_or_default();
+        if token.is_empty() || token.contains(char::is_whitespace) {
+            eprintln!("set {} to a shared token without spaces, the same on both machines", inbound::TOKEN_ENV);
+            std::process::exit(2);
+        }
+        if responder_mode {
+            if local_port == 0 {
+                eprintln!("--inbound-responder needs --port");
+                std::process::exit(2);
+            }
+            if let Err(error) = inbound::run_responder(local_port, &token, keep_ttl) {
+                eprintln!("responder stopped: {error}");
+                std::process::exit(1);
+            }
+            return;
+        }
+        let Some(target) = responder.as_deref().and_then(|r| resolve(r, Family::V4)) else {
+            eprintln!("--mapping-inbound needs --responder host:port, resolvable to IPv4");
+            std::process::exit(2);
+        };
+        let seconds = idle.unwrap_or_else(pick_idle_interval);
+        let test = inbound::run_client(target, &token, seconds, !json);
+        if json {
+            println!("{}", inbound::json(&label, &test));
+        } else {
+            inbound::report(&test);
+        }
+        return;
     }
 
     if map_port_mode {
@@ -163,6 +215,18 @@ fn print_usage() {
     println!("  --map-port       ask the router to forward a port to this machine, so it");
     println!("                   can be reached without being introduced. Use --port to");
     println!("                   choose which (default 4001)");
+    println!("  --mapping-inbound");
+    println!("                   the same question, answered by a peer sending a packet in");
+    println!("                   after the silence. Needed where the router preserves port");
+    println!("                   numbers. Needs --responder and the token below");
+    println!("  --responder <host:port>");
+    println!("                   the machine running --inbound-responder");
+    println!("  --inbound-responder");
+    println!("                   answer --mapping-inbound clients on --port. Runs until stopped");
+    println!("  --keep-ttl <n>   TTL for the responder's own-router keepalives (default 2;");
+    println!("                   0 turns them off)");
+    println!("                   Both inbound modes read a shared token from");
+    println!("                   MESH_PROBE_INBOUND_TOKEN.");
     println!("  --port <n>       bind this local port instead of letting the system choose.");
     println!("                   Tests whether this router gives the same external address");
     println!("                   every time, which decides whether peers can be remembered.");
@@ -207,6 +271,9 @@ struct Observation {
 struct FamilyResult {
     family: Family,
     local: Option<IpAddr>,
+    /// The port the shared socket was bound to, so a reader can tell whether
+    /// the router preserved it.
+    local_port: Option<u16>,
     observations: Vec<Observation>,
     errors: Vec<String>,
 }
@@ -221,6 +288,7 @@ fn probe_family_on(family: Family, verbose: bool, local_port: u16) -> FamilyResu
     let mut result = FamilyResult {
         family,
         local: None,
+        local_port: None,
         observations: Vec::new(),
         errors: Vec::new(),
     };
@@ -245,6 +313,7 @@ fn probe_family_on(family: Family, verbose: bool, local_port: u16) -> FamilyResu
         }
     };
     let _ = socket.set_read_timeout(Some(TIMEOUT));
+    result.local_port = socket.local_addr().ok().map(|a| a.port());
 
     if verbose {
         println!("Checking {}…", family.label());
@@ -448,6 +517,19 @@ fn decode_address(value: &[u8], xored: bool, transaction: &[u8; 12]) -> Option<S
 /// Transaction IDs only need to be unpredictable enough to match a reply to
 /// its request. `RandomState` is seeded randomly per process, which is
 /// sufficient here and avoids a dependency for a diagnostic tool.
+/// A session nonce for `--mapping-inbound`. Not secret, only unlikely to
+/// collide, which `RandomState`'s per-process keys provide without a crate.
+fn random_u64() -> u64 {
+    let mut hasher = RandomState::new().build_hasher();
+    hasher.write_u64(
+        SystemTime::now()
+            .duration_since(SystemTime::UNIX_EPOCH)
+            .map(|d| d.as_nanos() as u64)
+            .unwrap_or(0),
+    );
+    hasher.finish()
+}
+
 fn random_transaction_id() -> [u8; 12] {
     let mut id = [0u8; 12];
     let state = RandomState::new();
@@ -695,6 +777,9 @@ impl Outcome {
 struct MappingTest {
     idle_seconds: u64,
     server: String,
+    /// The port this end sent from. When the router hands the same number back
+    /// as the external port it preserves ports, and see [`judge_mapping`].
+    local_port: u16,
     first: Option<SocketAddr>,
     second: Option<SocketAddr>,
     outcome: Outcome,
@@ -714,6 +799,7 @@ fn probe_mapping_lifetime(idle_seconds: u64, verbose: bool) -> MappingTest {
     let unusable = |why: &'static str, server: String| MappingTest {
         idle_seconds,
         server,
+        local_port: 0,
         first: None,
         second: None,
         outcome: Outcome::Inconclusive(why),
@@ -724,6 +810,7 @@ fn probe_mapping_lifetime(idle_seconds: u64, verbose: bool) -> MappingTest {
         Err(_) => return unusable("cannot open a socket", "-".to_string()),
     };
     let _ = socket.set_read_timeout(Some(TIMEOUT));
+    let local_port = socket.local_addr().map(|a| a.port()).unwrap_or(0);
 
     // Both observations must come from the same server. Under
     // address-dependent mapping a different server sees a different port
@@ -754,27 +841,46 @@ fn probe_mapping_lifetime(idle_seconds: u64, verbose: bool) -> MappingTest {
         Ok(mapped) => mapped,
         Err(_) => {
             let mut test = unusable("no reply to the second query", server);
+            test.local_port = local_port;
             test.first = Some(first);
             return test;
         }
     };
 
-    // A changed public address means the ISP moved us, which would look
-    // identical to an expired mapping while proving nothing about the router.
-    let outcome = if first.ip() != second.ip() {
-        Outcome::Inconclusive("public address changed mid-test")
-    } else if first.port() == second.port() {
-        Outcome::Survived
-    } else {
-        Outcome::Expired
-    };
-
     MappingTest {
         idle_seconds,
         server,
+        local_port,
+        outcome: judge_mapping(first, second, local_port),
         first: Some(first),
         second: Some(second),
-        outcome,
+    }
+}
+
+/// What two observations of the same socket, either side of a silence, prove.
+///
+/// The second query is itself an outbound packet, and if the mapping had
+/// expired it creates a new one. A router that picks a fresh external port for
+/// a new mapping reveals the expiry as a changed port. A router that preserves
+/// port numbers gives the new mapping the same port as the old, so "unchanged"
+/// cannot tell survival from expiry-and-recreation. Found 2026-11-14 at the
+/// friend's house, where every reading kept the local port: 52 results there
+/// had said "survived" and proved nothing. Home's router randomises ports, so
+/// its results stand. `--mapping-inbound` measures preserving routers properly.
+fn judge_mapping(first: SocketAddr, second: SocketAddr, local_port: u16) -> Outcome {
+    if first.ip() != second.ip() {
+        // The ISP moved us, which would look identical to an expired mapping
+        // while proving nothing about the router.
+        Outcome::Inconclusive("public address changed mid-test")
+    } else if first.port() != second.port() {
+        // A changed port is expiry whatever the router's port policy.
+        Outcome::Expired
+    } else if local_port != 0 && first.port() == local_port {
+        Outcome::Inconclusive(
+            "the router preserves port numbers, so an expired mapping would come back on the same port",
+        )
+    } else {
+        Outcome::Survived
     }
 }
 
@@ -836,12 +942,13 @@ fn mapping_json(label: &str, test: &MappingTest) -> String {
 
     format!(
         "{{\"schema\":1,\"ts_unix\":{},\"ts_utc\":{},\"label\":{},\"test\":\"mapping-lifetime\",\
-         \"idle_seconds\":{},\"server\":{},\"first\":{},\"second\":{},\"outcome\":{},\"note\":{}}}",
+         \"idle_seconds\":{},\"server\":{},\"local_port\":{},\"first\":{},\"second\":{},\"outcome\":{},\"note\":{}}}",
         now,
         json_string(&format_utc(now)),
         json_string(label),
         test.idle_seconds,
         json_string(&test.server),
+        test.local_port,
         addr(test.first),
         addr(test.second),
         json_string(test.outcome.tag()),
@@ -1213,10 +1320,14 @@ fn family_json(result: &FamilyResult, verdict: &Verdict) -> String {
     let errors: Vec<String> = result.errors.iter().map(|e| json_string(e)).collect();
 
     format!(
-        "{{\"tag\":{},\"local\":{},\"observers\":[{}],\"errors\":[{}]}}",
+        "{{\"tag\":{},\"local\":{},\"local_port\":{},\"observers\":[{}],\"errors\":[{}]}}",
         json_string(&verdict.tag),
         match result.local {
             Some(ip) => json_string(&ip.to_string()),
+            None => "null".to_string(),
+        },
+        match result.local_port {
+            Some(port) => port.to_string(),
             None => "null".to_string(),
         },
         observers.join(","),
@@ -1298,6 +1409,7 @@ mod tests {
         let test = MappingTest {
             idle_seconds: 120,
             server: "stun.example.net:3478".to_string(),
+            local_port: 50123,
             first: Some("203.0.113.7:45485".parse().unwrap()),
             second: Some("203.0.113.7:45485".parse().unwrap()),
             outcome: Outcome::Survived,
@@ -1308,6 +1420,36 @@ mod tests {
         assert!(record.contains(r#""outcome":"survived""#));
         assert!(record.contains(r#""idle_seconds":120"#));
         assert!(record.contains(r#""note":null"#));
+        assert!(record.contains(r#""local_port":50123"#));
+    }
+
+    /// The rule found at the friend's house: when the router preserves port
+    /// numbers, an unchanged port is not evidence of survival.
+    #[test]
+    fn a_preserved_port_cannot_prove_survival() {
+        let a: SocketAddr = "198.51.100.4:41999".parse().unwrap();
+        assert!(matches!(judge_mapping(a, a, 41999), Outcome::Inconclusive(_)));
+    }
+
+    #[test]
+    fn a_randomised_port_that_held_is_survival() {
+        // Home's router: local 41999, external something else, unchanged.
+        let a: SocketAddr = "198.51.100.4:10809".parse().unwrap();
+        assert_eq!(judge_mapping(a, a, 41999), Outcome::Survived);
+    }
+
+    #[test]
+    fn a_changed_port_is_expiry_even_on_a_preserving_router() {
+        let first: SocketAddr = "198.51.100.4:41999".parse().unwrap();
+        let second: SocketAddr = "198.51.100.4:41998".parse().unwrap();
+        assert_eq!(judge_mapping(first, second, 41999), Outcome::Expired);
+    }
+
+    #[test]
+    fn a_moved_public_address_proves_nothing() {
+        let first: SocketAddr = "198.51.100.4:10809".parse().unwrap();
+        let second: SocketAddr = "198.51.100.9:10809".parse().unwrap();
+        assert!(matches!(judge_mapping(first, second, 41999), Outcome::Inconclusive(_)));
     }
 
     #[test]
@@ -1315,6 +1457,7 @@ mod tests {
         let test = MappingTest {
             idle_seconds: 60,
             server: "-".to_string(),
+            local_port: 0,
             first: None,
             second: None,
             outcome: Outcome::Inconclusive("public address changed mid-test"),
@@ -1330,6 +1473,7 @@ mod tests {
         let empty = |family| FamilyResult {
             family,
             local: None,
+            local_port: None,
             observations: Vec::new(),
             errors: Vec::new(),
         };
@@ -1356,6 +1500,7 @@ mod tests {
         let empty = |family| FamilyResult {
             family,
             local: None,
+            local_port: None,
             observations: Vec::new(),
             errors: vec!["no reply".to_string()],
         };
