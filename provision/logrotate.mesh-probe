@@ -6,5 +6,8 @@
     missingok
     notifempty
     copytruncate
-    su meshprobe meshprobe
+    # No su directive, for the same reason as logrotate.mesh-node: systemd's
+    # StandardOutput=append creates the file as root, so rotating as meshprobe
+    # cannot open it. On both boxes logrotate logged "Permission denied" every
+    # week and the file never rotated (found 2026-11-14, review finding 15).
 }
