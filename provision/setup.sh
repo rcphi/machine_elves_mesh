@@ -307,46 +307,10 @@ fi
 
 if [[ $ISOLATE_LAN -eq 1 ]]; then
     say "Isolating the box from the household network"
-    GATEWAY="$(ip route show default 2>/dev/null | awk '/default/ {print $3; exit}')"
-    if [[ -z "$GATEWAY" ]]; then
-        echo "could not determine the default gateway; refusing to apply LAN rules" >&2
-    else
-        echo "gateway is $GATEWAY"
-
-        # Public resolvers first: blocking the LAN removes the router's DNS,
-        # and a box that cannot resolve names cannot probe anything.
-        install -d -m 0755 /etc/systemd/resolved.conf.d
-        cat > /etc/systemd/resolved.conf.d/mesh-probe.conf <<'DNS'
-[Resolve]
-DNS=1.1.1.1 9.9.9.9
-FallbackDNS=8.8.8.8
-DNS
-        systemctl restart systemd-resolved || true
-
-        for net in 10.0.0.0/8 172.16.0.0/12 192.168.0.0/16 169.254.0.0/16; do
-            ufw --force delete deny out to "$net" >/dev/null 2>&1 || true
-            ufw deny out to "$net" >/dev/null
-        done
-        # The gateway itself must stay reachable, and must outrank the denials.
-        ufw --force delete allow out to "$GATEWAY" >/dev/null 2>&1 || true
-        ufw insert 1 allow out to "$GATEWAY" >/dev/null
-        ufw reload >/dev/null
-
-        echo "verifying the box can still reach the internet…"
-        sleep 2
-        if /usr/local/bin/mesh-probe --json --label "$LABEL" 2>/dev/null | grep -q '"observers":\[{'; then
-            echo "verified — LAN isolation is active and the internet still works"
-        else
-            echo "FAILED to reach any STUN server after isolating; rolling back" >&2
-            for net in 10.0.0.0/8 172.16.0.0/12 192.168.0.0/16 169.254.0.0/16; do
-                ufw --force delete deny out to "$net" >/dev/null 2>&1 || true
-            done
-            rm -f /etc/systemd/resolved.conf.d/mesh-probe.conf
-            systemctl restart systemd-resolved || true
-            ufw reload >/dev/null
-            echo "rolled back. The box is reachable again; LAN isolation is off." >&2
-        fi
-    fi
+    # Both families, multicast included, and verified by counting each
+    # rule's hits rather than only by checking that the internet still works.
+    # It rolls itself back if the internet stops answering. See isolate-lan.
+    "$REPO_ROOT/provision/isolate-lan" || echo "household isolation NOT complete; see above" >&2
 fi
 
 # ---------------------------------------------------------------- first run

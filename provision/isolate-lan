@@ -1,0 +1,299 @@
+#!/usr/bin/env python3
+"""Keeps a volunteer box away from the household it sits in.
+
+    sudo isolate-lan            apply, then prove it: the internet still works
+                                and every blocked kind of destination is blocked
+    sudo isolate-lan --remove   take every rule it adds back out
+    isolate-lan --plan          print the rules it would add, change nothing
+
+The box needs the internet and its gateway (DHCP, and NAT-PMP for the mesh
+node's port request). It needs nothing else on the friend's network, and the
+friend's other devices are not part of the experiment, so outbound traffic to
+them is rejected:
+
+- IPv4: the private ranges, link-local, multicast (mDNS, SSDP and LLMNR
+  live there), and any other route on the LAN interface, in case the LAN
+  uses addresses outside the private ranges. The gateway is allowed first.
+- IPv6: unique-local (fc00::/7), link-local (fe80::/10), the mDNS and LLMNR
+  groups, and any route on the LAN interface. ufw's own rules let neighbour
+  discovery, router solicitation and MLD out before any of these apply, and
+  DHCPv6's group (ff02::1:2) is left open.
+
+Replaces the IPv4-only isolation that setup.sh used to apply inline: it left
+the household's IPv6 reachable, and checked only that the internet still
+worked, never that anything was blocked. Found 2026-11-14 at the friend's
+house, whose network carries two unique-local IPv6 prefixes.
+
+Rejected, not dropped: a local process learns at once that it may not, which
+is also what lets the check below count each rule's hits.
+
+Anything already in place from an earlier run, or from the IPv4-only version
+(`deny out`), is replaced, so running it twice is the same as running it once.
+"""
+import errno
+import ipaddress
+import json
+import os
+import socket
+import subprocess
+import sys
+import time
+
+DNS_DROPIN = "/etc/systemd/resolved.conf.d/mesh-probe.conf"
+DNS_CONTENT = "[Resolve]\nDNS=1.1.1.1 9.9.9.9\nFallbackDNS=8.8.8.8\n"
+
+V4_ALWAYS = ["10.0.0.0/8", "172.16.0.0/12", "192.168.0.0/16", "169.254.0.0/16", "224.0.0.0/4"]
+V6_ALWAYS = ["fc00::/7", "fe80::/10", "ff02::fb/128", "ff02::1:3/128"]
+# The IPv4-only version's rules, removed so they do not linger beside these.
+LEGACY_V4 = ["10.0.0.0/8", "172.16.0.0/12", "192.168.0.0/16", "169.254.0.0/16"]
+
+
+class Failed(Exception):
+    pass
+
+
+def lan(default_routes):
+    """(interface, gateway) of the IPv4 default route."""
+    for route in default_routes:
+        if route.get("dst") == "default" and route.get("gateway") and route.get("dev"):
+            return route["dev"], route["gateway"]
+    raise Failed("no IPv4 default route with a gateway: refusing to guess which network is the household's")
+
+
+def household(always, routes, gateway=None):
+    """`always`, plus every non-default route on the LAN interface that it
+    does not already cover. The gateway's own host route is not household."""
+    nets = [ipaddress.ip_network(n) for n in always]
+    for route in routes:
+        dst = route.get("dst")
+        if not dst or dst == "default":
+            continue
+        try:
+            net = ipaddress.ip_network(dst if "/" in dst else f"{dst}/{32 if ':' not in dst else 128}",
+                                       strict=False)
+        except ValueError:
+            continue
+        if gateway and net.num_addresses == 1 and str(net.network_address) == gateway:
+            continue
+        if not any(net.version == n.version and net.subnet_of(n) for n in nets):
+            nets.append(net)
+    return [str(n) for n in nets]
+
+
+def target(net, routes, gateway=None):
+    """An address inside `net` to aim the check's test packet at. Inside one
+    of the interface's own routes when there is one, because a destination
+    with no route fails before the firewall ever sees it — fc00::2 on a box
+    with no IPv6 default route would prove nothing either way."""
+    n = ipaddress.ip_network(net)
+    if n.num_addresses == 1:
+        return str(n.network_address)
+    for route in routes:
+        dst = route.get("dst", "")
+        if "/" not in dst:
+            continue
+        r = ipaddress.ip_network(dst, strict=False)
+        if r.version == n.version and r.subnet_of(n) and r.num_addresses > 2:
+            candidate = r.network_address + 2
+            if str(candidate) != gateway:
+                return str(candidate)
+    return str(n.network_address + 2)
+
+
+def plan(default_routes, routes4, routes6):
+    iface, gateway = lan(default_routes)
+    v4 = household(V4_ALWAYS, routes4, gateway)
+    v6 = household(V6_ALWAYS, routes6)
+    return {
+        "iface": iface,
+        "gateway": gateway,
+        "v4": v4,
+        "v6": v6,
+        "targets": {**{n: target(n, routes4, gateway) for n in v4},
+                    **{n: target(n, routes6) for n in v6}},
+    }
+
+
+def apply_commands(p):
+    """In order. The gateway rule goes in first so it outranks the rejections."""
+    cmds = [["ufw", "insert", "1", "allow", "out", "to", p["gateway"]]]
+    cmds += [["ufw", "reject", "out", "to", net] for net in p["v4"] + p["v6"]]
+    return cmds
+
+
+def remove_commands(p):
+    """Every form any version added, so a re-run starts from nothing."""
+    cmds = [["ufw", "--force", "delete", "allow", "out", "to", p["gateway"]]]
+    for net in p["v4"] + p["v6"]:
+        cmds.append(["ufw", "--force", "delete", "reject", "out", "to", net])
+    for net in LEGACY_V4:
+        cmds.append(["ufw", "--force", "delete", "deny", "out", "to", net])
+    return cmds
+
+
+def sockaddr(address, iface_index):
+    addr = ipaddress.ip_address(address)
+    if addr.version == 4:
+        return socket.AF_INET, (address, 9)
+    scope = iface_index if (addr.is_link_local or addr.is_multicast) else 0
+    return socket.AF_INET6, (address, 9, 0, scope)
+
+
+def parse_counters(listing):
+    """{destination: packets} over REJECT rows of `iptables -L CHAIN -n -v -x`:
+
+        pkts bytes target prot opt in out source destination [extra]
+
+    ufw writes a tcp-reset row and a catch-all row for each rejection, so a
+    destination's rows are summed."""
+    out = {}
+    for line in listing.splitlines():
+        fields = line.split()
+        if len(fields) >= 9 and fields[2] == "REJECT" and fields[0].isdigit():
+            out[fields[8]] = out.get(fields[8], 0) + int(fields[0])
+    return out
+
+
+def canonical(net):
+    n = ipaddress.ip_network(net)
+    # iptables prints single addresses without the prefix length.
+    return str(n.network_address) if n.num_addresses == 1 else str(n)
+
+
+def run(cmd, tolerate=False):
+    result = subprocess.run(cmd, capture_output=True, text=True, timeout=60)
+    if result.returncode != 0 and not tolerate:
+        raise Failed(f"{' '.join(cmd)}: {result.stderr.strip() or result.stdout.strip()}")
+    return result.stdout
+
+
+def ip_json(*args):
+    return json.loads(run(["ip", "-j", *args]) or "[]")
+
+
+def current_plan():
+    default = ip_json("route", "show", "default")
+    iface, _ = lan(default)
+    return plan(default, ip_json("route", "show", "dev", iface), ip_json("-6", "route", "show", "dev", iface))
+
+
+def internet_works():
+    """A TCP connection to a public address, by number, so DNS is not a
+    second thing that could be broken."""
+    for host in ("1.1.1.1", "9.9.9.9"):
+        try:
+            with socket.create_connection((host, 443), timeout=5):
+                return True
+        except OSError:
+            continue
+    return False
+
+
+def counters():
+    return {**parse_counters(run(["iptables", "-w", "-L", "ufw-user-output", "-n", "-v", "-x"])),
+            **parse_counters(run(["ip6tables", "-w", "-L", "ufw6-user-output", "-n", "-v", "-x"]))}
+
+
+def check_blocked(p):
+    """Send one UDP packet into every rejected destination and confirm that
+    the rule meant to catch it counted it. Returns (missed, unroutable): a
+    destination with no route fails before the firewall, so there is nothing
+    there to block and nothing to prove."""
+    index = socket.if_nametoindex(p["iface"])
+    before = counters()
+    unroutable = []
+    for net in p["v4"] + p["v6"]:
+        family, addr = sockaddr(p["targets"][net], index)
+        with socket.socket(family, socket.SOCK_DGRAM) as s:
+            try:
+                s.sendto(b"isolate-lan check", addr)
+            except OSError as error:
+                if error.errno in (errno.ENETUNREACH, errno.EHOSTUNREACH, errno.EADDRNOTAVAIL):
+                    unroutable.append(net)
+                # Otherwise a rejection surfacing; the counter is the evidence.
+    time.sleep(0.5)
+    after = counters()
+    missed = [net for net in p["v4"] + p["v6"] if net not in unroutable
+              and after.get(canonical(net), 0) <= before.get(canonical(net), 0)]
+    return missed, unroutable
+
+
+def write_dns():
+    os.makedirs(os.path.dirname(DNS_DROPIN), exist_ok=True)
+    with open(DNS_DROPIN, "w") as f:
+        f.write(DNS_CONTENT)
+    run(["systemctl", "restart", "systemd-resolved"], tolerate=True)
+
+
+def remove_dns():
+    if os.path.exists(DNS_DROPIN):
+        os.remove(DNS_DROPIN)
+        run(["systemctl", "restart", "systemd-resolved"], tolerate=True)
+
+
+def apply(p, say=print):
+    """Apply, or put everything back as it was and say why."""
+    if run(["ufw", "status"]).strip().startswith("Status: inactive"):
+        raise Failed("ufw is inactive; enabling it here could lock the box out, so do that deliberately first")
+    # Public resolvers first: the router's DNS is on the LAN, and is about to
+    # become unreachable except as the gateway itself.
+    write_dns()
+    for cmd in remove_commands(p):
+        run(cmd, tolerate=True)
+    try:
+        for cmd in apply_commands(p):
+            run(cmd)
+        run(["ufw", "reload"])
+    except Failed:
+        rollback(p)
+        raise
+    time.sleep(1)
+    if not internet_works():
+        rollback(p)
+        raise Failed("the internet stopped answering after isolating, so everything was rolled back")
+    missed, unroutable = check_blocked(p)
+    if missed:
+        # The internet works and the rules are in, so they stay: removing
+        # them would block less, not more. But the promise is not kept.
+        raise Failed(f"rules are in place but these destinations were not caught: {', '.join(missed)}")
+    say(f"isolated from the household on {p['iface']}; gateway {p['gateway']} allowed")
+    say(f"  IPv4 rejected: {', '.join(p['v4'])}")
+    say(f"  IPv6 rejected: {', '.join(p['v6'])}")
+    say("  verified: the internet answers, and every rejected destination was caught"
+        + (f" (no route at all to {', '.join(unroutable)})" if unroutable else ""))
+
+
+def rollback(p):
+    for cmd in remove_commands(p):
+        run(cmd, tolerate=True)
+    run(["ufw", "reload"], tolerate=True)
+    remove_dns()
+
+
+def main(argv):
+    args = argv[1:]
+    if args not in ([], ["--remove"], ["--plan"]):
+        print(__doc__)
+        return 2
+    try:
+        p = current_plan()
+        if args == ["--plan"]:
+            for cmd in apply_commands(p):
+                print(" ".join(cmd))
+            return 0
+        if os.geteuid() != 0:
+            print("must run as root (sudo)", file=sys.stderr)
+            return 1
+        if args == ["--remove"]:
+            rollback(p)
+            print("household isolation removed")
+            return 0
+        apply(p)
+        return 0
+    except Failed as failure:
+        print(f"isolate-lan: {failure}", file=sys.stderr)
+        return 1
+
+
+if __name__ == "__main__":
+    sys.exit(main(sys.argv))
