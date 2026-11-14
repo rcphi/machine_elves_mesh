@@ -35,30 +35,59 @@ pub fn encode_items<'a>(items: impl Iterator<Item = (&'a str, &'a Serial)>) -> V
     out
 }
 
-/// Reads back what `encode_items` wrote.
+/// The longest kind a job may name, in bytes.
 ///
-/// A trailing partial record is dropped rather than refused. The file is
-/// appended to as things are made, so a power cut lands mid-record eventually;
-/// losing the last item is the correct outcome, and refusing to start because
-/// of it is not.
-pub fn decode_items(bytes: &[u8]) -> Vec<(String, Serial)> {
+/// A bound on what one item costs on disk and on the wire, so that a chunk of
+/// items can be sized to fit a gossip message by counting them. It also lets
+/// the decoder tell a torn record (the file simply ends) from a damaged one
+/// (a length no writer could have written).
+pub const MAX_KIND: usize = 256;
+
+/// How a byte sequence of items ended.
+#[derive(Debug, PartialEq, Clone, Copy)]
+pub enum Tail {
+    /// Every byte belonged to a complete record.
+    Clean,
+    /// The last record is incomplete, which is what an interrupted append
+    /// leaves. `valid` is where the complete records end.
+    Torn { valid: usize },
+    /// A record no writer could have produced: a kind longer than [`MAX_KIND`]
+    /// or not UTF-8. `valid` is where the readable records end; what follows
+    /// may hold good records, but they can no longer be found.
+    Corrupt { valid: usize },
+}
+
+/// Reads back what `encode_items` wrote, and says how it ended.
+pub fn decode_items_checked(bytes: &[u8]) -> (Vec<(String, Serial)>, Tail) {
     let mut items = Vec::new();
     let mut at = 0usize;
-    while at + 4 <= bytes.len() {
-        let len = u32::from_le_bytes(bytes[at..at + 4].try_into().expect("4 bytes")) as usize;
+    while at < bytes.len() {
+        let start = at;
+        let Some(header) = bytes.get(at..at + 4) else { return (items, Tail::Torn { valid: start }) };
+        let len = u32::from_le_bytes(header.try_into().expect("4 bytes")) as usize;
+        if len > MAX_KIND {
+            return (items, Tail::Corrupt { valid: start });
+        }
         at += 4;
-        // A length that runs past the end is the truncated-record case.
-        let Some(kind) = bytes.get(at..at + len) else { break };
-        let Ok(kind) = std::str::from_utf8(kind) else { break };
+        let Some(kind) = bytes.get(at..at + len) else { return (items, Tail::Torn { valid: start }) };
+        let Ok(kind) = std::str::from_utf8(kind) else { return (items, Tail::Corrupt { valid: start }) };
         at += len;
-        let Some(serial) = bytes.get(at..at + 32) else { break };
+        let Some(serial) = bytes.get(at..at + 32) else { return (items, Tail::Torn { valid: start }) };
         at += 32;
         items.push((
             kind.to_string(),
             Serial::from_bytes(serial.try_into().expect("32 bytes")),
         ));
     }
-    items
+    (items, Tail::Clean)
+}
+
+/// Reads back what `encode_items` wrote, keeping every complete record before
+/// anything incomplete or unreadable. For messages, where a bad tail costs only
+/// that message; a file needs [`Ledger::load_repairing`], because a bad tail
+/// left on disk takes every later append with it.
+pub fn decode_items(bytes: &[u8]) -> Vec<(String, Serial)> {
+    decode_items_checked(bytes).0
 }
 
 /// The identity of one produced thing.
@@ -84,10 +113,6 @@ impl Serial {
         hasher.update(kind.as_bytes());
         hasher.update(ordinal.to_le_bytes());
         Serial(hasher.finalize().into())
-    }
-
-    pub fn short(&self) -> String {
-        self.0[..6].iter().map(|b| format!("{b:02x}")).collect()
     }
 
     pub fn as_bytes(&self) -> &[u8; 32] {
@@ -257,7 +282,7 @@ impl Ledger {
     /// identically no matter what order they arrived in. Everything below
     /// depends on that: a digest computed from this is comparable between
     /// machines, and a file written from it can be read back into the same set.
-    #[cfg(test)]
+    /// Every item, in order. Used to rewrite a damaged file, and by tests.
     pub fn iter(&self) -> impl Iterator<Item = (&str, &Serial)> {
         self.items.iter().map(|(kind, serial)| (kind.as_str(), serial))
     }
@@ -280,19 +305,66 @@ impl Ledger {
     /// This is the difference between an inventory and a session's tally. The
     /// set is grow-only precisely so that it can outlive the process that
     /// built it; keeping it only in memory threw that away every restart.
+    #[cfg(test)]
     pub fn load(path: &Path) -> io::Result<Self> {
-        let mut ledger = Self::new();
-        match std::fs::File::open(path) {
-            Ok(mut file) => {
-                let mut bytes = Vec::new();
-                file.read_to_end(&mut bytes)?;
-                ledger.absorb(decode_items(&bytes));
-                Ok(ledger)
-            }
-            Err(error) if error.kind() == io::ErrorKind::NotFound => Ok(ledger),
-            Err(error) => Err(error),
-        }
+        Self::load_repairing(path).map(|(ledger, _)| ledger)
     }
+
+    /// Reads a ledger back, and leaves the file safe to append to.
+    ///
+    /// A torn last record used to be dropped from memory and left on disk.
+    /// The next append then went after the fragment, and the next load read
+    /// the fragment's length header as the start of a record, losing or
+    /// misreading everything appended since (review finding 1). So a torn tail
+    /// is now cut off the file before anything is appended. That is the
+    /// ordinary case, a power cut mid-append, and it costs the one item.
+    ///
+    /// A damaged record is different: it is not at the end, and cutting there
+    /// would destroy whatever good records follow it. The file is moved aside,
+    /// for anyone who wants to look, and the readable items are written to a
+    /// fresh one. One full rewrite, on an event that should never happen.
+    pub fn load_repairing(path: &Path) -> io::Result<(Self, Repair)> {
+        let mut ledger = Self::new();
+        let mut file = match std::fs::File::open(path) {
+            Ok(file) => file,
+            Err(error) if error.kind() == io::ErrorKind::NotFound => return Ok((ledger, Repair::None)),
+            Err(error) => return Err(error),
+        };
+        let mut bytes = Vec::new();
+        file.read_to_end(&mut bytes)?;
+        drop(file);
+        let (items, tail) = decode_items_checked(&bytes);
+        ledger.absorb(items);
+        let repair = match tail {
+            Tail::Clean => Repair::None,
+            Tail::Torn { valid } => {
+                std::fs::OpenOptions::new().write(true).open(path)?.set_len(valid as u64)?;
+                Repair::TornTailTrimmed { bytes: bytes.len() - valid }
+            }
+            Tail::Corrupt { valid } => {
+                let stamp = std::time::SystemTime::now()
+                    .duration_since(std::time::UNIX_EPOCH)
+                    .map(|d| d.as_secs())
+                    .unwrap_or(0);
+                let aside = path.with_extension(format!("corrupt-{stamp}"));
+                std::fs::rename(path, &aside)?;
+                std::fs::write(path, encode_items(ledger.iter()))?;
+                Repair::CorruptSetAside { at: valid, kept: ledger.len(), aside: aside.display().to_string() }
+            }
+        };
+        Ok((ledger, repair))
+    }
+}
+
+/// What loading had to do to leave the file appendable.
+#[derive(Debug, PartialEq)]
+pub enum Repair {
+    None,
+    /// An interrupted append: the fragment was cut off the end.
+    TornTailTrimmed { bytes: usize },
+    /// A damaged record at byte `at`: the file was moved to `aside` and the
+    /// `kept` readable items written to a fresh one.
+    CorruptSetAside { at: usize, kept: usize, aside: String },
 }
 
 /// Adds items to the file without rewriting it.
@@ -301,6 +373,9 @@ impl Ledger {
 /// written is never wrong, so there is nothing to rewrite. A full rewrite of a
 /// third of a million items several times a second would also be the single
 /// most expensive thing this program does.
+///
+/// A write that fails partway is cut back to where it began, so a failure
+/// leaves no fragment for the next successful append to land behind.
 pub fn append(path: &Path, items: &[(String, Serial)]) -> io::Result<()> {
     if items.is_empty() {
         return Ok(());
@@ -309,9 +384,47 @@ pub fn append(path: &Path, items: &[(String, Serial)]) -> io::Result<()> {
         std::fs::create_dir_all(parent)?;
     }
     let mut file = std::fs::OpenOptions::new().create(true).append(true).open(path)?;
-    file.write_all(&encode_items(
+    let before = file.metadata()?.len();
+    let written = file.write_all(&encode_items(
         items.iter().map(|(kind, serial)| (kind.as_str(), serial)),
-    ))
+    ));
+    if written.is_err() {
+        let _ = file.set_len(before);
+    }
+    written
+}
+
+/// What one attempt to write items down achieved. See [`persist`].
+#[derive(Debug, PartialEq)]
+pub enum Persisted {
+    /// Nothing was waiting and nothing was new.
+    Nothing,
+    /// Written, including `retried` items an earlier attempt failed to write.
+    Saved { retried: usize },
+    /// Not written; `pending` items are held for the next attempt.
+    NotSaved { error: String, pending: usize },
+}
+
+/// Writes `items` down, together with anything an earlier attempt could not.
+///
+/// The in-memory set already holds these items, so receiving them again adds
+/// nothing and never prompts another write: an item whose append failed was
+/// believed and never recorded, and a restart forgot it (review finding 7).
+/// So a failure keeps them in `unsaved`, and every later attempt, local
+/// production or a peer's, writes those first.
+pub fn persist(path: &Path, unsaved: &mut Vec<(String, Serial)>, items: &[(String, Serial)]) -> Persisted {
+    let retried = unsaved.len();
+    unsaved.extend_from_slice(items);
+    if unsaved.is_empty() {
+        return Persisted::Nothing;
+    }
+    match append(path, unsaved) {
+        Ok(()) => {
+            unsaved.clear();
+            Persisted::Saved { retried }
+        }
+        Err(error) => Persisted::NotSaved { error: error.to_string(), pending: unsaved.len() },
+    }
 }
 
 #[cfg(test)]
@@ -431,6 +544,106 @@ mod tests {
         recovered.absorb(decode_items(&bytes));
         assert_eq!(original.summary(), recovered.summary());
         assert_eq!(recovered.len(), 3);
+    }
+
+    fn temp_ledger(name: &str) -> std::path::PathBuf {
+        let dir = std::env::temp_dir().join(format!("me-ledger-{name}-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+        dir.join("ledger")
+    }
+
+    fn items(ticks: &[u64]) -> Vec<(String, Serial)> {
+        ticks.iter().map(|t| ("widget".to_string(), Serial::derive(&JOB, *t, "widget", 0))).collect()
+    }
+
+    /// The review's reproduction of finding 1, on a real file: a torn record,
+    /// a load, another append, and a second load must keep both whole items.
+    #[test]
+    fn an_append_after_a_torn_record_survives_the_next_load() {
+        let path = temp_ledger("torn");
+        append(&path, &items(&[1])).unwrap();
+        // A partial next length header, as an interrupted append leaves it.
+        std::fs::OpenOptions::new().append(true).open(&path).unwrap().write_all(&[6, 0]).unwrap();
+        let (first, repair) = Ledger::load_repairing(&path).unwrap();
+        assert_eq!(first.len(), 1);
+        assert_eq!(repair, Repair::TornTailTrimmed { bytes: 2 });
+        append(&path, &items(&[2])).unwrap();
+        let (second, repair) = Ledger::load_repairing(&path).unwrap();
+        assert_eq!(second.len(), 2, "the item appended after the repair was lost");
+        assert_eq!(repair, Repair::None);
+    }
+
+    #[test]
+    fn every_torn_boundary_is_trimmed_and_appendable() {
+        // Cut inside the header, the kind, and the serial of the third record.
+        let whole = encode_items(ledger_of(&[1, 2, 3]).iter());
+        let record = 4 + "widget".len() + 32;
+        for cut in [record * 2 + 2, record * 2 + 7, record * 2 + 4 + 6 + 10] {
+            let path = temp_ledger(&format!("cut{cut}"));
+            std::fs::write(&path, &whole[..cut]).unwrap();
+            let (ledger, repair) = Ledger::load_repairing(&path).unwrap();
+            assert_eq!(ledger.len(), 2, "cut at {cut}");
+            assert!(matches!(repair, Repair::TornTailTrimmed { .. }), "cut at {cut}: {repair:?}");
+            append(&path, &items(&[9])).unwrap();
+            assert_eq!(Ledger::load(&path).unwrap().len(), 3, "cut at {cut}");
+        }
+    }
+
+    #[test]
+    fn a_damaged_record_is_set_aside_not_cut_through() {
+        let path = temp_ledger("corrupt");
+        append(&path, &items(&[1, 2])).unwrap();
+        // A length no writer could produce, followed by a good record that
+        // can no longer be found.
+        let mut bytes = std::fs::read(&path).unwrap();
+        bytes.extend_from_slice(&(10_000u32).to_le_bytes());
+        bytes.extend_from_slice(&encode_items(ledger_of(&[3]).iter()));
+        std::fs::write(&path, &bytes).unwrap();
+        let (ledger, repair) = Ledger::load_repairing(&path).unwrap();
+        assert_eq!(ledger.len(), 2);
+        let Repair::CorruptSetAside { kept, aside, .. } = repair else { panic!("{repair:?}") };
+        assert_eq!(kept, 2);
+        assert_eq!(std::fs::read(&aside).unwrap(), bytes, "the original is kept to look at");
+        // The fresh file is clean and appendable.
+        append(&path, &items(&[4])).unwrap();
+        let (again, repair) = Ledger::load_repairing(&path).unwrap();
+        assert_eq!(repair, Repair::None);
+        assert_eq!(again.summary(), ledger_with(&[1, 2, 4]).summary());
+    }
+
+    fn ledger_with(ticks: &[u64]) -> Ledger {
+        let mut ledger = Ledger::new();
+        ledger.absorb(items(ticks));
+        ledger
+    }
+
+    #[test]
+    fn items_a_failed_write_held_back_are_written_by_the_next_attempt() {
+        // Finding 7: a standby's failed append was forgotten, because the set
+        // already held the items and nothing would ever write them again.
+        let dir = std::env::temp_dir().join(format!("me-ledger-persist-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+        // The ledger's directory is a file, so creating it fails.
+        let blocker = dir.join("sub");
+        std::fs::write(&blocker, b"in the way").unwrap();
+        let path = blocker.join("ledger");
+        let mut unsaved = Vec::new();
+        assert!(matches!(persist(&path, &mut unsaved, &items(&[1, 2])),
+                         Persisted::NotSaved { pending: 2, .. }));
+        // Writability restored.
+        std::fs::remove_file(&blocker).unwrap();
+        assert_eq!(persist(&path, &mut unsaved, &items(&[3])), Persisted::Saved { retried: 2 });
+        assert!(unsaved.is_empty());
+        assert_eq!(Ledger::load(&path).unwrap().len(), 3, "a restart remembers all three");
+    }
+
+    #[test]
+    fn a_kind_longer_than_any_writer_allows_is_damage_not_truncation() {
+        let mut bytes = (MAX_KIND as u32 + 1).to_le_bytes().to_vec();
+        bytes.extend_from_slice(&[b'x'; 10]);
+        assert_eq!(decode_items_checked(&bytes).1, Tail::Corrupt { valid: 0 });
     }
 
     #[test]

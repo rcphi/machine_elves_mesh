@@ -1,11 +1,14 @@
 //! Phase 0 mesh node.
 //!
-//! Does one thing: forms an overlay with other nodes, keeps track of who is in
-//! it, and notices when someone disappears — distinguishing a machine that left
-//! cleanly from one that was unplugged.
+//! Forms an overlay with other nodes, keeps track of who is in it, and notices
+//! when someone disappears — distinguishing a machine that left cleanly from
+//! one that was unplugged. On that membership it runs one sandboxed job (see
+//! `job`), checkpoints it to every peer each tick, continues it on another node
+//! when its host vanishes — on suspicion, before the loss is confirmed — and
+//! keeps a grow-only inventory of what the job made (see `ledger`).
 //!
-//! Jobs, checkpointing, and migration come later. Membership has to be
-//! trustworthy first, because everything else is built on knowing who is here.
+//! Membership came first, because everything else is built on knowing who is
+//! here; the rest is measured in `docs/phase-0-plan.md`.
 
 mod job;
 mod ledger;
@@ -47,7 +50,13 @@ const KIND_DEPARTING: u8 = 2;
 /// Sent by whichever node is currently running the job, to everyone. A peer
 /// that holds a recent checkpoint can continue the work without asking anyone
 /// for anything, which is what makes takeover fast enough to be worth doing.
-const KIND_CHECKPOINT: u8 = 3;
+///
+/// It names the job it is a checkpoint of. Kind 3 did not, so a node holding
+/// a different job file accepted another job's state as its own (review
+/// finding 5). Kind 3 is retired and ignored; a new kind rather than a longer
+/// kind 3, so that a node built before this ignores the new message instead
+/// of misreading a job id as a tick.
+const KIND_CHECKPOINT: u8 = 9;
 
 /// "I can see this peer at this address."
 ///
@@ -125,12 +134,40 @@ const REPAIR_BUCKETS_PER_ROUND: usize = 32;
 /// 88 items stayed missing through 537 attempts.
 const REPAIR_ITEMS_PER_BUCKET: usize = 4_096;
 
-/// How many items to put in one message.
+/// How many items to put in one message, at most.
 ///
 /// Gossipsub refuses anything oversized, and a refused repair is invisible —
-/// it does not fail loudly, it simply never arrives. Sized well inside the
-/// default cap so that a long kind name cannot push a chunk over it.
+/// it does not fail loudly, it simply never arrives. A count alone did not
+/// bound the size: 512 items of a 256-byte kind is 150 KB against a 64 KiB cap
+/// (review finding 9). So chunks are cut by encoded size as well; see
+/// [`chunks_that_fit`].
 const LEDGER_CHUNK: usize = 512;
+
+/// The largest message gossipsub will carry, set explicitly rather than
+/// inherited, because every size limit below is derived from it.
+const GOSSIP_MAX_BYTES: usize = 65_536;
+
+/// Room left for everything a message carries besides its payload: the
+/// label, the kind, the signature and key, the topic and sequence number.
+const GOSSIP_ENVELOPE: usize = 2_048;
+
+/// The largest job state a checkpoint can carry. A job whose state outgrows
+/// it still runs, but no standby could ever receive it, so a takeover would
+/// start from nothing; that is treated as the job failing.
+///
+/// What a checkpoint carries besides the state is the kind, the label and its
+/// length, the job's hash, the tick and the state's length: 49 bytes plus the
+/// label, rounded up to 64.
+const MAX_CHECKPOINT_STATE: usize = GOSSIP_MAX_BYTES - GOSSIP_ENVELOPE - MAX_LABEL - 64;
+
+/// The longest label a node may have. It rides in every message.
+const MAX_LABEL: usize = 64;
+
+/// The most items one tick may produce. Fuel bounds the job's instructions,
+/// not the host's: `produce widget 4294967295` is a few bytes of effect and
+/// four billion serials, hashes and set insertions afterwards (review
+/// finding 2). The factory makes at most a handful per tick.
+const MAX_PRODUCED_PER_TICK: u64 = 4_096;
 
 /// How often nodes summarise what they hold.
 ///
@@ -230,9 +267,9 @@ enum Message {
     /// peer that went silent and came back had restarted or had merely been
     /// unreachable — and those are different failures that must not be counted
     /// together.
-    Heartbeat { label: String, run: Option<u64> },
+    Heartbeat { label: String, run: Option<u64>, holding: Holding },
     Departing { label: String },
-    Checkpoint { label: String, tick: u64, state: Vec<u8> },
+    Checkpoint { label: String, job: [u8; 32], tick: u64, state: Vec<u8> },
     Observed { label: String, peer: PeerId, addr: Multiaddr },
     Produced { label: String, items: Vec<(String, ledger::Serial)> },
     LedgerSummary { label: String, held: u64, cells: Vec<ledger::Cell> },
@@ -266,11 +303,36 @@ fn take_bytes(bytes: &[u8], at: &mut usize) -> Option<Vec<u8>> {
     Some(value)
 }
 
-fn encode_heartbeat(label: &str, counter: u64, run: u64) -> Vec<u8> {
+/// What a member holds, as its heartbeats say.
+///
+/// The election asks who is lowest among the members, and it used to ask that
+/// of every member, including one launched without a job, or with a different
+/// one. A lower-identifier member that could not run the job then won every
+/// election and did nothing, and the job stopped (review finding 5). Only
+/// members holding the same job, by its code hash, are candidates now.
+#[derive(Clone, Copy, Debug, PartialEq)]
+enum Holding {
+    /// Not said: no heartbeat heard yet, or a node built before heartbeats
+    /// said. Not a candidate until it says.
+    Unknown,
+    /// In the mesh, holding no job.
+    Nothing,
+    Job([u8; 32]),
+}
+
+fn encode_heartbeat(label: &str, counter: u64, run: u64, job: Option<&[u8; 32]>) -> Vec<u8> {
     let mut out = vec![KIND_HEARTBEAT];
     put_str(&mut out, label);
     out.extend_from_slice(&counter.to_le_bytes());
     out.extend_from_slice(&run.to_le_bytes());
+    // Appended, so a node built before this reads the run and ignores the rest.
+    match job {
+        None => out.push(0),
+        Some(id) => {
+            out.push(1);
+            out.extend_from_slice(id);
+        }
+    }
     out
 }
 
@@ -290,9 +352,10 @@ fn encode_observed(label: &str, peer: &PeerId, addr: &Multiaddr) -> Vec<u8> {
     out
 }
 
-fn encode_checkpoint(label: &str, tick: u64, state: &[u8]) -> Vec<u8> {
+fn encode_checkpoint(label: &str, job: &[u8; 32], tick: u64, state: &[u8]) -> Vec<u8> {
     let mut out = vec![KIND_CHECKPOINT];
     put_str(&mut out, label);
+    out.extend_from_slice(job);
     out.extend_from_slice(&tick.to_le_bytes());
     out.extend_from_slice(&(state.len() as u32).to_le_bytes());
     out.extend_from_slice(state);
@@ -361,13 +424,23 @@ fn parse_message(bytes: &[u8]) -> Option<Message> {
             // optional, so a node built before runs existed is still heard as
             // alive rather than dropped as malformed.
             let run = take_u64(bytes, &mut at).and_then(|_| take_u64(bytes, &mut at));
-            Some(Message::Heartbeat { label, run })
+            let holding = match bytes.get(at) {
+                Some(0) => Holding::Nothing,
+                Some(1) => bytes
+                    .get(at + 1..at + 33)
+                    .map(|id| Holding::Job(id.try_into().expect("32 bytes")))
+                    .unwrap_or(Holding::Unknown),
+                _ => Holding::Unknown,
+            };
+            Some(Message::Heartbeat { label, run, holding })
         }
         KIND_DEPARTING => Some(Message::Departing { label }),
         KIND_CHECKPOINT => {
+            let job: [u8; 32] = bytes.get(at..at + 32)?.try_into().ok()?;
+            at += 32;
             let tick = take_u64(bytes, &mut at)?;
             let state = take_bytes(bytes, &mut at)?;
-            Some(Message::Checkpoint { label, tick, state })
+            Some(Message::Checkpoint { label, job, tick, state })
         }
         KIND_OBSERVED => {
             let peer = PeerId::from_bytes(&take_bytes(bytes, &mut at)?).ok()?;
@@ -522,6 +595,14 @@ struct Work {
     /// When this node noticed the owner disappear. Only set between the
     /// disappearance and the takeover, and used to measure the gap.
     owner_lost_at: Option<Instant>,
+    /// Who that owner was, so the takeover can name what it continued. A
+    /// summary matching takeovers to disruptions otherwise has only timing to
+    /// go on, and two disruptions close together can share one takeover
+    /// (review finding 14).
+    owner_lost_label: Option<String>,
+    /// Items the ledger holds that could not yet be written down. See
+    /// [`ledger::persist`].
+    unsaved: Vec<(String, ledger::Serial)>,
     /// When the last checkpoint arrived from whoever was running the job.
     last_checkpoint_at: Option<Instant>,
     /// Set by a takeover, cleared by the first tick after it.
@@ -570,8 +651,20 @@ impl Work {
     /// is the entire virtue, because it is the same arbitrary answer on every
     /// machine. Arranging a vote would cost more messages, and more of the
     /// gap a player is sitting through, than the takeover it arranges.
-    fn should_take_over(me: &PeerId, members: &HashMap<PeerId, Member>) -> bool {
-        Self::lowest_among(me, members.keys())
+    fn should_take_over(me: &PeerId, members: &HashMap<PeerId, Member>, job: &[u8; 32]) -> bool {
+        Self::lowest_among(me, Self::able(members, job))
+    }
+
+    /// Members that could continue this job: those whose heartbeats say they
+    /// hold the same code. See [`Holding`].
+    fn able<'a>(
+        members: &'a HashMap<PeerId, Member>,
+        job: &'a [u8; 32],
+    ) -> impl Iterator<Item = &'a PeerId> {
+        members
+            .iter()
+            .filter(move |(_, m)| m.holding == Holding::Job(*job))
+            .map(|(peer, _)| peer)
     }
 
     /// Whether to start continuing a job whose owner has gone quiet but is not
@@ -587,11 +680,12 @@ impl Work {
         members: &HashMap<PeerId, Member>,
         now: Instant,
         after: Duration,
+        job: &[u8; 32],
     ) -> bool {
         members
             .get(owner)
             .is_some_and(|suspect| now.duration_since(suspect.last_heard) >= after)
-            && Self::lowest_among(me, members.keys().filter(|peer| *peer != owner))
+            && Self::lowest_among(me, Self::able(members, job).filter(|peer| *peer != owner))
     }
 }
 
@@ -680,6 +774,8 @@ struct Member {
     /// Which start of the peer's process has been heard from, once a heartbeat
     /// has said. See [`Message::Heartbeat`].
     run: Option<u64>,
+    /// Which job it holds, once a heartbeat has said. See [`Holding`].
+    holding: Holding,
 }
 
 /// Peers declared gone, remembered so their return can be classified.
@@ -893,6 +989,10 @@ fn parse_args() -> Result<Config> {
         config.detect
     );
 
+    // A label rides in every message, so it is part of every size budget.
+    if config.label.is_empty() || config.label.len() > MAX_LABEL {
+        anyhow::bail!("a label must be 1 to {MAX_LABEL} bytes, not {}", config.label.len());
+    }
     Ok(config)
 }
 
@@ -1061,6 +1161,7 @@ async fn run(config: Config) -> Result<()> {
                     // not spend effort re-delivering old ones.
                     .heartbeat_interval(Duration::from_millis(500))
                     .validation_mode(gossipsub::ValidationMode::Strict)
+                    .max_transmit_size(GOSSIP_MAX_BYTES)
                     .build()
                     .map_err(std::io::Error::other)?,
             )?;
@@ -1153,8 +1254,25 @@ async fn run(config: Config) -> Result<()> {
             // What this node already knew existed, from before it was last
             // stopped. A ledger that started empty made every restart look
             // like the world had never been built in.
-            let ledger = match ledger::Ledger::load(std::path::Path::new(&config.ledger)) {
-                Ok(ledger) => {
+            let ledger = match ledger::Ledger::load_repairing(std::path::Path::new(&config.ledger)) {
+                Ok((ledger, repair)) => {
+                    match repair {
+                        ledger::Repair::None => {}
+                        ledger::Repair::TornTailTrimmed { bytes } => {
+                            emit(&config, "ledger-repaired",
+                                 &format!("cut {bytes} bytes of an interrupted append off the end \
+                                           of {}, so the next append is readable", config.ledger),
+                                 &[("path", &config.ledger), ("bytes", &bytes.to_string())]);
+                        }
+                        ledger::Repair::CorruptSetAside { at, kept, aside } => {
+                            emit(&config, "ledger-corrupt",
+                                 &format!("{} is damaged at byte {at}: moved to {aside}, and the \
+                                           {kept} readable items written to a fresh file",
+                                          config.ledger),
+                                 &[("path", &config.ledger), ("at", &at.to_string()),
+                                   ("kept", &kept.to_string()), ("aside", &aside)]);
+                        }
+                    }
                     if !ledger.is_empty() {
                         emit(&config, "ledger-loaded",
                              &format!("remembers {} things that already exist", ledger.len()),
@@ -1184,6 +1302,8 @@ async fn run(config: Config) -> Result<()> {
                 state: Vec::new(),
                 tick: 0,
                 owner_lost_at: None,
+                owner_lost_label: None,
+                unsaved: Vec::new(),
                 last_checkpoint_at: None,
                 resuming: None,
                 speculating: None,
@@ -1194,6 +1314,14 @@ async fn run(config: Config) -> Result<()> {
         }
         None => None,
     };
+
+    // Said in every heartbeat, so peers know whether this node could continue
+    // their job. Fixed for the life of the process.
+    let my_job: Option<[u8; 32]> = work.as_ref().map(|w| *w.job.id());
+    // Recurring problems, said at most once a minute each.
+    let mut quiet = Quiet::default();
+    // Peers already told off for sending another job's checkpoints.
+    let mut incompatible: HashSet<PeerId> = HashSet::new();
 
     let mut members: HashMap<PeerId, Member> = HashMap::new();
     let mut absences = Absences::default();
@@ -1345,9 +1473,10 @@ async fn run(config: Config) -> Result<()> {
             _ = heartbeat.tick() => {
                 counter += 1;
                 // Failing to publish is normal and uninteresting while this node
-                // is the only one subscribed to the topic.
-                let _ = swarm.behaviour_mut().gossipsub
-                    .publish(topic.clone(), encode_heartbeat(&config.label, counter, run));
+                // is the only one subscribed to the topic; `published` says so
+                // only for the failures that are not that.
+                published(&config, &mut quiet, "heartbeat", swarm.behaviour_mut().gossipsub
+                    .publish(topic.clone(), encode_heartbeat(&config.label, counter, run, my_job.as_ref())));
             }
 
             _ = job_tick.tick() => {
@@ -1363,6 +1492,21 @@ async fn run(config: Config) -> Result<()> {
                         emit(&config, "claimed",
                              "nobody was running this job, so this node is",
                              &[("tick", &work.tick.to_string())]);
+                        // Progress lives only in checkpoints, which live only
+                        // in running nodes. If every holder stopped, the claim
+                        // starts again from tick 0 with an inventory that says
+                        // the work was already done: nothing is made twice,
+                        // because the serials repeat, but every tick up to
+                        // where it was is computed again. A Phase 0 limitation,
+                        // said rather than hidden (review finding 8).
+                        if work.tick == 0 && !work.ledger.is_empty() {
+                            emit(&config, "cold-start",
+                                 &format!("no peer held a checkpoint, so the job restarts from tick 0 \
+                                           although {} things it made already exist; progress is not \
+                                           kept on disk, so the work up to them is redone",
+                                          work.ledger.len()),
+                                 &[("held", &work.ledger.len().to_string())]);
+                        }
                     }
                 }
 
@@ -1377,7 +1521,15 @@ async fn run(config: Config) -> Result<()> {
                 inputs.extend_from_slice(&4u32.to_le_bytes());  // steel delivered
                 inputs.extend_from_slice(&3u32.to_le_bytes());  // workers present
 
-                match work.job.tick(&work.state, &inputs) {
+                let ticked = work.job.tick(&work.state, &inputs).and_then(|outcome| {
+                    if outcome.state.len() > MAX_CHECKPOINT_STATE {
+                        anyhow::bail!("the job's state grew to {} bytes, past the {} a checkpoint \
+                                       can carry, so no standby could ever continue it",
+                                      outcome.state.len(), MAX_CHECKPOINT_STATE);
+                    }
+                    Ok(outcome)
+                });
+                match ticked {
                     Ok(outcome) => {
                         work.state = outcome.state;
                         work.tick += 1;
@@ -1413,19 +1565,27 @@ async fn run(config: Config) -> Result<()> {
                             let kind = line.split_whitespace().take(2).collect::<Vec<_>>().join(" ");
                             *since_summary.entry(kind).or_insert(0) += 1;
                         }
-                        let fresh = record_production(work, &effects);
+                        let (fresh, rejected) = record_production(work, &effects);
+                        if let Some(why) = rejected {
+                            if let Some(repeats) = quiet.say("effects", Instant::now()) {
+                                emit(&config, "effects-rejected",
+                                     &format!("tick {}: {why} — nothing it produced was recorded", work.tick),
+                                     &[("tick", &work.tick.to_string()), ("why", &why),
+                                       ("repeats", &repeats.to_string())]);
+                            }
+                        }
                         // Checkpointed every tick because this state is tiny.
                         // Real work would checkpoint less often and trade a
                         // little replayed work for a lot less traffic.
-                        let _ = swarm.behaviour_mut().gossipsub.publish(
+                        published(&config, &mut quiet, "checkpoint", swarm.behaviour_mut().gossipsub.publish(
                             topic.clone(),
-                            encode_checkpoint(&config.label, work.tick, &work.state),
-                        );
+                            encode_checkpoint(&config.label, work.job.id(), work.tick, &work.state),
+                        ));
                         // Separately from the checkpoint, and that separation
                         // is the design: the checkpoint is where the job *is*,
                         // small and sent constantly; this is what the job has
                         // *made*, and it is sent once per thing, forever.
-                        publish_production(&mut swarm, &topic, &config, &fresh);
+                        publish_production(&mut swarm, &topic, &config, &mut work.unsaved, &fresh, &mut quiet);
                     }
                     Err(error) => {
                         emit(&config, "job-failed", &format!("{error:#}"),
@@ -1496,6 +1656,7 @@ async fn run(config: Config) -> Result<()> {
                             if w.owner == Some(peer) {
                                 w.owner = None;
                                 w.owner_lost_at = Some(now);
+                                w.owner_lost_label = Some(member.label.clone());
                             }
                         }
                         emit(
@@ -1565,7 +1726,7 @@ async fn run(config: Config) -> Result<()> {
                     let owner = w.owner.filter(|owner| *owner != me);
                     if let Some(owner) = owner {
                         if w.speculating.is_none()
-                            && Work::should_speculate(&me, &owner, &members, now, after)
+                            && Work::should_speculate(&me, &owner, &members, now, after, w.job.id())
                         {
                             let member = members.get(&owner);
                             let silent = member
@@ -1755,6 +1916,7 @@ async fn run(config: Config) -> Result<()> {
                             last_heard: Instant::now(),
                             disconnected: false,
                             run: None,
+                            holding: Holding::Unknown,
                         });
                         once_members.insert(source);
                         emit(&config, "joined", &format!("{label} joined"),
@@ -1766,7 +1928,7 @@ async fn run(config: Config) -> Result<()> {
                         // else is also continuing.
                         counter += 1;
                         let _ = swarm.behaviour_mut().gossipsub
-                            .publish(topic.clone(), encode_heartbeat(&config.label, counter, run));
+                            .publish(topic.clone(), encode_heartbeat(&config.label, counter, run, my_job.as_ref()));
                         // And say what we hold, for the same reason. A node
                         // that has just arrived has missed everything made
                         // before it did, and waiting for the periodic digest
@@ -1784,6 +1946,12 @@ async fn run(config: Config) -> Result<()> {
                     } else if let Some(member) = members.get_mut(&source) {
                         member.last_heard = Instant::now();
                         member.disconnected = false;
+                    }
+
+                    if let Message::Heartbeat { holding, .. } = &parsed {
+                        if let Some(member) = members.get_mut(&source) {
+                            member.holding = *holding;
+                        }
                     }
 
                     match parsed {
@@ -1823,9 +1991,12 @@ async fn run(config: Config) -> Result<()> {
                                 if !added.is_empty() {
                                     // Written down, not merely believed. The
                                     // in-memory set and the file have to agree
-                                    // or a restart quietly undoes the merge.
-                                    let _ = ledger::append(
-                                        std::path::Path::new(&config.ledger), &added);
+                                    // or a restart quietly undoes the merge, and
+                                    // a failure is said and retried exactly as
+                                    // for this node's own production.
+                                    let outcome = ledger::persist(
+                                        std::path::Path::new(&config.ledger), &mut w.unsaved, &added);
+                                    report_persisted(&config, &mut quiet, outcome);
                                 }
                             }
                         }
@@ -1875,9 +2046,9 @@ async fn run(config: Config) -> Result<()> {
                                  &[("label", &label), ("bucket", &bucket.to_string()),
                                    ("cells", &differ.len().to_string()),
                                    ("items", &items.len().to_string())]);
-                            for chunk in items.chunks(LEDGER_CHUNK) {
-                                let _ = swarm.behaviour_mut().gossipsub.publish(
-                                    topic.clone(), encode_produced(&config.label, chunk));
+                            for chunk in chunks_that_fit(&items, PRODUCED_BUDGET) {
+                                published(&config, &mut quiet, "repair", swarm.behaviour_mut().gossipsub.publish(
+                                    topic.clone(), encode_produced(&config.label, chunk)));
                             }
                             // The asker has sent its cells but not its items —
                             // it cannot know which of ours we lack until it
@@ -1913,6 +2084,7 @@ async fn run(config: Config) -> Result<()> {
                                 if w.owner == Some(source) {
                                     w.owner = None;
                                     w.owner_lost_at = Some(Instant::now());
+                                    w.owner_lost_label = Some(label.clone());
                                     take_over_if_ours(&config, me, w, &members, "announced");
                                 }
                             }
@@ -1955,8 +2127,20 @@ async fn run(config: Config) -> Result<()> {
                             pending.push(addr);
                         }
 
-                        Message::Checkpoint { tick, state, .. } => {
+                        Message::Checkpoint { job, tick, state, .. } => {
                             let Some(w) = work.as_mut() else { continue };
+
+                            // Another job's state is not this job's state, and
+                            // its sender is not this job's owner.
+                            if &job != w.job.id() {
+                                if incompatible.insert(source) {
+                                    emit(&config, "checkpoint-incompatible",
+                                         &format!("{label} is running a different job; its checkpoints \
+                                                   are ignored and it is not a candidate for this one"),
+                                         &[("peer_id", &source.to_string()), ("label", &label)]);
+                                }
+                                continue;
+                            }
 
                             // Somebody is running it, so this node has no cause
                             // to claim it.
@@ -2025,6 +2209,7 @@ async fn run(config: Config) -> Result<()> {
 
                             w.owner = Some(source);
                             w.owner_lost_at = None;
+                            w.owner_lost_label = None;
                             w.last_checkpoint_at = Some(Instant::now());
                             // Someone else is running it after all; a takeover
                             // still waiting for its first tick never got one.
@@ -2090,24 +2275,91 @@ async fn run(config: Config) -> Result<()> {
 /// serials as the node that ran it before, so re-running work the mesh already
 /// knows about correctly announces nothing. That is the duplicate problem
 /// dissolving rather than being handled.
-fn record_production(work: &mut Work, effects: &str) -> Vec<(String, ledger::Serial)> {
+fn record_production(work: &mut Work, effects: &str) -> (Vec<(String, ledger::Serial)>, Option<String>) {
+    let totals = match production(effects) {
+        Ok(totals) => totals,
+        Err(why) => return (Vec::new(), Some(why)),
+    };
     let mut fresh = Vec::new();
+    for (kind, count) in totals {
+        for ordinal in 0..count {
+            let serial = ledger::Serial::derive(work.job.id(), work.tick, &kind, ordinal);
+            if work.ledger.record(&kind, serial) {
+                fresh.push((kind.clone(), serial));
+            }
+        }
+    }
+    (fresh, None)
+}
+
+/// Reads a tick's `produce` lines into a count per kind, or says why it
+/// cannot.
+///
+/// Every line is checked before anything is recorded, so a tick is applied
+/// whole or not at all. Counts are totalled per kind before serials are
+/// derived: ordinals used to restart at zero on every line, so
+/// `produce widget 2` then `produce widget 3` made three widgets, not five
+/// (review finding 6). A kind on one line, which is all the factory writes,
+/// derives exactly the serials it always did.
+///
+/// A missing count still means one. A count that is not a number used to mean
+/// one as well, silently; it is now an error, as is a kind longer than
+/// [`ledger::MAX_KIND`] or a tick producing more than
+/// [`MAX_PRODUCED_PER_TICK`] in all.
+fn production(effects: &str) -> Result<Vec<(String, u32)>, String> {
+    let mut totals: Vec<(String, u64)> = Vec::new();
+    let mut all = 0u64;
     for line in effects.lines() {
         let mut parts = line.split_whitespace();
         if parts.next() != Some("produce") {
             continue;
         }
-        let Some(kind) = parts.next() else { continue };
-        let count: u32 = parts.next().and_then(|n| n.parse().ok()).unwrap_or(1);
-
-        for ordinal in 0..count {
-            let serial = ledger::Serial::derive(work.job.id(), work.tick, kind, ordinal);
-            if work.ledger.record(kind, serial) {
-                fresh.push((kind.to_string(), serial));
-            }
+        let Some(kind) = parts.next() else {
+            return Err(format!("`{line}` names nothing to produce"));
+        };
+        if kind.len() > ledger::MAX_KIND {
+            return Err(format!("a kind of {} bytes, over the {}-byte limit", kind.len(), ledger::MAX_KIND));
+        }
+        let count = match parts.next() {
+            None => 1,
+            Some(n) => n.parse::<u32>().map_err(|_| format!("`{line}` has a count that is not a number"))? as u64,
+        };
+        if parts.next().is_some() {
+            return Err(format!("`{line}` has more after its count"));
+        }
+        all += count;
+        if all > MAX_PRODUCED_PER_TICK {
+            return Err(format!("more than {MAX_PRODUCED_PER_TICK} things in one tick"));
+        }
+        match totals.iter_mut().find(|(k, _)| k == kind) {
+            Some((_, total)) => *total += count,
+            None => totals.push((kind.to_string(), count)),
         }
     }
-    fresh
+    Ok(totals.into_iter().map(|(kind, n)| (kind, n as u32)).collect())
+}
+
+/// Room for a production message's items once the envelope is allowed for.
+const PRODUCED_BUDGET: usize = GOSSIP_MAX_BYTES - GOSSIP_ENVELOPE - MAX_LABEL - 16;
+
+/// Cuts items into runs that each fit one message: at most [`LEDGER_CHUNK`]
+/// items, and at most `budget` bytes once encoded.
+fn chunks_that_fit(items: &[(String, ledger::Serial)], budget: usize) -> Vec<&[(String, ledger::Serial)]> {
+    let mut chunks = Vec::new();
+    let (mut start, mut size) = (0, 0);
+    for (i, (kind, _)) in items.iter().enumerate() {
+        let cost = 4 + kind.len() + 32;
+        if i > start && (i - start == LEDGER_CHUNK || size + cost > budget) {
+            chunks.push(&items[start..i]);
+            start = i;
+            size = 0;
+        }
+        size += cost;
+    }
+    if start < items.len() {
+        chunks.push(&items[start..]);
+    }
+    chunks
 }
 
 /// Writes new items down and tells everyone about them.
@@ -2119,24 +2371,102 @@ fn publish_production(
     swarm: &mut libp2p::Swarm<MeshBehaviour>,
     topic: &gossipsub::IdentTopic,
     config: &Config,
+    unsaved: &mut Vec<(String, ledger::Serial)>,
     fresh: &[(String, ledger::Serial)],
+    quiet: &mut Quiet,
 ) {
     if fresh.is_empty() {
         return;
     }
-    if let Err(error) = ledger::append(std::path::Path::new(&config.ledger), fresh) {
-        // Said once per occurrence rather than swallowed. A node whose ledger
-        // is not being written still works and still converges with its peers
-        // — it just forgets everything when it restarts, which is exactly the
-        // failure that is invisible until the restart.
-        emit(config, "ledger-not-saved", &format!("{error}"),
-             &[("path", &config.ledger), ("error", &error.to_string())]);
-    }
-    for chunk in fresh.chunks(LEDGER_CHUNK) {
-        let _ = swarm
+    report_persisted(config, quiet, ledger::persist(std::path::Path::new(&config.ledger), unsaved, fresh));
+    for chunk in chunks_that_fit(fresh, PRODUCED_BUDGET) {
+        published(config, quiet, "production", swarm
             .behaviour_mut()
             .gossipsub
-            .publish(topic.clone(), encode_produced(&config.label, chunk));
+            .publish(topic.clone(), encode_produced(&config.label, chunk)));
+    }
+}
+
+/// Says what [`ledger::persist`] achieved, when there is anything to say.
+///
+/// A node whose ledger is not being written still works and still converges
+/// with its peers — it just forgets everything when it restarts, which is
+/// exactly the failure that is invisible until the restart. Local production
+/// and a peer's both come through here, so both are reported the same way.
+fn report_persisted(config: &Config, quiet: &mut Quiet, outcome: ledger::Persisted) {
+    match outcome {
+        ledger::Persisted::Nothing | ledger::Persisted::Saved { retried: 0 } => {}
+        ledger::Persisted::Saved { retried } => {
+            emit(config, "ledger-saved-again",
+                 &format!("wrote {retried} items an earlier attempt could not"),
+                 &[("path", &config.ledger), ("retried", &retried.to_string())]);
+        }
+        ledger::Persisted::NotSaved { error, pending } => {
+            if let Some(repeats) = quiet.say("ledger", Instant::now()) {
+                emit(config, "ledger-not-saved",
+                     &format!("{error} — {pending} items held to retry"),
+                     &[("path", &config.ledger), ("error", &error),
+                       ("pending", &pending.to_string()), ("repeats", &repeats.to_string())]);
+            }
+        }
+    }
+}
+
+/// How long a recurring problem stays quiet after being said.
+const QUIET_FOR: Duration = Duration::from_secs(60);
+
+/// Says a recurring problem at most once a minute, with a count of the repeats
+/// in between, so a fault that recurs every tick is reported without burying
+/// everything else in the log.
+#[derive(Default)]
+struct Quiet {
+    last: HashMap<String, (Instant, u64)>,
+}
+
+impl Quiet {
+    /// `Some(repeats since it was last said)` when it should be said now.
+    fn say(&mut self, key: &str, now: Instant) -> Option<u64> {
+        match self.last.get_mut(key) {
+            Some((at, held)) if now.duration_since(*at) < QUIET_FOR => {
+                *held += 1;
+                None
+            }
+            Some((at, held)) => {
+                let repeats = *held;
+                *at = now;
+                *held = 0;
+                Some(repeats)
+            }
+            None => {
+                self.last.insert(key.to_string(), (now, 0));
+                Some(0)
+            }
+        }
+    }
+}
+
+/// Reports a publish that failed for any reason other than nobody listening.
+///
+/// Every publish used to be `let _ =`. A node alone has no subscribers and
+/// fails every publish, which is normal; but a message too large, or every
+/// peer's queue full, is a checkpoint no standby receives while the job looks
+/// perfectly healthy (review finding 9).
+fn published(
+    config: &Config,
+    quiet: &mut Quiet,
+    what: &str,
+    result: Result<gossipsub::MessageId, gossipsub::PublishError>,
+) {
+    let error = match result {
+        Ok(_)
+        | Err(gossipsub::PublishError::NoPeersSubscribedToTopic)
+        | Err(gossipsub::PublishError::Duplicate) => return,
+        Err(error) => error,
+    };
+    if let Some(repeats) = quiet.say(&format!("publish-{what}"), Instant::now()) {
+        emit(config, "publish-failed",
+             &format!("a {what} could not be sent: {error}"),
+             &[("what", what), ("error", &error.to_string()), ("repeats", &repeats.to_string())]);
     }
 }
 
@@ -2220,7 +2550,7 @@ fn take_over_if_ours(
     cause: &'static str,
 ) {
     let now = Instant::now();
-    if !Work::should_take_over(&me, members) {
+    if !Work::should_take_over(&me, members, &work.job.id().clone()) {
         // Losing an election this node's own suspicion started still ends the
         // speculation. Returning before this ran — which a membership change
         // between suspecting and confirming is enough to cause — stranded the
@@ -2265,6 +2595,7 @@ fn take_over_if_ours(
 
     work.owner = Some(me);
     work.owner_lost_at = None;
+    let previous = work.owner_lost_label.take().unwrap_or_default();
     if resume_is_owed(speculated.is_some()) {
         work.resuming =
             Some(Resuming { cause, decided: now, last_checkpoint: work.last_checkpoint_at });
@@ -2285,6 +2616,8 @@ fn take_over_if_ours(
         &[
             ("tick", &work.tick.to_string()),
             ("cause", cause),
+            // Which owner this continues. Empty when not known.
+            ("previous", &previous),
             ("decision_ms", &gap.as_millis().to_string()),
             ("state_bytes", &work.state.len().to_string()),
             ("survivors", &(members.len() + 1).to_string()),
@@ -2418,6 +2751,9 @@ fn json_string(raw: &str) -> String {
 mod tests {
     use super::*;
 
+    /// The job every member in these tests holds.
+    const TEST_JOB: [u8; 32] = [3; 32];
+
     /// The mesh ran undisturbed for 41.1 hours before Run C, and when the peer
     /// finally left, `dial_retry`'s arm became eligible and fired 74,016 stored
     /// ticks at once: 16,873 connections in 86 seconds, 7.5 MB of log, and a
@@ -2497,17 +2833,22 @@ mod tests {
     #[test]
     fn messages_survive_a_round_trip() {
         assert_eq!(
-            parse_message(&encode_heartbeat("diamond", 42, 9)),
-            Some(Message::Heartbeat { label: "diamond".into(), run: Some(9) })
+            parse_message(&encode_heartbeat("diamond", 42, 9, Some(&TEST_JOB))),
+            Some(Message::Heartbeat { label: "diamond".into(), run: Some(9), holding: Holding::Job(TEST_JOB) })
+        );
+        assert_eq!(
+            parse_message(&encode_heartbeat("diamond", 42, 9, None)),
+            Some(Message::Heartbeat { label: "diamond".into(), run: Some(9), holding: Holding::Nothing })
         );
         assert_eq!(
             parse_message(&encode_departing("diamond")),
             Some(Message::Departing { label: "diamond".into() })
         );
         assert_eq!(
-            parse_message(&encode_checkpoint("diamond", 7, b"opaque")),
+            parse_message(&encode_checkpoint("diamond", &TEST_JOB, 7, b"opaque")),
             Some(Message::Checkpoint {
                 label: "diamond".into(),
+                job: TEST_JOB,
                 tick: 7,
                 state: b"opaque".to_vec()
             })
@@ -2532,7 +2873,7 @@ mod tests {
         let mut members = HashMap::new();
         members.insert(present, Member {
             label: "present".into(), joined: long_ago, last_heard: now,
-            disconnected: false, run: None,
+            disconnected: false, run: None, holding: Holding::Job(TEST_JOB),
         });
 
         // A connection just made has not had time to speak; one to a node of
@@ -2549,8 +2890,151 @@ mod tests {
         old.extend_from_slice(&42u64.to_le_bytes());
         assert_eq!(
             parse_message(&old),
-            Some(Message::Heartbeat { label: "diamond".into(), run: None })
+            Some(Message::Heartbeat { label: "diamond".into(), run: None, holding: Holding::Unknown })
         );
+    }
+
+    /// A heartbeat from a build that had runs but not jobs: alive, run known,
+    /// and not a candidate until it says what it holds.
+    #[test]
+    fn a_heartbeat_from_before_jobs_were_said_holds_unknown() {
+        let mut old = vec![KIND_HEARTBEAT];
+        put_str(&mut old, "diamond");
+        old.extend_from_slice(&42u64.to_le_bytes());
+        old.extend_from_slice(&9u64.to_le_bytes());
+        assert_eq!(
+            parse_message(&old),
+            Some(Message::Heartbeat { label: "diamond".into(), run: Some(9), holding: Holding::Unknown })
+        );
+    }
+
+    /// The old checkpoint kind carried no job, so it cannot be checked, and
+    /// a node that misread it would take another job's state as its own.
+    #[test]
+    fn the_retired_checkpoint_kind_is_ignored() {
+        let mut old = vec![3u8];
+        put_str(&mut old, "diamond");
+        old.extend_from_slice(&7u64.to_le_bytes());
+        old.extend_from_slice(&6u32.to_le_bytes());
+        old.extend_from_slice(b"opaque");
+        assert_eq!(parse_message(&old), None);
+    }
+
+    fn holding(h: Holding) -> Member {
+        Member { label: "peer".into(), joined: Instant::now(), last_heard: Instant::now(),
+                 disconnected: false, run: Some(1), holding: h }
+    }
+
+    /// Finding 5's first case: the lowest identifier in the mesh holds no job.
+    /// It used to win every election and do nothing, so the job stopped.
+    #[test]
+    fn a_member_without_the_job_cannot_block_one_that_has_it() {
+        let mut peers = vec![PeerId::random(), PeerId::random()];
+        peers.sort();
+        let (jobless, survivor) = (peers[0], peers[1]);
+        let mut members = HashMap::new();
+        members.insert(jobless, holding(Holding::Nothing));
+        assert!(Work::should_take_over(&survivor, &members, &TEST_JOB));
+        members.insert(jobless, holding(Holding::Unknown));
+        assert!(Work::should_take_over(&survivor, &members, &TEST_JOB), "unknown is not a candidate either");
+    }
+
+    /// Finding 5's second case: two members holding different job files are
+    /// not candidates for each other's job.
+    #[test]
+    fn a_member_holding_a_different_job_is_not_a_candidate() {
+        let mut peers = vec![PeerId::random(), PeerId::random(), PeerId::random()];
+        peers.sort();
+        let (other_job, me, same_job) = (peers[0], peers[1], peers[2]);
+        let mut members = HashMap::new();
+        members.insert(other_job, holding(Holding::Job([9; 32])));
+        members.insert(same_job, holding(Holding::Job(TEST_JOB)));
+        assert!(Work::should_take_over(&me, &members, &TEST_JOB));
+        // And the one holding the same job, if lower, still wins.
+        members.insert(other_job, holding(Holding::Job(TEST_JOB)));
+        assert!(!Work::should_take_over(&me, &members, &TEST_JOB));
+    }
+
+    #[test]
+    fn a_suspect_is_only_succeeded_by_a_member_that_can_run_it() {
+        let mut peers = vec![PeerId::random(), PeerId::random(), PeerId::random()];
+        peers.sort();
+        let (jobless, me, owner) = (peers[0], peers[1], peers[2]);
+        let now = Instant::now();
+        let after = Duration::from_millis(500);
+        let mut members = HashMap::new();
+        members.insert(jobless, holding(Holding::Nothing));
+        let mut quiet_owner = holding(Holding::Job(TEST_JOB));
+        quiet_owner.last_heard = now - Duration::from_millis(600);
+        members.insert(owner, quiet_owner);
+        assert!(Work::should_speculate(&me, &owner, &members, now, after, &TEST_JOB));
+    }
+
+    #[test]
+    fn repeated_lines_of_one_kind_make_distinct_items() {
+        // Finding 6: two lines of one kind restarted the ordinal and made
+        // three widgets instead of five.
+        assert_eq!(production("produce widget 2\nproduce widget 3\n"),
+                   Ok(vec![("widget".to_string(), 5)]));
+        assert_eq!(production("produce widget 2\nproduce gear 1\nproduce widget 1"),
+                   Ok(vec![("widget".to_string(), 3), ("gear".to_string(), 1)]));
+    }
+
+    #[test]
+    fn the_factorys_one_line_derives_the_serials_it_always_did() {
+        assert_eq!(production("produce widget 4\n"), Ok(vec![("widget".to_string(), 4)]));
+        assert_eq!(production("produce widget\n"), Ok(vec![("widget".to_string(), 1)]));
+        assert_eq!(production("idle\n"), Ok(vec![]));
+    }
+
+    #[test]
+    fn a_tick_that_asks_for_too_much_or_nonsense_produces_nothing() {
+        // Finding 2: a few bytes of effect asked for four billion items.
+        assert!(production("produce widget 4294967295").is_err());
+        assert!(production(&format!("produce widget {}", MAX_PRODUCED_PER_TICK + 1)).is_err());
+        let near = MAX_PRODUCED_PER_TICK / 2 + 1;
+        assert!(production(&format!("produce a {near}\nproduce b {near}")).is_err(), "the total counts");
+        assert!(production("produce widget lots").is_err(), "not a number is not one");
+        assert!(production("produce widget 2 extra").is_err());
+        assert!(production(&format!("produce {} 1", "k".repeat(ledger::MAX_KIND + 1))).is_err());
+        assert!(production("produce").is_err());
+    }
+
+    #[test]
+    fn long_kinds_are_chunked_to_fit_a_message() {
+        // Finding 9: 512 items of a 256-byte kind came to 150 KB.
+        let kind = "k".repeat(ledger::MAX_KIND);
+        let items: Vec<(String, ledger::Serial)> = (0..1500u32)
+            .map(|n| (kind.clone(), ledger::Serial::derive(&TEST_JOB, 1, &kind, n)))
+            .collect();
+        let chunks = chunks_that_fit(&items, PRODUCED_BUDGET);
+        assert_eq!(chunks.iter().map(|c| c.len()).sum::<usize>(), items.len());
+        let label = "l".repeat(MAX_LABEL);
+        for chunk in &chunks {
+            assert!(encode_produced(&label, chunk).len() + GOSSIP_ENVELOPE <= GOSSIP_MAX_BYTES);
+        }
+        // Ordinary kinds still go 512 at a time.
+        let widgets = serials(&(0..1200).collect::<Vec<_>>());
+        assert_eq!(chunks_that_fit(&widgets, PRODUCED_BUDGET)[0].len(), LEDGER_CHUNK);
+    }
+
+    #[test]
+    fn the_largest_checkpoint_fits_one_message() {
+        let state = vec![0u8; MAX_CHECKPOINT_STATE];
+        let label = "l".repeat(MAX_LABEL);
+        assert!(encode_checkpoint(&label, &TEST_JOB, u64::MAX, &state).len() + GOSSIP_ENVELOPE
+                <= GOSSIP_MAX_BYTES);
+    }
+
+    #[test]
+    fn a_recurring_problem_is_said_once_a_minute_with_its_count() {
+        let mut quiet = Quiet::default();
+        let t0 = Instant::now();
+        assert_eq!(quiet.say("x", t0), Some(0));
+        assert_eq!(quiet.say("x", t0 + Duration::from_secs(1)), None);
+        assert_eq!(quiet.say("x", t0 + Duration::from_secs(2)), None);
+        assert_eq!(quiet.say("y", t0 + Duration::from_secs(2)), Some(0), "kinds are separate");
+        assert_eq!(quiet.say("x", t0 + QUIET_FOR), Some(2));
     }
 
     #[test]
@@ -2832,8 +3316,8 @@ mod tests {
         // chooses to put in it — the reason this is framed rather than
         // delimited.
         let state: Vec<u8> = (0u8..=255).collect();
-        let parsed = parse_message(&encode_checkpoint("n", 1, &state)).expect("parses");
-        assert_eq!(parsed, Message::Checkpoint { label: "n".into(), tick: 1, state });
+        let parsed = parse_message(&encode_checkpoint("n", &TEST_JOB, 1, &state)).expect("parses");
+        assert_eq!(parsed, Message::Checkpoint { label: "n".into(), job: TEST_JOB, tick: 1, state });
     }
 
     #[test]
@@ -2872,6 +3356,7 @@ mod tests {
             last_heard: Instant::now(),
             disconnected: false,
             run: None,
+            holding: Holding::Job(TEST_JOB),
         };
 
         let mut winners = 0;
@@ -2881,7 +3366,7 @@ mod tests {
                 .filter(|p| *p != me)
                 .map(|p| (*p, member("peer")))
                 .collect();
-            if Work::should_take_over(me, &others) {
+            if Work::should_take_over(me, &others, &TEST_JOB) {
                 winners += 1;
                 assert_eq!(me, &sorted[0], "the wrong node volunteered");
             }
@@ -2924,15 +3409,16 @@ mod tests {
             last_heard: Instant::now(),
             disconnected: false,
             run: None,
+            holding: Holding::Job(TEST_JOB),
         });
-        assert!(Work::should_take_over(&me, &members));
+        assert!(Work::should_take_over(&me, &members, &TEST_JOB));
     }
 
     #[test]
     fn a_lone_survivor_takes_over() {
         // The last node standing has nobody to lose the comparison to, and the
         // job should continue rather than stop because no election was possible.
-        assert!(Work::should_take_over(&PeerId::random(), &HashMap::new()));
+        assert!(Work::should_take_over(&PeerId::random(), &HashMap::new(), &TEST_JOB));
     }
 
     #[test]
@@ -2965,7 +3451,7 @@ mod tests {
     }
 
     fn member_last_heard(at: Instant) -> Member {
-        Member { label: "peer".into(), joined: at, last_heard: at, disconnected: false, run: Some(1) }
+        Member { label: "peer".into(), joined: at, last_heard: at, disconnected: false, run: Some(1), holding: Holding::Job(TEST_JOB) }
     }
 
     #[test]
@@ -2976,11 +3462,11 @@ mod tests {
         let mut members = HashMap::new();
         members.insert(owner, member_last_heard(now - Duration::from_millis(200)));
 
-        assert!(!Work::should_speculate(&me, &owner, &members, now, after),
+        assert!(!Work::should_speculate(&me, &owner, &members, now, after, &TEST_JOB),
                 "200 ms of silence is one lost packet, not a missing machine");
 
         members.insert(owner, member_last_heard(now - Duration::from_millis(600)));
-        assert!(Work::should_speculate(&me, &owner, &members, now, after));
+        assert!(Work::should_speculate(&me, &owner, &members, now, after, &TEST_JOB));
     }
 
     #[test]
@@ -3001,12 +3487,12 @@ mod tests {
 
         // `low` owns the job and has gone quiet. `middle` is the lowest of the
         // survivors, so it speculates and `high` does not.
-        assert!(Work::should_speculate(&middle, &low, &members, now, after));
+        assert!(Work::should_speculate(&middle, &low, &members, now, after, &TEST_JOB));
 
         let mut seen_by_high = HashMap::new();
         seen_by_high.insert(low, member_last_heard(quiet));
         seen_by_high.insert(middle, member_last_heard(now));
-        assert!(!Work::should_speculate(&high, &low, &seen_by_high, now, after));
+        assert!(!Work::should_speculate(&high, &low, &seen_by_high, now, after, &TEST_JOB));
     }
 
     #[test]
@@ -3073,7 +3559,7 @@ mod tests {
         let now = Instant::now();
         let (me, stranger) = (PeerId::random(), PeerId::random());
         assert!(!Work::should_speculate(&me, &stranger, &HashMap::new(), now,
-                                        Duration::from_millis(500)));
+                                        Duration::from_millis(500), &TEST_JOB));
     }
 
     #[test]
