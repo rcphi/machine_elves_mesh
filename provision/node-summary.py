@@ -11,6 +11,7 @@ that is nearly always the question being asked, and a summary that silently
 includes yesterday is worse than one that says it is partial.
 """
 import collections
+import gzip
 import json
 import os
 import sys
@@ -18,39 +19,15 @@ import time
 
 DEFAULT_LOG = "/var/log/mesh-node/events.jsonl"
 
-# Moments worth a line of their own: things that happened *to* the node, rather
-# than the steady hum of it working.
-NOTABLE = {
-    "identity-created": "made a new identity — peers will not know it yet",
-    "identity-loaded": "was itself again across the restart",
-    "identity-unreadable": "IDENTITY FILE UNREADABLE — became a stranger",
-    "identity-not-saved": "could not save its identity — a stranger after every restart",
-    "started": "started up",
-    "claimed": "took the job — nobody else was running it",
-    "job-owner": "saw {label} running the job",
-    "yielded": "gave the job to {label}, which was further along",
-    "took-over": "TOOK OVER the job at tick {tick}",
-    "joined": "{label} appeared",
-    "left": "{label} left, announced",
-    "vanished": "{label} VANISHED without warning",
-    "redialling": "lost a peer — trying its address again",
-    "connected": "connected to {addr}",
-    "my-address": "learned its own address: {addr}",
-    "port-mapped": "the router opened {external}",
-    "port-map-failed": "the router refused a mapping",
-    "ledger-loaded": "remembered {held} things that already existed",
-    "ledger-unreadable": "LEDGER UNREADABLE — the inventory started from nothing",
-    "ledger-not-saved": "could not write the inventory down — it will not survive a restart",
-    "ledger-comparing": "found {buckets} of 256 inventory buckets differing from {label}'s",
-    "ledger-repairing": "sent {label} {items} items from {cells} differing cells of bucket {bucket}",
-    "job-failed": "the job failed",
-    "listen-failed": "could not listen on an address",
-}
+sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
+from chaos import rotations  # noqa: E402  — every rotation, the same way chaos.py finds them
+from node_events import NOTABLE, describe  # noqa: E402  — shared with node-watch.sh
 
 
 def load(path):
     events = []
-    with open(path, encoding="utf-8") as handle:
+    opener = gzip.open if path.endswith(".gz") else open
+    with opener(path, "rt", encoding="utf-8", errors="replace") as handle:
         for line in handle:
             line = line.strip()
             if not line.startswith("{"):
@@ -96,17 +73,44 @@ def timeline(events, now_ms):
             print(f"              … and {repeats} more like that")
             repeats = 0
         previous = kind
-        # Every field the event carries, and "?" for any the description asks
-        # for and the event lacks. Naming the fields here instead meant a
-        # description mentioning a field nobody listed fell back to the bare
-        # event name — which is what the inventory lines did, silently.
-        fields = collections.defaultdict(lambda: "?", event)
-        try:
-            description = NOTABLE[kind].format_map(fields)
-        except (IndexError, ValueError):
-            description = kind
+        description = describe(event)
         ts = event.get("ts_unix_ms", 0)
         print(f"  {clock(ts)}  {description}  ({ago(ts, now_ms)})")
+
+
+def work_lines(events, kinds):
+    """What the job did in this window, from the node's `working` lines.
+
+    The node writes one a minute while it advances the job, carrying the
+    ticks run since the last one, the tick reached, and the inventory held.
+    This used to count `effect` and `produced` events, which the node
+    stopped writing long ago, so a node working steadily reported "0 effects,
+    0 productions" (review finding 20).
+    """
+    working = [e for e in events if e.get("event") == "working"]
+    ticks = sum(int(e.get("ticks", 0) or 0) for e in working)
+    lines = []
+    if working:
+        last = working[-1]
+        lines.append(f"  work              {ticks} ticks run in this window, "
+                     f"reaching tick {last.get('tick', '?')}")
+        # The inventory is everything this node knows exists, from every node
+        # and every run, so it is a level, not a count of what was made here.
+        lines.append(f"  inventory now     {last.get('ledger', '?')} things known to exist "
+                     "(all of history, not this window's output)")
+    else:
+        lines.append("  work              none in this window — standing by, or stopped")
+    lines.append(f"  job ownership     {kinds.get('claimed', 0)} claimed, "
+                 f"{kinds.get('took-over', 0)} taken over, {kinds.get('yielded', 0)} yielded")
+    spec = kinds.get("speculating", 0)
+    if spec:
+        lines.append(f"  suspicions        {spec} raised, {kinds.get('speculation-abandoned', 0)} "
+                     "abandoned as wrong")
+    for kind, words in (("job-failed", "FAILURES"), ("effects-rejected", "ticks with production REFUSED"),
+                        ("cold-start", "COLD STARTS from tick 0")):
+        if kinds.get(kind):
+            lines.append(f"                    {kinds[kind]} {words}")
+    return lines
 
 
 def main():
@@ -139,12 +143,19 @@ def main():
 
     events = load(path)
     # The log is rotated daily with copytruncate, so a run that has lasted past
-    # a rotation has its start in yesterday's file and none in today's. Reading
-    # only today's then reports a node that has been connected for days as one
-    # that never connected — which is exactly what it did on riverboat.
-    rotated = path + ".1"
-    if os.path.exists(rotated) and not any(e.get("event") == "started" for e in events):
-        events = load(rotated) + events
+    # a rotation has its start in an older file. Reading only today's reported
+    # a node connected for days as one that never connected, which is what it
+    # did on riverboat; reading only .1 did the same to any run older than two
+    # days (review finding 15). So older files are read, newest first, until
+    # the window asked for is covered: a start for the current run, the cutoff
+    # for --since, everything for --all.
+    cutoff_ms = int(time.time() * 1000) - since_minutes * 60_000 if scope == "since" else None
+    for older in rotations(path):
+        if scope == "run" and any(e.get("event") == "started" for e in events):
+            break
+        if scope == "since" and events and events[0].get("ts_unix_ms", 0) <= cutoff_ms:
+            break
+        events = load(older) + events
     if not events:
         print("the log is empty — the node may never have started, which is the finding")
         return 1
@@ -218,13 +229,9 @@ def main():
     else:
         print(f"  own address       moved {len(distinct) - 1}x, now {distinct[-1]}")
 
-    if kinds.get("job-loaded") or kinds.get("effect"):
-        print(f"  work              {kinds.get('effect', 0)} effects, "
-              f"{kinds.get('produced', 0)} productions")
-        print(f"  job ownership     {kinds.get('claimed', 0)} claimed, "
-              f"{kinds.get('took-over', 0)} taken over, {kinds.get('yielded', 0)} yielded")
-        if kinds.get("job-failed"):
-            print(f"                    {kinds['job-failed']} FAILURES")
+    if kinds.get("job-loaded") or kinds.get("working"):
+        for line in work_lines(events, kinds):
+            print(line)
 
     timeline(events, now_ms)
 

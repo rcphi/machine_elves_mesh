@@ -34,6 +34,7 @@ import gzip
 import json
 import os
 import random
+import re
 import shutil
 import subprocess
 import sys
@@ -90,6 +91,31 @@ def now_ms():
     return int(time.time() * 1000)
 
 
+def rotations(path):
+    """The rotated siblings of `path`, newest first: path.1, path.2.gz, and so
+    on, for every numeric suffix logrotate keeps.
+
+    Shared by everything in this directory that reads node logs. Each used to
+    find rotations its own way, and each found fewer than logrotate keeps:
+    this function searched seven, takeover-summary.py matched one digit and
+    so never saw .10 to .14, and node-summary.py read only .1 (review finding
+    15). Long runs lost their starts, joins and claims to whichever limit was
+    lowest.
+    """
+    directory = os.path.dirname(path) or "."
+    pattern = re.compile(re.escape(os.path.basename(path)) + r"\.(\d+)(\.gz)?$")
+    try:
+        names = os.listdir(directory)
+    except OSError:
+        return []
+    found = []
+    for name in names:
+        match = pattern.match(name)
+        if match:
+            found.append((int(match.group(1)), os.path.join(directory, name)))
+    return [p for _, p in sorted(found)]
+
+
 def read_events(path, tail_bytes=2_000_000):  # noqa: C901
     """The current run's events: everything after the last `started`.
 
@@ -125,14 +151,11 @@ def read_events(path, tail_bytes=2_000_000):  # noqa: C901
     # siblings rather than nesting, so following path + ".1" repeatedly finds
     # nothing after the first step.
     older = []
-    for age in range(1, 8):
-        for name in (f"{path}.{age}", f"{path}.{age}.gz"):
-            if not os.path.exists(name):
-                continue
-            rows = read_events(name, tail_bytes)
-            older = rows + older
-            if any(e.get("event") == "started" for e in rows):
-                return older + events
+    for name in rotations(path):
+        rows = read_events(name, tail_bytes)
+        older = rows + older
+        if any(e.get("event") == "started" for e in rows):
+            return older + events
     return older + events
 
 
@@ -153,6 +176,16 @@ def situation(events, now):
         kind = event.get("event")
         ts = event.get("ts_unix_ms", 0)
         if kind == "started":
+            # A new process knows nothing of what the last one held. Called on
+            # rows spanning several runs (takeover-summary.py reads half an
+            # hour back), a claim from before a restart used to survive it
+            # and report a freshly started standby as the owner (review
+            # finding 15).
+            claimed = False
+            working_at = None
+            lost_at = None
+            peers = set()
+            last_tick = None
             last_disturbance = ts
         elif kind == WORKING:
             if lost_at is None or ts - lost_at > WORKING_AFTER_LOSING_OWNERSHIP_S * 1000:

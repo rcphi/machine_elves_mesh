@@ -82,8 +82,8 @@ def with_rotations(paths):
     """
     found = []
     for path in paths:
-        for candidate in [path] + sorted(glob.glob(path + ".[0-9]")
-                                         + glob.glob(path + ".[0-9].gz")):
+        # Every numeric suffix, .10 to .14 included; see chaos.rotations.
+        for candidate in [path] + chaos.rotations(path):
             if os.path.exists(candidate) and candidate not in found:
                 found.append(candidate)
     return found
@@ -155,26 +155,52 @@ def held_the_job(by_node, victim, at):
     return chaos.situation(rows[start:end], at)[0]
 
 
+# Events that end or interrupt a node's work on the job. Any of them between
+# two of its working lines means the work did not run straight through.
+BREAKS_WORK = {"yielded", "started", "job-failed", "job-owner", "speculation-abandoned"}
+# How much of its own previous rate a node must keep up across a disruption to
+# count as never having stopped. At five ticks a second, 0.97 tolerates under
+# two seconds of lost ticks, which is inside the detection window: a stall long
+# enough for a peer to notice is long enough to fail this.
+KEPT_PACE = 0.97
+
+
 def kept_working_elsewhere(events, victim, at):
-    """Which other node was already advancing the job when this one was hit.
+    """Which other node demonstrably kept the job running through this
+    disruption, or None.
 
     On a flapping link two nodes can both believe they own the job, and
     chaos fires at whichever one believes it. If another node was advancing
-    the work before the disruption and still advancing it after, nothing
-    stopped and no takeover was needed — so the absence of a `took-over` is
-    not a job nobody continued. Run D produced two of these and the summary
-    called them orphans while the survivor's ticks never missed a beat.
+    the work before the disruption and kept advancing it, nothing stopped and
+    no takeover was needed — so the absence of a `took-over` is not a job
+    nobody continued. Run D produced two of these.
 
-    `working` is the evidence because only the node advancing the job writes
-    it. It is written once a minute, so a minute and a half either side is
-    the span in which a steady owner must appear at least once.
+    "Demonstrably" is the change (review finding 4). It used to be enough
+    for that node to write a working line within 90 s either side, which
+    holds for a node that yielded, stopped, and claimed the job again twenty
+    seconds after the victim died: an outage, counted as continuity. Now the
+    two working lines either side must be consecutive, with nothing between
+    them that stops the work, and the second must report at least KEPT_PACE
+    of the ticks the first one's rate predicts. Run D's two cases pass: 300
+    ticks a minute before, 300 after.
     """
-    for node in {e.get("node") for e in events if e.get("node") != victim}:
-        lines = [e["ts_unix_ms"] for e in events
-                 if e.get("node") == node and e.get("event") == "working"]
-        before = any(at - WORKING_SPAN_MS <= t < at for t in lines)
-        after = any(at < t <= at + WORKING_SPAN_MS for t in lines)
-        if before and after:
+    for node in sorted({e.get("node") for e in events if e.get("node") not in (victim, None)}):
+        mine = [e for e in events if e.get("node") == node]
+        before = [e for e in mine if e.get("event") == "working"
+                  and at - WORKING_SPAN_MS <= e.get("ts_unix_ms", 0) < at]
+        after = [e for e in mine if e.get("event") == "working"
+                 and at < e.get("ts_unix_ms", 0) <= at + WORKING_SPAN_MS]
+        if not before or not after:
+            continue
+        first, second = before[-1], after[0]
+        t1, t2 = first["ts_unix_ms"], second["ts_unix_ms"]
+        if any(e.get("event") in BREAKS_WORK for e in mine if t1 < e.get("ts_unix_ms", 0) < t2):
+            continue
+        tick1, tick2, rate = num(first.get("tick")), num(second.get("tick")), num(first.get("ticks"))
+        if None in (tick1, tick2, rate) or rate <= 0 or t2 <= t1:
+            continue
+        expected = rate * (t2 - t1) / 60_000
+        if tick2 - tick1 >= KEPT_PACE * expected:
             return node
     return None
 
@@ -220,16 +246,37 @@ def match(actions, events):
     disruptions = [a for a in actions if a.get("action") in ("kill", "term", "partition")]
     by_node = by_node_ownership_events(events)
     results = []
+    # A takeover belongs to one disruption. Matching used to let one takeover
+    # satisfy every disruption whose window it fell in (review finding 14).
+    used = set()
     for action in disruptions:
         victim, at = action["node"], action["ts_unix_ms"]
         window = [e for e in events
                   if e.get("node") != victim
                   and at - MATCH_EARLY_MS <= e.get("ts_unix_ms", 0) <= at + MATCH_WINDOW_MS]
-        lost = next((e for e in window
-                     if e.get("event") in ("vanished", "left") and e.get("label") == victim), None)
+        noticed = [e for e in window
+                   if e.get("event") in ("vanished", "left") and e.get("label") == victim]
+        lost = noticed[0] if noticed else None
+        # A takeover that names its previous owner (nodes since 2026-11-14)
+        # belongs to that owner's disruption and no other. One that does not
+        # is matched by timing alone, as before, and marked ambiguous when
+        # another node's disruption could equally have caused it.
         takeovers = [e for e in window if e.get("event") == "took-over"
-                     and (lost is None or e["ts_unix_ms"] >= lost["ts_unix_ms"])]
+                     and (lost is None or e["ts_unix_ms"] >= lost["ts_unix_ms"])
+                     and e.get("previous", victim) in (victim, "")
+                     and (e.get("node"), e["ts_unix_ms"]) not in used]
         first = takeovers[0] if takeovers else None
+        ambiguous = False
+        if first:
+            used.add((first.get("node"), first["ts_unix_ms"]))
+            # Detection is read from the node that took over, so the two
+            # numbers describe one observer's experience of one loss.
+            own = [e for e in noticed if e.get("node") == first.get("node")]
+            lost = own[0] if own else lost
+            ambiguous = not first.get("previous") and any(
+                other is not action and other["node"] != victim
+                and first["ts_unix_ms"] - MATCH_WINDOW_MS <= other["ts_unix_ms"] <= first["ts_unix_ms"]
+                for other in disruptions)
         resumed = None
         if first:
             # `resumed` carries no label, so nothing in the event itself says
@@ -292,6 +339,7 @@ def match(actions, events):
             "gap_ms": num(resumed.get("gap_ms")) if resumed else None,
             "speculated": bool(first and first.get("speculated") == "true"),
             "takeovers": len({t["node"] for t in takeovers}),
+            "ambiguous": ambiguous,
             "seconds": action.get("seconds"),
             # The victim's own log said it owned the job when chaos read it,
             # but it yielded at almost the same moment. Nobody needed to take
@@ -395,6 +443,10 @@ def report(results, events, actions, out=sys.stdout):
         + (f"  ({sum(1 for r in orphaned if r['was_standby'])} of them hit a node that had "
            "just yielded — no work stopped)" if any(r["was_standby"] for r in orphaned) else ""))
     say(f"  more than one took over   {len(doubled):>4}")
+    ambiguous = [r for r in results if r.get("ambiguous")]
+    if ambiguous:
+        say(f"  matched by timing alone   {len(ambiguous):>4}  takeovers that name no previous owner, "
+            "with another\n                                  node's disruption close enough to have caused them")
     say(f"  false alarms              {len(alarms):>4}  returned without restarting, "
         "and no partition explains it")
     say(f"  restarted unnoticed       {len(unnoticed):>4}  back inside one detection window")

@@ -131,9 +131,10 @@ class WorkThatNeverStopped(unittest.TestCase):
         # "victim was a standby" guard does not apply.
         events = [ev("yoinkerz", 1_000, "claimed", tick="0"),
                   ev("yoinkerz", 30_000, "working", tick="150"),
-                  # diamond is advancing the same job, before and after.
-                  ev("diamond", 10_000, "working", tick="300"),
-                  ev("diamond", 70_000, "working", tick="600"),
+                  # diamond is advancing the same job, before and after, at
+                  # its steady 300 ticks a minute.
+                  ev("diamond", 10_000, "working", tick="300", ticks="300"),
+                  ev("diamond", 70_000, "working", tick="600", ticks="300"),
                   ev("diamond", 62_000, "vanished", label="yoinkerz", silent_ms="2300")]
         return [act("yoinkerz", 60_000, "kill")], events
 
@@ -152,6 +153,40 @@ class WorkThatNeverStopped(unittest.TestCase):
         self.assertIn("nobody took over             0", text)
         self.assertNotIn("orphaned:", text)
 
+    def with_survivor(self, *between, second_tick="600"):
+        actions, events = self.owner_and_second_owner()
+        events = [e for e in events if not (e["node"] == "diamond" and e["event"] == "working")]
+        events += [ev("diamond", 10_000, "working", tick="300", ticks="300"), *between,
+                   ev("diamond", 70_000, "working", tick=second_tick, ticks="300")]
+        return actions, sorted(events, key=lambda e: e["ts_unix_ms"])
+
+    def test_a_survivor_that_yielded_and_came_back_did_not_keep_working(self):
+        # The review's reproduction of finding 4: the survivor works, yields,
+        # stops, and claims the job again 20 s after the owner is killed.
+        actions, events = self.with_survivor(
+            ev("diamond", 40_000, "yielded", label="yoinkerz"),
+            ev("diamond", 80_000, "claimed", tick="450"))  # 20 s after the kill
+        [r] = summary.match(actions, events)
+        self.assertIsNone(r["kept_elsewhere"])
+
+    def test_a_survivor_that_restarted_did_not_keep_working(self):
+        actions, events = self.with_survivor(ev("diamond", 61_000, "started"))
+        [r] = summary.match(actions, events)
+        self.assertIsNone(r["kept_elsewhere"])
+
+    def test_a_survivor_that_stalled_did_not_keep_working(self):
+        # Ten seconds of a sixty-second minute without ticks: 250, not 300.
+        actions, events = self.with_survivor(second_tick="550")
+        [r] = summary.match(actions, events)
+        self.assertIsNone(r["kept_elsewhere"])
+
+    def test_a_working_line_without_its_rate_proves_nothing(self):
+        actions, events = self.owner_and_second_owner()
+        for e in events:
+            e.pop("ticks", None)
+        [r] = summary.match(actions, events)
+        self.assertIsNone(r["kept_elsewhere"])
+
     def test_a_real_orphan_is_still_counted(self):
         # Nobody else was working, so this one really did stop.
         actions = [act("yoinkerz", 60_000, "kill")]
@@ -160,6 +195,66 @@ class WorkThatNeverStopped(unittest.TestCase):
                   ev("diamond", 62_000, "vanished", label="yoinkerz", silent_ms="2300")]
         [r] = summary.match(actions, events)
         self.assertIsNone(r["kept_elsewhere"])
+
+
+class OneTakeoverOneDisruption(unittest.TestCase):
+    """Review finding 14: a takeover could satisfy every disruption whose
+    window it fell in, and could be borrowed by a disruption it had nothing
+    to do with."""
+
+    def test_a_takeover_naming_its_previous_owner_belongs_to_that_owner(self):
+        # Both gone within a moment; riverboat continues diamond's job.
+        actions = [act("diamond", 0, "kill"), act("yoinkerz", 100, "kill")]
+        events = [ev("riverboat", 2_150, "vanished", label="yoinkerz", silent_ms="2050"),
+                  ev("riverboat", 2_200, "vanished", label="diamond", silent_ms="2200"),
+                  ev("riverboat", 2_200, "took-over", tick="10", previous="diamond")]
+        first, second = summary.match(actions, events)
+        self.assertEqual(first["successor"], "riverboat")
+        self.assertIsNone(second["successor"], "borrowed diamond's takeover")
+
+    def test_one_takeover_is_not_counted_for_two_disruptions(self):
+        actions = [act("diamond", 0, "kill"), act("diamond", 3_000, "term")]
+        events = [ev("riverboat", 2_200, "vanished", label="diamond", silent_ms="2200"),
+                  ev("riverboat", 2_200, "took-over", tick="10")]
+        first, second = summary.match(actions, events)
+        self.assertEqual(first["successor"], "riverboat")
+        self.assertIsNone(second["successor"])
+
+    def test_an_old_takeover_near_another_nodes_disruption_is_marked_ambiguous(self):
+        actions = [act("diamond", 0, "kill"), act("yoinkerz", 1_000, "kill")]
+        events = [ev("riverboat", 2_200, "vanished", label="diamond", silent_ms="2200"),
+                  ev("riverboat", 2_200, "took-over", tick="10")]  # names nobody
+        first, _ = summary.match(actions, events)
+        self.assertTrue(first["ambiguous"])
+        out = io.StringIO()
+        summary.report(summary.match(actions, events), events, actions, out)
+        self.assertIn("matched by timing alone", out.getvalue())
+
+    def test_a_lone_disruption_is_not_ambiguous(self):
+        actions, events = kill_and_takeover(0)
+        [r] = summary.match(actions, events)
+        self.assertFalse(r["ambiguous"])
+
+    def test_detection_is_read_from_the_node_that_took_over(self):
+        actions = [act("diamond", 0, "kill")]
+        events = [ev("yoinkerz", 1_900, "vanished", label="diamond", silent_ms="1900"),
+                  ev("riverboat", 2_400, "vanished", label="diamond", silent_ms="2400"),
+                  ev("riverboat", 2_400, "took-over", tick="10", previous="diamond")]
+        [r] = summary.match(actions, events)
+        self.assertEqual(r["detect_ms"], 2400)
+
+
+class EveryRotation(unittest.TestCase):
+    def test_rotations_ten_and_up_are_read(self):
+        import tempfile
+        directory = tempfile.mkdtemp()
+        base = os.path.join(directory, "events.jsonl")
+        for name in ("events.jsonl", "events.jsonl.1", "events.jsonl.2.gz", "events.jsonl.10.gz",
+                     "events.jsonl.14.gz", "events.jsonl.bak"):
+            open(os.path.join(directory, name), "w").close()
+        found = [os.path.basename(p) for p in summary.with_rotations([base])]
+        self.assertEqual(found, ["events.jsonl", "events.jsonl.1", "events.jsonl.2.gz",
+                                 "events.jsonl.10.gz", "events.jsonl.14.gz"])
 
 
 class SpeculationsThatEndedWithoutAnEvent(unittest.TestCase):

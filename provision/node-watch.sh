@@ -17,35 +17,17 @@ echo
 
 # The steady hum of working is filtered out. Effects and heartbeats arrive
 # several times a second and would bury the one line that matters.
-tail -n 0 -F "$LOG" 2>/dev/null | python3 -u -c '
-import json, signal, sys, time
+HERE="$(cd "$(dirname "$0")" && pwd)"
+# The descriptions live in node_events.py, shared with node-summary.py, so the
+# two views cannot drift apart again (review finding 20).
+tail -n 0 -F "$LOG" 2>/dev/null | MESH_PROVISION="$HERE" python3 -u -c '
+import json, os, signal, sys, time
+sys.path.insert(0, os.environ["MESH_PROVISION"])
+from node_events import describe
 
 # Ctrl-C is how this is meant to end. A traceback makes an ordinary exit look
 # like a fault.
 signal.signal(signal.SIGINT, lambda *_: sys.exit(0))
-
-SAY = {
-    "identity-created":  "made a new identity — peers will not know it yet",
-    "identity-loaded":   "this node is itself again, across the restart",
-    "identity-unreadable":"IDENTITY FILE UNREADABLE — becoming a stranger",
-    "identity-not-saved":"identity could not be saved — a stranger after every restart",
-    "started":        "started up",
-    "claimed":        "TOOK THE JOB — nobody else was running it",
-    "job-owner":      "{label} is running the job",
-    "yielded":        "gave the job to {label} — it is further along",
-    "took-over":      "TOOK OVER at tick {tick}",
-    "joined":         "{label} appeared",
-    "left":           "{label} left, announced",
-    "vanished":       "{label} VANISHED — no goodbye",
-    "redialling":     "lost a peer, trying its address again",
-    "connected":      "connected: {addr}",
-    "my-address":     "this node is at {addr}, says {observed_by}",
-    "port-mapped":    "router opened {external}",
-    "port-map-failed":"router refused a mapping",
-    "job-failed":     "JOB FAILED",
-    "listen-failed":  "could not listen",
-    "learned-peer":   "heard about a peer at {addr}",
-}
 
 for line in sys.stdin:
     line = line.strip()
@@ -55,11 +37,9 @@ for line in sys.stdin:
         event = json.loads(line)
     except json.JSONDecodeError:
         continue
-    kind = event.get("event")
-    if kind not in SAY:
+    said = describe(event)
+    if said is None:
         continue
-    fields = {k: event.get(k, "?") for k in
-              ("label", "tick", "addr", "external", "observed_by")}
     clock = time.strftime("%H:%M:%S", time.localtime(event.get("ts_unix_ms", 0) / 1000))
-    print(f"{clock}  {SAY[kind].format(**fields)}")
+    print(f"{clock}  {said}")
 '

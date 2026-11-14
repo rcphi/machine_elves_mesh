@@ -210,6 +210,33 @@ class ReadEvents(unittest.TestCase):
         self.assertEqual([e["event"] for e in events], ["started", "job-owner"])
         self.assertFalse(chaos.situation(events, T0 + 400_000)[0])
 
+    def test_a_restart_ends_whatever_the_last_process_held(self):
+        # Review finding 15: across runs, a claim survived the next start.
+        events = [ev(0, "started"), ev(1, "joined", peer_id=PEER), ev(6, "claimed"),
+                  ev(100, "started")]
+        owns, peers, _, _ = chaos.situation(events, T0 + 400_000)
+        self.assertFalse(owns)
+        self.assertEqual(peers, 0)
+
+    def test_every_numbered_rotation_is_found_newest_first(self):
+        directory = tempfile.mkdtemp()
+        base = os.path.join(directory, "events.jsonl")
+        for name in ("events.jsonl.1", "events.jsonl.2.gz", "events.jsonl.10.gz", "events.jsonl.9"):
+            open(os.path.join(directory, name), "w").close()
+        self.assertEqual([os.path.basename(p) for p in chaos.rotations(base)],
+                         ["events.jsonl.1", "events.jsonl.2.gz", "events.jsonl.9", "events.jsonl.10.gz"])
+
+    def test_a_start_past_the_seventh_rotation_is_still_found(self):
+        directory = tempfile.mkdtemp()
+        base = os.path.join(directory, "events.jsonl")
+        open(base, "w").write(json.dumps(ev(900, "working")) + "\n")
+        for age in range(1, 10):
+            open(f"{base}.{age}", "w").write(json.dumps(ev(900 - age * 10, "working")) + "\n")
+        open(f"{base}.10", "w").write(json.dumps(ev(0, "started")) + "\n" + json.dumps(ev(1, "claimed")) + "\n")
+        events = chaos.read_events(base)
+        self.assertEqual(events[0]["event"], "started")
+        self.assertTrue(chaos.situation(events, T0 + 901_000)[0])
+
     def test_a_missing_log_is_no_events(self):
         self.assertEqual(chaos.read_events("/nonexistent/events.jsonl"), [])
 
