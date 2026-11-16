@@ -253,17 +253,43 @@ for 17.5 hours. Step 2 above no longer simply stops when no modem is listed:
   under `/sys/bus/usb/devices`), it has been unplugged, and nothing is done.
 - **If it is on USB but unlisted for 2 minutes**, ModemManager is restarted
   (`--no-block`, for the same reason as the tunnel restart).
+- **If it is still unlisted 2 minutes after that**, the modem is rebooted:
+  ModemManager is stopped (it holds the AT ports), `AT+CFUN=1,1` goes to the
+  modem's AT port (USB interface 2, found in sysfs, so not tied to a ttyUSB
+  number), and ModemManager is started again whatever happened. The modem
+  drops off USB and comes back with its firmware started afresh.
 - **If it is still unlisted 2 minutes after that**, the USB device is reset by
   writing 0, then 1, to its `authorized` file. The kernel unbinds every driver
   and enumerates the device again, which ModemManager sees as a replug.
-- **Each round waits twice as long**, up to an hour. A listed modem clears it.
+- **Each round waits twice as long**, up to an hour. Only a usable link
+  clears it. A modem off USB keeps the backoff, because a rebooting modem is
+  off USB for 10–20 s and a run can land in that window.
 - The state lives in `/run/mesh-backchannel-modem.state`, on `CLOCK_BOOTTIME`,
   like the watchdog's. It is saved before each action, so a failed action
   still moves the next round on.
 
 Tested on the box by holding the modem with `mmcli --inhibit-device`: the
 restart alone recovered it, and diamond was back 3 min 15 s after losing it.
-The USB reset is tested only in code.
+
+**A modem that is listed but useless.** *Added 2026-11-16.* On 2026-11-14 the
+modem's QMI side hung. The steps above restarted ModemManager and then reset
+the USB device, and the modem came back with QMI still hung. ModemManager
+built it from the AT ports alone: listed, registered, "connected", with no
+interface and no address. The script took "listed" to mean "well", and asked
+it to connect every 30 s for 48 hours, until the friend unplugged it. So:
+
+- **A listed modem that gives no usable link**, whether the connect returns
+  nothing usable or fails outright, goes through the same steps as an
+  unlisted one, on the same clock.
+- **The modem's own reboot comes before the USB reset.** Re-enumerating is a
+  replug without the power cut, and it was the power cut that cleared the hang.
+- `mesh-backchannel-link --reboot-modem` runs the reboot step by hand.
+
+Tested on the box, 2026-11-16, by hand: the modem answered `OK`, left USB 9 s
+later, was back on USB 7 s after that with its QMI port, and had a bearer 40 s
+after the command. A blocking `systemctl stop` of ModemManager from inside a
+oneshot ordered `After=` it was checked for deadlock on lightning first. The
+USB reset step is tested only in code.
 
 ### 4. The tunnel
 

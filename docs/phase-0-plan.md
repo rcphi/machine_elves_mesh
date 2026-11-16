@@ -875,6 +875,35 @@ Remote management of machines behind NAT is *the same problem Phase 0 exists to 
   **3 min 15 s from losing the modem to login, with nobody at the box**, against 17.5 hours before. The restart was enough, so the USB reset never ran.
 - **What this does not prove.** The test released the modem; it did not reproduce the USB error that started the real failure. If a ModemManager restart does not clear that error, the USB reset follows 2 minutes later, but that step has only been tested in code. The next real occurrence will show which step clears it.
 
+**The next real occurrence showed that neither step clears it — found 2026-11-16, fixed the same day.** diamond's link was down for **48 hours**, from 2026-11-14 23:04 to 2026-11-16 23:23 UTC. The measurement was unaffected: diamond's idle-timeout tests kept reaching riverboat over the friend's internet throughout, every half hour or so.
+
+| UTC | |
+|---|---|
+| Sat 22:54 | The modem's QMI side stopped answering. There was no USB error this time, and the signal was fine. |
+| Sat 22:58 | ModemManager marked the modem invalid after 10 timeouts. The new recovery noticed. |
+| Sat 23:00 | It restarted ModemManager; the modem stayed unlisted. |
+| Sat 23:02 | It reset the USB device. The modem came back, but its QMI probe timed out, so ModemManager built it from the AT ports alone: listed, registered and "connected", with no interface and no address. All three of the modem's lights were on. |
+| Sat 23:04 → Mon 23:22 | The link script asked it to connect every 30 s and got "no usable IPv4 bearer" each time. The recovery acted only on a modem that was *not* listed, and this one was. |
+| Mon 23:22 | The friend unplugged and replugged the modem. It had a bearer 44 s later. |
+
+- **Two gaps.** A listed modem was taken to be a working one. And the USB reset re-enumerates the modem without cutting its power, so a hang inside the modem survives it; the replug cut the power, and that is what cleared it.
+- **The fix.** A listed modem that gives no usable link now goes through the same steps as an unlisted one. Between the ModemManager restart and the USB reset there is a new step: stop ModemManager, send the modem `AT+CFUN=1,1` on its AT port, and start ModemManager again. That command makes the modem restart its own firmware. The AT ports kept answering on Saturday while QMI did not. A modem briefly off USB while it reboots keeps the backoff, so a modem with no service is not rebooted every few minutes for the whole outage. `mesh-backchannel-link --reboot-modem` runs the step by hand.
+- **Under the new code, Saturday would have gone:** ModemManager restarted at 23:00, the modem rebooted at 23:02, and a bearer by about 23:03. That is minutes, not two days.
+- **Tested on the box, 2026-11-16**, with `--reboot-modem` run under `systemd-run` so it outlived the session it cut:
+
+  | UTC | |
+  |---|---|
+  | 23:44:42 | ModemManager stopped; `AT+CFUN=1,1` sent; modem answered `OK`; ModemManager started |
+  | 23:44:51 | modem left USB |
+  | 23:44:58 | modem back on USB |
+  | 23:45:10 | ModemManager built it from all 7 ports, QMI included |
+  | 23:45:22 | bearer up, 40 s after the command |
+  | 23:47:04 | riverboat timed out the dead session that still held port 2201 |
+  | 23:47:27 | tunnel up |
+
+  The last two minutes were riverboat, not the modem; see the operator limitation below. The watchdog also reconnected the bearer at 23:47:23, which was not needed: the tunnel was being refused by riverboat, not black-holed, and its own retry would have got in at the same moment. That cost a second bearer, and nothing else.
+- **What this does not prove.** The test rebooted a healthy modem; it could not hang one on demand. That the reboot clears a QMI hang rests on what the replug did on 2026-11-16, and the reboot is the software version of a replug. Two modem failures in four days at the friend's, and none on record before the move, mean the next real one will probably come during Run E. If the reboot does not clear it, the fallback is a USB hub that can switch off a port's power.
+
 **One limitation for the operator.** sshd only checks for a dead session when that session has been idle for 30 s, and a login attempt through 2201 counts as activity. So retrying the login in a tight loop keeps a dead session alive. After a reboot this held recovery to 9 minutes instead of about 1. **After diamond drops off, wait 2 minutes before trying.**
 
 **Data cost.** It's small: tens of KB an hour while idle, and about 25 MB a month of keepalives against the 2 GB plan.

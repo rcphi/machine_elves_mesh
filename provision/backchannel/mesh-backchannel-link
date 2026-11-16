@@ -1,8 +1,9 @@
 #!/usr/bin/env python3
 """Keeps diamond's LTE management link up, and fences the tunnel user onto it.
 
-    mesh-backchannel-link           fence, then connect the modem and apply its address
-    mesh-backchannel-link --fence   fence only: run before every start of the tunnel
+    mesh-backchannel-link                  fence, then connect the modem and apply its address
+    mesh-backchannel-link --fence          fence only: run before every start of the tunnel
+    mesh-backchannel-link --reboot-modem   reboot the modem now, as the recovery below does
 
 It also watches the tunnel. A bearer can say connected, and pass pings, while
 every SYN to home goes unanswered; a fresh bearer with a new address clears
@@ -10,12 +11,13 @@ it. So if the tunnel unit wants to run but has had no established socket home
 for WAIT seconds, the bearer is reconnected. WAIT starts at 2 minutes and
 doubles to an hour, so a home that is simply down does not churn the modem.
 
-And it recovers a modem that ModemManager has given up on. If the modem is
-still on USB but ModemManager lists none for 2 minutes, ModemManager is
-restarted; if that does not bring it back within 2 more, the USB device is
-reset, which re-enumerates it as a replug would. Each round waits twice as
-long, to an hour. A modem that is not on USB at all is unplugged, and nothing
-is done.
+And it recovers a modem that is there but useless: on USB with ModemManager
+listing none, or listed with no usable connection. After 2 minutes of that,
+ModemManager is restarted; 2 minutes later, the modem is rebooted with its own
+AT+CFUN=1,1, which restarts its firmware the way cutting its power does; 2
+minutes after that, the USB device is reset. Each round waits twice as long,
+to an hour. A modem that is not on USB at all is unplugged, or rebooting, and
+nothing is done to it, though the backoff is kept for when it returns.
 
 And it hurries the tunnel along. After any fresh bearer, or when the tunnel's
 connection is on an address LTE no longer has, the tunnel unit is restarted
@@ -34,9 +36,12 @@ import json
 import os
 import pwd
 import re
+import select
 import subprocess
 import sys
+import termios
 import time
+import tty
 from dataclasses import dataclass
 
 USER = "backchannel"
@@ -62,6 +67,19 @@ MISSING_GRACE = 120
 # home (2 of the first 6 seen) never will.
 FIRST_WAIT = 120
 MAX_WAIT = 3600
+# What is tried, in order, on a modem that is there but useless; each round
+# waits twice as long as the one before. The modem's own reboot comes before
+# the USB reset because on 2026-11-14 the reset brought the modem back with
+# its QMI side still hung: re-enumerating is a replug without the power cut.
+LADDER = ("restart-modemmanager", "reboot-modem", "reset-usb")
+# The SIM7600's AT port is USB interface 2 (ttyUSB2 when it is the only
+# modem). Its ttyUSB number follows plug order; the interface does not.
+AT_INTERFACE = "2"
+# 3GPP 27.007: full function, after resetting the mobile terminal. The modem
+# drops off USB and returns 10-20 s later with its firmware started afresh.
+RESET_COMMAND = "AT+CFUN=1,1"
+AT_TIMEOUT = 10
+FINAL_RESULT = re.compile(r"^(OK|ERROR|\+CME ERROR:.*)$")
 
 MODEM_PATH = "/org/freedesktop/ModemManager1/Modem/"
 BEARER_PATH = "/org/freedesktop/ModemManager1/Bearer/"
@@ -191,23 +209,31 @@ def watchdog(state, now, tunnel_up, wanted):
     return {"down_since": now, "wait": min(state["wait"] * 2, MAX_WAIT)}, True
 
 
-def recovery(state, now, listed, on_usb):
-    """(new state, action) for a modem ModemManager does not list. The action
-    is None, "restart-modemmanager" or "reset-usb". Found 2026-11-13: after a
-    USB protocol error ModemManager declared the modem unusable and never
-    looked again, though it never left USB."""
-    if listed or not on_usb:
+def recovery(state, now, usable, on_usb):
+    """(new state, action) for a modem that may be there but useless. The
+    action is None or a step of LADDER.
+
+    Found 2026-11-13: after a USB protocol error ModemManager declared the
+    modem unusable and never looked again, though it never left USB. Found
+    2026-11-14: a modem ModemManager does list can be just as useless, and
+    "listed" had been taken to mean "well"."""
+    if usable:
         return {}, None
+    if not on_usb:
+        # Nothing to act on. How far the backoff had got is kept: a modem off
+        # USB because it is rebooting must not return to a fresh, fast ladder.
+        return {k: state[k] for k in ("wait", "next") if k in state}, None
     if "since" not in state:
         return {"since": now, "wait": state.get("wait", MISSING_GRACE),
-                "next": "restart-modemmanager"}, None
+                "next": state.get("next", LADDER[0])}, None
     if now - state["since"] < state["wait"]:
         return state, None
-    action = state["next"]
-    if action == "restart-modemmanager":
-        return {"since": now, "wait": state["wait"], "next": "reset-usb"}, action
+    action = state["next"] if state.get("next") in LADDER else LADDER[0]
+    step = LADDER.index(action)
+    if step + 1 < len(LADDER):
+        return {"since": now, "wait": state["wait"], "next": LADDER[step + 1]}, action
     return {"since": now, "wait": min(state["wait"] * 2, MAX_WAIT),
-            "next": "restart-modemmanager"}, action
+            "next": LADDER[0]}, action
 
 
 def usb_device(vidpid, root=USB_DEVICES):
@@ -241,27 +267,105 @@ def reset_usb(device, root=USB_DEVICES, sleep=time.sleep, opener=open):
         f.write("1")
 
 
-def recover_modem(run, modem_watch, find_usb, reset, say):
-    """No modem listed. Decide whether ModemManager has given up on one that
-    is still there, and act if it has been long enough."""
+def at_port(device, root=USB_DEVICES, interface=AT_INTERFACE):
+    """/dev path of the modem's AT port, found by USB interface, or None."""
+    where = os.path.join(root, f"{device}:1.{interface}")
+    try:
+        ttys = sorted(name for name in os.listdir(where) if name.startswith("tty"))
+    except OSError:
+        return None
+    return f"/dev/{ttys[0]}" if ttys else None
+
+
+def send_at(path, command, timeout=AT_TIMEOUT):
+    """Send one AT command; the modem's final result line, or None if it said
+    nothing final in time. Lines are read only once complete, so a reply cut
+    across two reads is not mistaken for a shorter one."""
+    fd = os.open(path, os.O_RDWR | os.O_NOCTTY | os.O_NONBLOCK)
+    try:
+        tty.setraw(fd)
+        termios.tcflush(fd, termios.TCIOFLUSH)
+        os.write(fd, command.encode("ascii") + b"\r")
+        heard, deadline = b"", time.monotonic() + timeout
+        while (left := deadline - time.monotonic()) > 0:
+            if not select.select([fd], [], [], left)[0]:
+                break
+            try:
+                chunk = os.read(fd, 256)
+            except BlockingIOError:
+                continue
+            except OSError:
+                break  # the port went away: a resetting modem takes its ports with it
+            if not chunk:
+                break
+            heard += chunk
+            for line in re.split(rb"\r\n|\r|\n", heard)[:-1]:
+                text = line.decode("ascii", "replace").strip()
+                if FINAL_RESULT.match(text):
+                    return text
+        return None
+    finally:
+        os.close(fd)
+
+
+def reboot_modem(device, root=USB_DEVICES, send=None):
+    """Send the modem its own reset on its AT port. ModemManager must not be
+    holding the port."""
+    port = at_port(device, root)
+    if port is None:
+        raise OSError(f"no AT port at {device}:1.{AT_INTERFACE}")
+    return (send or send_at)(port, RESET_COMMAND)
+
+
+def reboot_now(run, device, reboot, say):
+    """Stop ModemManager, which holds the AT ports while it runs, send the
+    reset, and start ModemManager again whatever happened. The stop waits:
+    this unit is After=ModemManager.service, and a oneshot can stop a unit it
+    is ordered after without deadlock (tested 2026-11-16); it is starting one
+    ordered after itself, as the tunnel is, that must not wait."""
+    run(["systemctl", "stop", "ModemManager.service"])
+    try:
+        reply = reboot(device)
+    except OSError as error:
+        say(f"could not send {RESET_COMMAND} to the modem at {device}: {error}")
+        return 1
+    finally:
+        run(["systemctl", "start", "--no-block", "ModemManager.service"])
+    if reply is None:
+        # Not a failure: a modem that resets at once may never finish its
+        # reply. Whether it worked is for the next runs to see.
+        say(f"the modem at {device} gave no answer to {RESET_COMMAND}")
+    else:
+        say(f"the modem at {device} answered {reply} to {RESET_COMMAND}")
+    return 0
+
+
+def recover_modem(run, modem_watch, find_usb, reset, reboot, say, listed=False):
+    """No usable modem: none listed, or one listed that gives no usable
+    connection. Decide whether it is still there to act on, and act if it
+    has been long enough."""
     device = find_usb()
     before = modem_watch.load()
-    state, action = recovery(before, modem_watch.now(), listed=False, on_usb=device is not None)
+    state, action = recovery(before, modem_watch.now(), usable=False, on_usb=device is not None)
     # Saved before acting, so a failed action still moves the next round on.
     modem_watch.save(state)
     if device is None:
         say("no modem: the fence holds, and the tunnel will fail cleanly")
         return 0
+    trouble = (f"modem at {device} listed but with no usable connection" if listed
+               else f"modem on USB at {device} but ModemManager lists none")
     if action is None:
         waited = int(modem_watch.now() - state["since"])
-        say(f"modem on USB at {device} but ModemManager lists none "
-            f"({waited} of {state['wait']} s before {state['next']})")
+        say(f"{trouble} ({waited} of {state['wait']} s before {state['next']})")
         return 0
     if action == "restart-modemmanager":
-        say(f"modem on USB at {device} unlisted for {before['wait']} s: restarting ModemManager")
+        say(f"{trouble} for {before['wait']} s: restarting ModemManager")
         run(["systemctl", "restart", "--no-block", "ModemManager.service"])
         return 0
-    say(f"modem on USB at {device} still unlisted after a ModemManager restart: "
+    if action == "reboot-modem":
+        say(f"{trouble}, still, after restarting ModemManager: rebooting the modem")
+        return reboot_now(run, device, reboot, say)
+    say(f"{trouble}, still, after rebooting it: "
         f"resetting the USB device; next round after {state['wait']} s")
     try:
         reset(device)
@@ -365,7 +469,7 @@ def apply(run, found):
 
 
 def ensure(run, uid, apn, fence_only=False, say=say, home=None, watch=None,
-           modem_watch=None, find_usb=None, reset_usb=None):
+           modem_watch=None, find_usb=None, reset_usb=None, reboot_modem=None):
     for cmd in fence_commands(uid):
         run(cmd, tolerate_exists=True)
     if fence_only:
@@ -375,15 +479,23 @@ def ensure(run, uid, apn, fence_only=False, say=say, home=None, watch=None,
         if modem_watch is None:
             say("no modem: the fence holds, and the tunnel will fail cleanly")
             return 0
-        return recover_modem(run, modem_watch, find_usb, reset_usb, say)
-    if modem_watch is not None and modem_watch.load():
-        modem_watch.save({})
+        return recover_modem(run, modem_watch, find_usb, reset_usb, reboot_modem, say)
     found, fresh = find_link(run, path), False
     if found is None:
-        found, fresh = connect(run, path, apn, say), True
+        try:
+            found, fresh = connect(run, path, apn, say), True
+            if found is None:
+                say(f"{path} connected but offers no usable IPv4 bearer")
+        except Failed as failure:
+            say(f"connecting {path} failed: {failure}")
     if found is None:
-        say(f"{path} connected but offers no usable IPv4 bearer")
+        # Listed is not well: on 2026-11-14 a modem rebuilt from its AT ports
+        # alone was listed, registered and "connected" for 48 hours.
+        if modem_watch is not None:
+            recover_modem(run, modem_watch, find_usb, reset_usb, reboot_modem, say, listed=True)
         return 1
+    if modem_watch is not None and modem_watch.load():
+        modem_watch.save({})
     apply(run, found)
     if home is None or watch is None:
         return 0
@@ -424,6 +536,7 @@ def watch_tunnel(run, path, apn, found, fresh, home, watch, say):
 def main(argv, user=USER, run=None, config=CONFIG):
     run = run or sh
     fence_only = argv[1:] == ["--fence"]
+    reboot_only = argv[1:] == ["--reboot-modem"]
     try:
         uid = pwd.getpwnam(user).pw_uid
     except KeyError:
@@ -439,11 +552,18 @@ def main(argv, user=USER, run=None, config=CONFIG):
     home = None
     if settings.get("HOME_ADDR") and settings.get("HOME_PORT"):
         home = (settings["HOME_ADDR"], settings["HOME_PORT"])
+    vidpid = settings.get("MODEM_USB", MODEM_USB)
     try:
-        vidpid = settings.get("MODEM_USB", MODEM_USB)
+        if reboot_only:
+            device = usb_device(vidpid)
+            if device is None:
+                print(f"no modem {vidpid} on USB: nothing to reboot", file=sys.stderr)
+                return 1
+            return reboot_now(run, device, reboot_modem, say)
         return ensure(run, uid, apn, fence_only=fence_only, home=home, watch=StateFile(),
                       modem_watch=StateFile(MODEM_STATE),
-                      find_usb=lambda: usb_device(vidpid), reset_usb=reset_usb)
+                      find_usb=lambda: usb_device(vidpid), reset_usb=reset_usb,
+                      reboot_modem=reboot_modem)
     except Failed as failure:
         print(failure, file=sys.stderr)
         return 1

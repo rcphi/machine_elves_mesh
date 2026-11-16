@@ -164,8 +164,10 @@ class Box:
     """A fake `run`. Answers by command prefix, records every call."""
 
     def __init__(self, connected_after_connect=True, modem=True, already_connected=False,
-                 tunnel_up=True, tunnel_unit="active", tunnel_from="100.66.12.9"):
+                 tunnel_up=True, tunnel_unit="active", tunnel_from="100.66.12.9",
+                 bearer=BEARER_CONNECTED, connect_error=None):
         self.calls, self.tolerant = [], []
+        self.bearer, self.connect_error = bearer, connect_error
         self.connected = already_connected
         self.tunnel_up, self.tunnel_unit, self.tunnel_from = tunnel_up, tunnel_unit, tunnel_from
         self.connected_after_connect = connected_after_connect
@@ -191,10 +193,12 @@ class Box:
         if key.startswith("ss -Htn state established "):
             return (f"0 0 {self.tunnel_from}:49104 204.210.210.200:2302\n" if self.tunnel_up else "")
         if key.startswith(f"mmcli -m {MODEM} --simple-connect="):
+            if self.connect_error:
+                raise link.Failed(self.connect_error)
             self.connected = self.connected_after_connect
             return ""
         if key.startswith("mmcli -b "):
-            return BEARER_CONNECTED
+            return self.bearer
         if key.startswith("ip -j -4 addr show dev "):
             return "[]"
         return ""
@@ -444,6 +448,8 @@ class FasterRecovery(unittest.TestCase):
 
 USB = "1-7"
 RESTART_MM = ["systemctl", "restart", "--no-block", "ModemManager.service"]
+STOP_MM = ["systemctl", "stop", "ModemManager.service"]
+START_MM = ["systemctl", "start", "--no-block", "ModemManager.service"]
 
 
 class ModemManagerGaveUp(unittest.TestCase):
@@ -462,11 +468,11 @@ class ModemManagerGaveUp(unittest.TestCase):
         code = link.ensure(box, 997, "vzwinternet",
                            say=(said.append if said is not None else lambda m: None),
                            modem_watch=watch, find_usb=lambda: USB if on_usb else None,
-                           reset_usb=resets.append)
+                           reset_usb=resets.append, reboot_modem=lambda d: "OK")
         return code, box, watch, resets
 
     def test_the_first_miss_only_starts_the_clock(self):
-        state, action = link.recovery({}, 100.0, listed=False, on_usb=True)
+        state, action = link.recovery({}, 100.0, usable=False, on_usb=True)
         self.assertIsNone(action)
         self.assertEqual(state, {"since": 100.0, "wait": 120, "next": "restart-modemmanager"})
 
@@ -474,19 +480,28 @@ class ModemManagerGaveUp(unittest.TestCase):
         # A replugged modem takes about 24 s to be listed, and ModemManager's
         # own failed init took 90 s. Neither may trigger anything.
         before = {"since": 100.0, "wait": 120, "next": "restart-modemmanager"}
-        state, action = link.recovery(before, 219.0, listed=False, on_usb=True)
+        state, action = link.recovery(before, 219.0, usable=False, on_usb=True)
         self.assertIsNone(action)
         self.assertEqual(state, before)
 
     def test_two_minutes_unlisted_on_usb_restarts_modemmanager(self):
         before = {"since": 100.0, "wait": 120, "next": "restart-modemmanager"}
-        state, action = link.recovery(before, 220.0, listed=False, on_usb=True)
+        state, action = link.recovery(before, 220.0, usable=False, on_usb=True)
         self.assertEqual(action, "restart-modemmanager")
-        self.assertEqual(state, {"since": 220.0, "wait": 120, "next": "reset-usb"})
+        self.assertEqual(state, {"since": 220.0, "wait": 120, "next": "reboot-modem"})
 
-    def test_if_a_restart_did_not_bring_it_back_the_usb_device_is_reset(self):
+    def test_if_a_restart_did_not_bring_it_back_the_modem_itself_is_rebooted(self):
+        # 2026-11-14: a USB reset straight after the restart brought the modem
+        # back with its QMI side still hung. Only the modem's own reboot, or a
+        # power cut, clears that.
+        before = {"since": 220.0, "wait": 120, "next": "reboot-modem"}
+        state, action = link.recovery(before, 340.0, usable=False, on_usb=True)
+        self.assertEqual(action, "reboot-modem")
+        self.assertEqual(state, {"since": 340.0, "wait": 120, "next": "reset-usb"})
+
+    def test_if_a_reboot_did_not_bring_it_back_the_usb_device_is_reset(self):
         before = {"since": 220.0, "wait": 120, "next": "reset-usb"}
-        state, action = link.recovery(before, 340.0, listed=False, on_usb=True)
+        state, action = link.recovery(before, 340.0, usable=False, on_usb=True)
         self.assertEqual(action, "reset-usb")
         self.assertEqual(state, {"since": 340.0, "wait": 240, "next": "restart-modemmanager"})
 
@@ -494,25 +509,39 @@ class ModemManagerGaveUp(unittest.TestCase):
         state, now, actions = {}, 0.0, []
         for _ in range(2000):
             now += 30
-            state, action = link.recovery(state, now, listed=False, on_usb=True)
+            state, action = link.recovery(state, now, usable=False, on_usb=True)
             if action:
                 actions.append((now, action))
         gaps = [b[0] - a[0] for a, b in zip(actions, actions[1:])]
         # The clock starts at the first run that sees it missing (t=30).
         self.assertEqual(actions[0], (150.0, "restart-modemmanager"))
-        self.assertEqual(actions[1][1], "reset-usb")
+        self.assertEqual([a for _, a in actions[1:3]], ["reboot-modem", "reset-usb"])
+        self.assertEqual(actions[3][1], "restart-modemmanager")
         self.assertLessEqual(max(gaps), link.MAX_WAIT)
         self.assertEqual(state["wait"], link.MAX_WAIT)
 
     def test_a_listed_modem_clears_everything(self):
         before = {"since": 100.0, "wait": 960, "next": "reset-usb"}
-        self.assertEqual(link.recovery(before, 5000.0, listed=True, on_usb=True), ({}, None))
+        self.assertEqual(link.recovery(before, 5000.0, usable=True, on_usb=True), ({}, None))
 
     def test_a_modem_that_is_not_on_usb_is_unplugged_and_nothing_is_done(self):
         # Unplugged is recovered by plugging in; restarting things achieves
         # nothing and resetting a device that is not there is meaningless.
         before = {"since": 100.0, "wait": 120, "next": "restart-modemmanager"}
-        self.assertEqual(link.recovery(before, 5000.0, listed=False, on_usb=False), ({}, None))
+        state, action = link.recovery(before, 5000.0, usable=False, on_usb=False)
+        self.assertIsNone(action)
+        self.assertNotIn("since", state)
+
+    def test_a_modem_off_usb_while_it_reboots_keeps_the_backoff(self):
+        # A rebooting modem leaves USB for 10-20 s, and a run can land in that
+        # window. Forgetting the backoff there would reboot a modem with no
+        # service every four minutes for as long as the outage lasted.
+        before = {"since": 100.0, "wait": 480, "next": "reset-usb"}
+        state, action = link.recovery(before, 130.0, usable=False, on_usb=False)
+        self.assertEqual((state, action), ({"wait": 480, "next": "reset-usb"}, None))
+        # Back on USB, it gets the whole wait before anything is done to it.
+        state, action = link.recovery(state, 160.0, usable=False, on_usb=True)
+        self.assertEqual((state, action), ({"since": 160.0, "wait": 480, "next": "reset-usb"}, None))
 
     def test_on_the_box_modemmanager_is_restarted_without_blocking(self):
         # --no-block for the same reason as the tunnel restart: this oneshot is
@@ -553,7 +582,8 @@ class ModemManagerGaveUp(unittest.TestCase):
         code, box, watch, resets = self.run_once(
             {"since": 100.0, "wait": 120, "next": "restart-modemmanager"},
             now=9_999.0, on_usb=False, said=said)
-        self.assertEqual((code, watch.state, resets), (0, {}, []))
+        self.assertEqual((code, resets), (0, []))
+        self.assertNotIn("since", watch.state)
         self.assertNotIn(RESTART_MM, box.calls)
         self.assertTrue([m for m in said if "no modem" in m])
 
@@ -577,6 +607,217 @@ class ModemManagerGaveUp(unittest.TestCase):
         box = Box(modem=False)
         self.assertEqual(link.ensure(box, 997, "vzwinternet", say=lambda m: None), 0)
         self.assertNotIn(RESTART_MM, box.calls)
+
+
+# What modem1's bearer looked like from 23:04 on 2026-11-14: connected, as the
+# modem saw it, with no interface and no address, because ModemManager had
+# built the modem from its AT ports alone.
+BEARER_HALF = """\
+bearer.dbus-path                 : /org/freedesktop/ModemManager1/Bearer/3
+bearer.status.connected          : yes
+bearer.status.interface          : --
+bearer.ipv4-config.method        : --
+bearer.ipv4-config.address       : --
+bearer.ipv4-config.prefix        : --
+"""
+
+
+class TheModemHungButStayedListed(unittest.TestCase):
+    """Found at the friend's house, 2026-11-14 22:54 UTC: the modem's QMI side
+    stopped answering. ModemManager gave up at 22:58, and the recovery above
+    restarted it and then reset the USB device. The modem came back, but its
+    QMI port still did not answer, so ModemManager built it from the AT ports
+    alone: registered, "connected", with no interface and no address. The
+    recovery acted only on a modem that was not listed, and this one was, so
+    the link asked it to connect every 30 s for 48 hours. Unplugging it, which
+    cut its power, fixed it in 44 s."""
+
+    def run_once(self, state=None, now=10_000.0, said=None, reboots=None, **box):
+        box = Box(**({"bearer": BEARER_HALF} | box))
+        watch = Watch(state, now=now)
+        code = link.ensure(box, 997, "vzwinternet",
+                           say=(said.append if said is not None else lambda m: None),
+                           modem_watch=watch, find_usb=lambda: USB, reset_usb=lambda d: None,
+                           reboot_modem=(reboots.append if reboots is not None else lambda d: "OK"))
+        return code, box, watch
+
+    def test_a_listed_modem_with_no_usable_connection_starts_the_clock(self):
+        code, box, watch = self.run_once({}, now=100.0)
+        self.assertEqual(code, 1)
+        self.assertEqual(watch.state["since"], 100.0)
+
+    def test_being_listed_is_not_being_well(self):
+        # The old code cleared the recovery the moment a modem was listed.
+        before = {"since": 100.0, "wait": 120, "next": "reboot-modem"}
+        code, box, watch = self.run_once(before, now=150.0)
+        self.assertEqual(watch.state, before)
+
+    def test_two_minutes_unusable_restarts_modemmanager(self):
+        code, box, watch = self.run_once(
+            {"since": 100.0, "wait": 120, "next": "restart-modemmanager"}, now=220.0)
+        self.assertIn(RESTART_MM, box.calls)
+
+    def test_a_connect_that_errors_counts_as_unusable(self):
+        code, box, watch = self.run_once({}, now=100.0, connect_error="QMI operation failed")
+        self.assertEqual(code, 1)
+        self.assertEqual(watch.state["since"], 100.0)
+
+    def test_a_usable_link_forgets_the_failure(self):
+        code, box, watch = self.run_once(
+            {"since": 100.0, "wait": 480, "next": "reset-usb"}, now=9_999.0,
+            bearer=BEARER_CONNECTED, already_connected=True)
+        self.assertEqual((code, watch.state), (0, {}))
+
+    def test_saturday_replayed_the_modem_is_rebooted_within_five_minutes(self):
+        state, reboots, now = {}, [], 0.0
+        restarted_at = None
+        while now <= 300 and not reboots:
+            code, box, watch = self.run_once(state, now=now, reboots=reboots)
+            state = watch.state
+            if RESTART_MM in box.calls:
+                restarted_at = now
+            now += 30
+        self.assertEqual(restarted_at, 120.0)
+        self.assertEqual(reboots, [USB])
+
+
+class RebootingTheModem(unittest.TestCase):
+    """The modem's own reset, sent as an AT command. Its AT ports kept
+    answering on 2026-11-14 while QMI did not, and AT+CFUN=1,1 restarts its
+    firmware the way cutting its power does. ModemManager holds the ports
+    while it runs, so it is stopped first and started again after."""
+
+    def reboot(self, reply="OK", error=None):
+        box, said = Box(), []
+        def reboot(device):
+            box.calls.append(["reboot", device])
+            if error:
+                raise OSError(error)
+            return reply
+        code = link.reboot_now(box, USB, reboot, said.append)
+        return code, box, said
+
+    def test_modemmanager_is_stopped_before_the_reset_and_started_after(self):
+        code, box, said = self.reboot()
+        self.assertEqual(code, 0)
+        self.assertEqual(box.calls, [STOP_MM, ["reboot", USB], START_MM])
+
+    def test_modemmanager_is_started_again_even_if_the_reset_cannot_be_sent(self):
+        code, box, said = self.reboot(error="No such file or directory")
+        self.assertEqual(code, 1)
+        self.assertEqual(box.calls[-1], START_MM)
+        self.assertTrue([m for m in said if "No such file" in m])
+
+    def test_the_modems_answer_is_said_in_the_journal(self):
+        code, box, said = self.reboot(reply="OK")
+        self.assertTrue([m for m in said if "answered OK" in m])
+        # A modem may reset before it finishes replying; silence is said, not
+        # treated as failure. Whether it worked is the next runs' to judge.
+        code, box, said = self.reboot(reply=None)
+        self.assertEqual(code, 0)
+        self.assertTrue([m for m in said if "no answer" in m])
+
+    def test_the_ladder_reboots_through_the_runner(self):
+        box, reboots = Box(modem=False), []
+        watch = Watch({"since": 220.0, "wait": 120, "next": "reboot-modem"}, now=340.0)
+        link.ensure(box, 997, "vzwinternet", say=lambda m: None, modem_watch=watch,
+                    find_usb=lambda: USB, reset_usb=lambda d: None, reboot_modem=reboots.append)
+        self.assertEqual(reboots, [USB])
+        self.assertLess(box.index(STOP_MM), box.index(START_MM))
+        self.assertEqual(watch.state["next"], "reset-usb")
+
+    def test_by_hand(self):
+        box, said = Box(), []
+        saved = link.usb_device, link.reboot_modem
+        link.usb_device = lambda vidpid: USB
+        link.reboot_modem = lambda device: box.calls.append(["reboot", device]) or "OK"
+        try:
+            import getpass
+            code = link.main(["x", "--reboot-modem"], user=getpass.getuser(), run=box,
+                             config="/nonexistent")
+        finally:
+            link.usb_device, link.reboot_modem = saved
+        self.assertEqual(code, 0)
+        self.assertEqual(box.calls, [STOP_MM, ["reboot", USB], START_MM])
+
+    def test_by_hand_with_no_modem_on_usb_touches_nothing(self):
+        box = Box()
+        saved = link.usb_device
+        link.usb_device = lambda vidpid: None
+        try:
+            import getpass
+            code = link.main(["x", "--reboot-modem"], user=getpass.getuser(), run=box,
+                             config="/nonexistent")
+        finally:
+            link.usb_device = saved
+        self.assertEqual((code, box.calls), (1, []))
+
+
+class TalkingToTheModem(unittest.TestCase):
+    """The AT exchange, against a real pseudo-terminal standing in for
+    ttyUSB2."""
+
+    def modem(self, answer):
+        import threading
+        master, slave = os.openpty()
+        heard = []
+        def run():
+            got = b""
+            try:
+                while not got.endswith(b"\r"):
+                    got += os.read(master, 64)
+                heard.append(got)
+                if answer:
+                    os.write(master, answer)
+            except OSError:
+                pass  # the test ended, or failed, before the exchange did
+        thread = threading.Thread(target=run, daemon=True)
+        thread.start()
+        self.addCleanup(os.close, master)
+        self.addCleanup(os.close, slave)
+        return os.ttyname(slave), heard, thread
+
+    def test_the_reset_goes_out_and_ok_comes_back(self):
+        # With echo on, as the SIM7600 ships: the command comes back first.
+        path, heard, thread = self.modem(b"AT+CFUN=1,1\r\r\nOK\r\n")
+        self.assertEqual(link.send_at(path, "AT+CFUN=1,1", timeout=5), "OK")
+        thread.join(5)
+        self.assertEqual(heard, [b"AT+CFUN=1,1\r"])
+
+    def test_an_error_is_returned_as_the_modem_said_it(self):
+        path, heard, thread = self.modem(b"\r\n+CME ERROR: operation not allowed\r\n")
+        self.assertEqual(link.send_at(path, "AT+CFUN=1,1", timeout=5),
+                         "+CME ERROR: operation not allowed")
+
+    def test_silence_is_none_after_the_timeout(self):
+        import time
+        path, heard, thread = self.modem(None)
+        started = time.monotonic()
+        self.assertIsNone(link.send_at(path, "AT+CFUN=1,1", timeout=0.5))
+        self.assertLess(time.monotonic() - started, 3)
+
+    def make_sysfs(self, entries):
+        import tempfile
+        root = tempfile.mkdtemp()
+        for path in entries:
+            os.makedirs(os.path.join(root, path))
+        return root
+
+    def test_the_at_port_is_found_by_its_usb_interface_not_its_number(self):
+        # ttyUSB numbers follow plug order; interface 2 is the SIM7600's AT port.
+        root = self.make_sysfs(["1-7:1.0/ttyUSB5", "1-7:1.2/ttyUSB7", "1-7:1.3/ttyUSB8"])
+        self.assertEqual(link.at_port(USB, root), "/dev/ttyUSB7")
+
+    def test_the_reset_is_sent_to_that_port(self):
+        root = self.make_sysfs(["1-7:1.2/ttyUSB2"])
+        sent = []
+        reply = link.reboot_modem(USB, root, send=lambda port, cmd: sent.append((port, cmd)) or "OK")
+        self.assertEqual((reply, sent), ("OK", [("/dev/ttyUSB2", "AT+CFUN=1,1")]))
+
+    def test_no_at_port_is_an_error_not_a_guess(self):
+        root = self.make_sysfs(["1-7:1.5/net"])
+        with self.assertRaises(OSError):
+            link.reboot_modem(USB, root, send=lambda port, cmd: "OK")
 
 
 class FindingTheModemOnUsb(unittest.TestCase):
