@@ -303,6 +303,8 @@ The keepalive the mesh may use is governed by the worst connection among the pla
 
 **Shipped: 55 s**, leaving better than a twofold margin on the shorter of the two connections measured.
 
+> **Corrected 2026-11-16: the friend's router is now the shorter connection, and 55 s fails this rule.** It keeps an idle flow for 90 s and loses it by 120 s (138 runs; see "Measuring idle timeouts properly"). Halving 90 s gives **45 s**. At 55 s, one lost keepalive leaves 110 s of silence, inside the band where this router forgets: the "one dropped packet away" case the rule exists to prevent. In Run E it changes nothing, because heartbeats cross the connection every second, and the keepalive matters only on a connection that has gone quiet. Changing the default is a decision for Run E's build.
+
 The residual risk is worth stating: these are one carrier and one home router. Carriers vary, and the common industry figure is nearer 25 seconds — WireGuard's persistent keepalive defaults to 25 s for that reason. A carrier more aggressive than the one measured here would break connections silently rather than loudly. It is a one-line change (`--keepalive-ms`) if a volunteer's connection turns out to be shorter, and the probe will say so before it becomes a mystery.
 
 ### The measurement exposes a mechanism doing two jobs at once
@@ -946,7 +948,7 @@ Volunteers should be told plainly what the machine does, that it can be remotely
 - The two sides exchange a 3-second two-way flow, so the router treats it like a mesh connection rather than a single request.
 - After the silence, the responder sends three probes, a second apart. If none arrives, a check confirms that the path itself still works before the run counts as an expiry.
 
-**riverboat's own router must not forget its half meanwhile.** That router randomises ports. If it forgot the flow, the probe would leave from a new port and be filtered out at the client: a false expiry. So during the silence the responder sends keepalives with TTL 2. They refresh its own router and die one hop later, long before the client's router. If one ever arrives, the run is inconclusive, so the assumption checks itself.
+**riverboat's own router must not forget its half meanwhile.** That router usually keeps port numbers, but not always: 128 of diamond's 3,380 readings from home came back on another port. If it forgot the flow and gave the probes a new port, they would be filtered out at the client: a false expiry. *(Corrected 2026-11-16: this said the router randomises ports, the error retracted above.)* So during the silence the responder sends keepalives with TTL 2. They refresh its own router and die one hop later, long before the client's router. If one ever arrives, the run is inconclusive, so the assumption checks itself.
 
 **Checked against real Linux NAT in namespaces** (`probe/inbound-rig.sh`), with a port-preserving client router timing out at 20 s and a port-randomising responder router at 12 s:
 
@@ -959,6 +961,31 @@ Volunteers should be told plainly what the machine does, that it can be remotely
 | Keepalive TTL of 5 | caught, reported inconclusive |
 
 **First result from the friend's router, 2026-11-14 01:53 UTC:** 60 s of silence, survived. The probe arrived 60,008 ms after the last packet diamond heard; all 3 flow echoes came back; local port 59228 came back unchanged as 75.118.77.81:59228. `summarise.py` now counts only evidence that can tell survival from expiry, and reports separately for each network a machine has been on. Until each site has confirmed evidence, it gives no mesh-wide keepalive interval.
+
+**Final result from the friend's router — 138 runs, 2026-11-14 01:53 to 2026-11-16 23:38 UTC: it forgets an idle two-way flow between 90 and 120 seconds.**
+
+| Silence | Survived | Expired |
+|---|---|---|
+| 15 s | 17 | 0 |
+| 30 s | 10 | 0 |
+| 45 s | 12 | 0 |
+| 60 s | 15 | 0 |
+| **90 s** | **12** | **0** |
+| **120 s** | **0** | **11** |
+| 180 s | 0 | 8 |
+| 240 s | 0 | 16 |
+| 300 s | 0 | 14 |
+| 420 s | 0 | 12 |
+| 600 s | 0 | 11 |
+
+- **No run contradicts another, and none needed excusing.** Every run had all three flow echoes and no note. Every expiry was followed by a check that got through, from the same public address and port, so the path was up and only the mapping was gone. No keepalive leaked.
+- **The same at every time of day.** Each quarter of the UTC day shows the same split, so the household's evening traffic does not shorten it.
+- **On time.** Every probe that got in arrived within 90 ms of the silence ending. The public address stayed 75.118.77.81, and the router kept the local port number, in all 138.
+- **A reading, not a finding:** 120 s is Linux's default for a two-way UDP flow, and the least RFC 4787 asks of a NAT, so a Linux-based router left at its defaults would look exactly like this. The test brackets the value; it does not see the router's software.
+- **The bracket is not worth narrowing.** A finer grid could only raise the confirmed-safe figure, and the keepalive it governs costs almost nothing to shorten instead.
+- **The outbound test, alongside, shows what it could not see.** Before the new probe went in, `--mapping-lifetime` on this router said "survived" 24 times at silences of 120 to 600 s, all of which this router does not survive.
+
+`summarise.py` reports this site as forgetting "somewhere between 90s and 120s". It still gives no mesh-wide keepalive: the home router has no confirmed evidence, because it is the responder's end and has never been measured from outside. Run E does not need it, because riverboat's port 4001 is held open by a NAT-PMP mapping rather than by traffic.
 
 ## Before Run E: what the review's second group changed — 2026-11-14
 
@@ -988,7 +1015,7 @@ The external review of 2026-11-07 (`CODE_REVIEW_2026-11-07.md`, with its complet
 - the new node and probe on both boxes;
 - the logrotate policy on both;
 - the `lan-only` drop-in on diamond;
-- a UDP port forward for 4001 to riverboat. riverboat has to be the reachable member, because the friend's router does not answer NAT-PMP.
+- a UDP port forward for 4001 to riverboat. riverboat has to be the reachable member, because the friend's router does not answer NAT-PMP. *(Not needed, found 2026-11-16: the home router answers NAT-PMP, and riverboat's node already holds 204.210.210.200:4001 that way, as diamond's did while it was at home. A mapping is also what a real player's node would get, where a hand-made forward is not.)*
 
 The Run E handover will list these as commands.
 
