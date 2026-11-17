@@ -244,11 +244,14 @@ fn dial_retry_interval() -> tokio::time::Interval {
 
 /// How often a quiet connection is poked to stop a router forgetting it.
 ///
-/// Measured rather than guessed: the mobile connection tested forgot an idle
-/// mapping somewhere between 120 and 300 seconds, and the home connection did
-/// not forget in over ten minutes across 45 attempts. The keepalive is governed
-/// by the worst connection among the players, so 55 s leaves better than a
-/// twofold margin on the shorter of the two.
+/// Measured rather than guessed, and governed by the worst connection among
+/// the players: the longest silence it is confirmed to survive, halved, so one
+/// lost keepalive still lands inside it. The friend's router (2026-11-14/16,
+/// 138 inbound runs) kept an idle flow through 90 s and lost it by 120 s, the
+/// shortest yet; the hotspot's limit was 120-300 s. Halving 90 s gives 45 s,
+/// and 40 s sits a little under it, as 55 s once sat under the hotspot's 60.
+/// (The home connection's "over ten minutes" was never evidence: the test
+/// behind it could not see expiry on a router that keeps port numbers.)
 ///
 /// **This is a different job from the heartbeat, and the separation is the
 /// point.** Heartbeats run every second because that is what makes an
@@ -258,7 +261,7 @@ fn dial_retry_interval() -> tokio::time::Interval {
 /// why this needs its own name — the moment detection is slowed, or a player
 /// runs this on a metered connection where every packet is a cost, the two
 /// requirements pull in opposite directions and one of them silently loses.
-const DEFAULT_KEEPALIVE_MS: u64 = 55_000;
+const DEFAULT_KEEPALIVE_MS: u64 = 40_000;
 
 #[derive(Debug, PartialEq)]
 enum Message {
@@ -2805,12 +2808,16 @@ mod tests {
 
     #[test]
     fn the_keepalive_leaves_margin_on_the_worst_measured_connection() {
-        // The mobile connection tested forgot an idle mapping between 120s and
-        // 300s. A keepalive without real margin is one dropped packet away from
-        // a connection that dies with no error anywhere.
+        // The friend's router kept an idle two-way flow through 90 s and lost
+        // it by 120 s, in 138 inbound runs (2026-11-14/16): shorter than the
+        // hotspot's 120-300 s. A keepalive without real margin is one dropped
+        // packet away from a connection that dies with no error anywhere, so
+        // two intervals, one of them lost, must still fit inside the
+        // longest silence confirmed safe.
         let keepalive = Duration::from_millis(DEFAULT_KEEPALIVE_MS);
-        let shortest_confirmed_safe = Duration::from_secs(120);
-        assert!(keepalive * 2 <= shortest_confirmed_safe);
+        let shortest_confirmed_safe = Duration::from_secs(90);
+        assert!(keepalive * 2 <= shortest_confirmed_safe,
+            "{keepalive:?} twice over is past {shortest_confirmed_safe:?}");
     }
 
     #[test]
