@@ -246,10 +246,14 @@ fn dial_retry_interval() -> tokio::time::Interval {
 ///
 /// Measured rather than guessed, and governed by the worst connection among
 /// the players: the longest silence it is confirmed to survive, halved, so one
-/// lost keepalive still lands inside it. The friend's router (2026-11-14/16,
-/// 138 inbound runs) kept an idle flow through 90 s and lost it by 120 s, the
-/// shortest yet; the hotspot's limit was 120-300 s. Halving 90 s gives 45 s,
-/// and 40 s sits a little under it, as 55 s once sat under the hotspot's 60.
+/// lost keepalive still lands inside it. At the friend's house (2026-11-14/16,
+/// 138 inbound runs) the path into diamond kept an idle flow through 90 s and
+/// lost it at 120 s, the shortest yet: not the router, which kept it through
+/// 120 s, but diamond's own firewall, whose connection tracking forgets an
+/// idle UDP flow at Linux's default 120 s and then refuses what only a reply
+/// rule would admit. A player behind a default firewall meets that first.
+/// Halving 90 s gives 45 s, and 40 s sits a little under it, as 55 s once sat
+/// under the hotspot's 60.
 /// (The home connection's "over ten minutes" was never evidence: the test
 /// behind it could not see expiry on a router that keeps port numbers.)
 ///
@@ -2808,12 +2812,14 @@ mod tests {
 
     #[test]
     fn the_keepalive_leaves_margin_on_the_worst_measured_connection() {
-        // The friend's router kept an idle two-way flow through 90 s and lost
-        // it by 120 s, in 138 inbound runs (2026-11-14/16): shorter than the
-        // hotspot's 120-300 s. A keepalive without real margin is one dropped
-        // packet away from a connection that dies with no error anywhere, so
-        // two intervals, one of them lost, must still fit inside the
-        // longest silence confirmed safe.
+        // At the friend's house the path into diamond kept an idle two-way
+        // flow through 90 s and lost it at 120 s, in 138 inbound runs
+        // (2026-11-14/16): diamond's own firewall, at Linux's default
+        // connection-tracking timeout, not the router, which kept it through
+        // 120 s. Shorter than the hotspot's 120-300 s. A keepalive without
+        // real margin is one dropped packet away from a connection that dies
+        // with no error anywhere, so two intervals, one of them lost, must
+        // still fit inside the longest silence confirmed safe.
         let keepalive = Duration::from_millis(DEFAULT_KEEPALIVE_MS);
         let shortest_confirmed_safe = Duration::from_secs(90);
         assert!(keepalive * 2 <= shortest_confirmed_safe,

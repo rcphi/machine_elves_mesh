@@ -303,7 +303,7 @@ The keepalive the mesh may use is governed by the worst connection among the pla
 
 **Shipped: 55 s**, leaving better than a twofold margin on the shorter of the two connections measured.
 
-> **Corrected 2026-11-16: the friend's router is now the shorter connection, and 55 s fails this rule.** It keeps an idle flow for 90 s and loses it by 120 s (138 runs; see "Measuring idle timeouts properly"). Halving 90 s gives **45 s**. At 55 s, one lost keepalive leaves 110 s of silence, inside the band where this router forgets: the "one dropped packet away" case the rule exists to prevent. In Run E it changes nothing, because heartbeats cross the connection every second, and the keepalive matters only on a connection that has gone quiet. **Shipped for Run E: 40 s**, a little under 45 s, as 55 s sat under 60. The test that encodes this rule now holds the node to the friend's 90 s, and failed at 55 s before the change.
+> **Corrected 2026-11-16: a host firewall that admits only replies is now the shortest path, and 55 s fails this rule there.** At the friend's house the path into diamond kept an idle flow through 90 s and lost it at 120 s, and the 120 s was diamond's own firewall: Linux's connection tracking forgets an idle two-way UDP flow at 120 s by default, and a firewall that admits only replies then refuses the next packet (see "Measuring idle timeouts properly"). The friend's router itself kept the flow through 120 s, which halves to 60 s and would have let 55 s stand. But a player's node behind a default firewall meets the 120 s first. Halving 90 s gives **45 s**. At 55 s, one lost keepalive leaves 110 s of silence, 10 s from that limit: the "one dropped packet away" case the rule exists to prevent. In Run E it changes nothing, because heartbeats cross the connection every second, and both boxes admit 4001 by rule. **Shipped for Run E: 40 s**, a little under 45 s, as 55 s sat under 60. The test that encodes this rule now holds the node to 90 s, and failed at 55 s before the change. *(First written as "the friend's router is now the shorter connection", which the kernel log disproved the same evening. The decision survives the correction; its stated reason did not.)*
 
 The residual risk is worth stating: these are one carrier and one home router. Carriers vary, and the common industry figure is nearer 25 seconds — WireGuard's persistent keepalive defaults to 25 s for that reason. A carrier more aggressive than the one measured here would break connections silently rather than loudly. It is a one-line change (`--keepalive-ms`) if a volunteer's connection turns out to be shorter, and the probe will say so before it becomes a mystery.
 
@@ -962,30 +962,31 @@ Volunteers should be told plainly what the machine does, that it can be remotely
 
 **First result from the friend's router, 2026-11-14 01:53 UTC:** 60 s of silence, survived. The probe arrived 60,008 ms after the last packet diamond heard; all 3 flow echoes came back; local port 59228 came back unchanged as 75.118.77.81:59228. `summarise.py` now counts only evidence that can tell survival from expiry, and reports separately for each network a machine has been on. Until each site has confirmed evidence, it gives no mesh-wide keepalive interval.
 
-**Final result from the friend's router — 138 runs, 2026-11-14 01:53 to 2026-11-16 23:38 UTC: it forgets an idle two-way flow between 90 and 120 seconds.**
+**Final result at the friend's house — 138 runs, 2026-11-14 01:53 to 2026-11-16 23:38 UTC. The path into diamond forgets an idle two-way flow between 90 and 120 s, and the 120 s is diamond's own firewall, not the router. The router keeps the flow for at least 120 s and loses it by 180 s.**
 
-| Silence | Survived | Expired |
-|---|---|---|
-| 15 s | 17 | 0 |
-| 30 s | 10 | 0 |
-| 45 s | 12 | 0 |
-| 60 s | 15 | 0 |
-| **90 s** | **12** | **0** |
-| **120 s** | **0** | **11** |
-| 180 s | 0 | 8 |
-| 240 s | 0 | 16 |
-| 300 s | 0 | 14 |
-| 420 s | 0 | 12 |
-| 600 s | 0 | 11 |
+| Silence | Survived | Expired | Where the probes stopped |
+|---|---|---|---|
+| 15 s | 17 | 0 | |
+| 30 s | 10 | 0 | |
+| 45 s | 12 | 0 | |
+| 60 s | 15 | 0 | |
+| **90 s** | **12** | **0** | |
+| **120 s** | **0** | **11** | **at diamond's own firewall**, in all 11 |
+| 180 s | 0 | 8 | before diamond: none arrived |
+| 240 s | 0 | 16 | before diamond |
+| 300 s | 0 | 14 | before diamond |
+| 420 s | 0 | 12 | before diamond |
+| 600 s | 0 | 11 | before diamond |
 
-- **No run contradicts another, and none needed excusing.** Every run had all three flow echoes and no note. Every expiry was followed by a check that got through, from the same public address and port, so the path was up and only the mapping was gone. No keepalive leaked.
+- **The correction, found the same evening.** For every 120 s expiry, diamond's kernel log holds three `[UFW BLOCK]` lines from `204.210.210.200:3479` to that run's port, a second apart, 6–9 s before the run's record: the three probes, delivered by the friend's router and refused by diamond. diamond's `nf_conntrack_udp_timeout_stream` is 120 s, Linux's default, and nothing in its ufw rules admits the test's random ports, so 120 s after the last packet the reply-only rule no longer matched. For every silence of 180 s or more, no probe reached diamond in any of 61 runs. That expiry is the router's. *(First recorded here, an hour earlier, as the router forgetting between 90 and 120 s. The "reading, not a finding" that 120 s is Linux's default was right about the number and wrong about whose Linux.)*
+- **So the test measures the whole path in**, the host's own firewall included, and the probe cannot see where along the path a packet stopped. Only the kernel log showed it. A follow-up for the probe: record the client's `nf_conntrack_udp_timeout_stream`, so the summary can say when the host's limit, not the router's, is what was found. Measuring the router alone, between 120 and 180 s, needs the client's port admitted by its firewall; nothing now waits on that number.
+- **Both limits are real for a player.** A node behind a host firewall that admits only replies, which is the default posture, meets the 120 s first. diamond's mesh port is admitted by rule (`setup.sh` opens 4001), so its node meets only the router's.
+- **No run contradicts another, and none needed excusing.** Every run had all three flow echoes and no note. Every expiry was followed by a check that got through, from the same public address and port, so the path was up and only the flow's state was gone. No keepalive leaked.
 - **The same at every time of day.** Each quarter of the UTC day shows the same split, so the household's evening traffic does not shorten it.
 - **On time.** Every probe that got in arrived within 90 ms of the silence ending. The public address stayed 75.118.77.81, and the router kept the local port number, in all 138.
-- **A reading, not a finding:** 120 s is Linux's default for a two-way UDP flow, and the least RFC 4787 asks of a NAT, so a Linux-based router left at its defaults would look exactly like this. The test brackets the value; it does not see the router's software.
-- **The bracket is not worth narrowing.** A finer grid could only raise the confirmed-safe figure, and the keepalive it governs costs almost nothing to shorten instead.
-- **The outbound test, alongside, shows what it could not see.** Before the new probe went in, `--mapping-lifetime` on this router said "survived" 24 times at silences of 120 to 600 s, all of which this router does not survive.
+- **The outbound test, alongside, shows what it could not see.** Before the new probe went in, `--mapping-lifetime` on this router said "survived" 24 times at silences of 120 to 600 s, and the router does not survive 180 s or more.
 
-`summarise.py` reports this site as forgetting "somewhere between 90s and 120s". It still gives no mesh-wide keepalive: the home router has no confirmed evidence, because it is the responder's end and has never been measured from outside. Run E does not need it, because riverboat's port 4001 is held open by a NAT-PMP mapping rather than by traffic.
+`summarise.py` reports this site as forgetting "somewhere between 90s and 120s". That is true of the path the test used, and it is not the router. It still gives no mesh-wide keepalive: the home router has no confirmed evidence, because it is the responder's end and has never been measured from outside. Run E does not need it, because riverboat's port 4001 is held open by a NAT-PMP mapping rather than by traffic.
 
 ## Before Run E: what the review's second group changed — 2026-11-14
 
@@ -1320,6 +1321,96 @@ First read, Run D reported **2 orphaned jobs** and **19 unaccounted speculations
 ### What Run D is not
 
 **It is not step 5.** Two internet connections in one household, both machines owned and administered by the operator, one of them a laptop carried to a hotspot for the afternoon. It is the nearest the available rig reaches to a volunteer run and it is not one. **Phase 0 results remain an upper bound**, and this run moves the bound on one axis only: the link is now genuinely lossy, while the machines are still dedicated and still the operator's.
+
+## Run E: handover (2026-11-16) — two households
+
+**What this run tests.** The same takeover criterion as Runs B–D, for the first time between two households on ordinary broadband. `riverboat` is at home behind the home router (`204.210.210.200`); `diamond` is at a friend's house behind theirs (`75.118.77.81`). Run C had a switch between the boxes, and Run D had a phone hotspot. This is the case in between, and the one a real player is in. It is also:
+- the first run with one box unattended in someone else's home, reachable only over its LTE back channel;
+- the first with the review's second group live: the election counts only holders of the same job, checkpoints name their job, and every takeover names the owner it continued;
+- the first with the 40 s keepalive. That should change nothing here, because heartbeats cross every second.
+
+**What would count as failure,** unchanged from Run D:
+- any of the four counts leaving zero (orphaned, doubled, false alarm, unnoticed restart);
+- detection or resume moving off their p95s;
+- ownership churn: yields beyond those the partitions explain.
+
+| | Baseline | Run E | Prediction, fixed before the run |
+|---|---|---|---|
+| Detection p95 | 2463 ms (Run D) | | unchanged, inside 2–3 s |
+| Resume p95 | 200 ms (Run D) | | unchanged, about 200 ms |
+| **Visible gap p95** | 1060 ms (Run C), 1076 ms (Run D) | | **near 1060–1076 ms**: a third path, the same answer |
+| Orphaned / doubled / unnoticed restart | 0 | | must stay 0 |
+| **False alarms** | 0 (Runs B, C), 17 (Run D) | | **0**. Broadband should not produce Run D's multi-second dropouts. A real outage of either household's internet would show here as both sides losing each other with no chaos action behind it, and would be a finding about the link. |
+| Yields beyond the partitions | 0 (Run B), 1 (Run C), 19 (Run D) | | **0–2** |
+| **False suspicion** (abandoned of started) | 0 of 93 (Run C), 36 of 73 (Run D) | | **under 10%**, far nearer Run C than Run D |
+| RTT p50 / p99, from the node's own `rtt` events | 85 / 599 ms (Run D) | | **p50 under 60 ms, p99 under 200 ms.** Two cable networks; the home router does not answer ICMP, so there is no earlier figure. |
+| Mesh bytes, UDP 4001, per box | Run B ~60 MB/h (phone-side); Run D not measurable | | **10–60 MB/h**: well under 1 Mbit/s of either uplink |
+
+About a hundred disruptions are expected: chaos fires every 3–7 minutes on each box, and acts only on the box running the job with a peer present.
+
+**Staged and verified 2026-11-16.**
+- **The build:** `./release.sh` at `974cf23`, `rustc 1.98.0 (88d9e12ae 2026-08-18)`, static musl. `mesh-node` sha256 `62ae4c69fefa42b87e24da349cbad275028f2a7620f44c0973533aafc7dfba1d`, `mesh-probe` `3226fdea…`.
+- **What `~/rune/` holds on both boxes:** the two binaries, `timed-run.sh` and its chaos files, `mesh-node.service`, `logrotate.mesh-probe` and `mesh-node-lan-only.conf`, with a `SHA256SUMS` checked on each box. diamond's copy went over LTE in 24 s (11 MB compressed).
+- **The job:** `factory_job.wasm` is already in place on both, sha256 `9300437c…`, the same as `dist/`.
+- **Rigs on this build:** `migration-rig.sh` passes. `chaos-rig.sh`: see below.
+
+**Found while staging, and handled in the commands below:**
+- **diamond's config had `JOB=""`** from the solo phase. `timed-run.sh` does not set the job. Under the new election a node without the job is never a candidate, so diamond would have been a spectator: every disruption of riverboat would have been an orphan. The commands save diamond's config first with `cp -n`, which `timed-run.sh`'s own `cp -n` then leaves alone, so `--revert` restores the solo config.
+- **diamond's config has no `OWN=` line**, so `timed-run.sh`'s edit of it does nothing. The runner defaults to `no`, which is what diamond should be.
+- **riverboat's unit predated `IPAccounting=yes`**: Run D's unit update reached diamond and yoinkerz only. It is installed here, though Run D showed its counters reset with every restart. **The byte count this run relies on is an `nft` counter table on UDP 4001**, the follow-up Run D wrote down. It only counts, its chains accept everything, and it is separate from chaos's `mesh_chaos` table.
+- **No router change is needed.** riverboat holds `204.210.210.200:4001` by NAT-PMP.
+
+**Commands the human runs.** riverboat first, because it is the reachable end, and its address must be read from its own log.
+
+On **riverboat** (`ssh -t rpc@192.168.50.128`):
+```
+cd ~/rune
+sudo install -m 0755 mesh-probe /usr/local/bin/mesh-probe
+sudo install -m 0644 logrotate.mesh-probe /etc/logrotate.d/mesh-probe
+sudo install -m 0644 mesh-node.service /etc/systemd/system/mesh-node.service && sudo systemctl daemon-reload
+sudo nft -f - <<'EOF'
+table inet rune_bytes {
+    chain in  { type filter hook input  priority 0; policy accept; udp dport 4001 counter }
+    chain out { type filter hook output priority 0; policy accept; udp sport 4001 counter }
+}
+EOF
+sudo ./timed-run.sh --label riverboat --mesh run-e --peer 127.0.0.1 --own --hours 8 --not-a-hotspot
+grep port-mapped /var/log/mesh-node/events.jsonl | tail -1
+```
+- `--peer 127.0.0.1` is a placeholder, as in Run D: `timed-run.sh` requires a peer, and the reachable end dials nobody.
+- The last line must say `"external":"204.210.210.200:4001"`. If the port is not 4001, stop: diamond dials 4001.
+
+Then on **diamond** (from riverboat, `ssh -p 2201 rpc@127.0.0.1`):
+```
+cd ~/rune
+sudo systemctl disable --now mesh-probe-inbound.timer
+sudo install -m 0755 mesh-probe /usr/local/bin/mesh-probe
+sudo install -m 0644 logrotate.mesh-probe /etc/logrotate.d/mesh-probe
+sudo install -D -m 0644 mesh-node-lan-only.conf /etc/systemd/system/mesh-node.service.d/lan-only.conf && sudo systemctl daemon-reload
+sudo cp -n /etc/mesh-node/config /etc/mesh-node/config.before-run-e
+sudo sed -i 's|^JOB=.*|JOB=/var/lib/mesh-node/jobs/factory_job.wasm|' /etc/mesh-node/config
+sudo nft -f - <<'EOF'
+table inet rune_bytes {
+    chain in  { type filter hook input  priority 0; policy accept; udp dport 4001 counter }
+    chain out { type filter hook output priority 0; policy accept; udp sport 4001 counter }
+}
+EOF
+sudo ./timed-run.sh --label diamond --mesh run-e --peer 204.210.210.200 --hours 8 --not-a-hotspot
+```
+- Its wait for the peer should end in `joined`.
+- The idle-timeout test is switched off because it has finished its job.
+- The drop-in confines the node to ethernet and loopback, and takes effect when `timed-run.sh` restarts it.
+
+**During the run** nothing needs to be done at either box. Reading diamond's logs over the back channel is allowed, because management stays off the measured path. If the modem hangs, the recovery added in `0020abb` meets its first real failure.
+
+**Afterwards** — collection, the summary and the byte counts are mine:
+```
+mkdir -p provision/results/run-e/{diamond,riverboat}
+# chaos logs, then events, from each box; diamond's compressed for the LTE link
+cd provision && python3 takeover-summary.py results/run-e/*/events.jsonl results/run-e/*/chaos.jsonl
+sudo nft list table inet rune_bytes      # on each box, then: sudo nft delete table inet rune_bytes
+```
+What each box runs after the run is a separate decision. `--revert` would put riverboat back on Run C's config, which dials diamond's old home address, and put diamond back on its pre-review binary. Neither is wanted.
 
 ## Open decisions
 
