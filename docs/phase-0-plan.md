@@ -1352,7 +1352,7 @@ About a hundred disruptions are expected: chaos fires every 3–7 minutes on eac
 - **The build:** `./release.sh` at `974cf23`, `rustc 1.98.0 (88d9e12ae 2026-08-18)`, static musl. `mesh-node` sha256 `62ae4c69fefa42b87e24da349cbad275028f2a7620f44c0973533aafc7dfba1d`, `mesh-probe` `3226fdea…`.
 - **What `~/rune/` holds on both boxes:** the two binaries, `timed-run.sh` and its chaos files, `mesh-node.service`, `logrotate.mesh-probe` and `mesh-node-lan-only.conf`, with a `SHA256SUMS` checked on each box. diamond's copy went over LTE in 24 s (11 MB compressed).
 - **The job:** `factory_job.wasm` is already in place on both, sha256 `9300437c…`, the same as `dist/`.
-- **Rigs on this build:** `migration-rig.sh` passes. `chaos-rig.sh`: see below.
+- **Rigs on this build:** `migration-rig.sh` passes. `chaos-rig.sh`, 15 min: 20 disruptions, and the four counts that must stay zero all stayed zero. Detection p95 2,494 ms, resume p95 201 ms, visible gap p95 1,143 ms (1,199 ms on `d4739fb`). 17 suspicions, all confirmed. 3 yields, the 3 its partitions explain.
 
 **Found while staging, and handled in the commands below:**
 - **diamond's config had `JOB=""`** from the solo phase. `timed-run.sh` does not set the job. Under the new election a node without the job is never a candidate, so diamond would have been a spectator: every disruption of riverboat would have been an orphan. The commands save diamond's config first with `cp -n`, which `timed-run.sh`'s own `cp -n` then leaves alone, so `--revert` restores the solo config.
