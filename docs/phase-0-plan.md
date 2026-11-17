@@ -1357,7 +1357,7 @@ About a hundred disruptions are expected: chaos fires every 3–7 minutes on eac
 **Found while staging, and handled in the commands below:**
 - **diamond's config had `JOB=""`** from the solo phase. `timed-run.sh` does not set the job. Under the new election a node without the job is never a candidate, so diamond would have been a spectator: every disruption of riverboat would have been an orphan. The commands save diamond's config first with `cp -n`, which `timed-run.sh`'s own `cp -n` then leaves alone, so `--revert` restores the solo config.
 - **diamond's config has no `OWN=` line**, so `timed-run.sh`'s edit of it does nothing. The runner defaults to `no`, which is what diamond should be.
-- **riverboat's unit predated `IPAccounting=yes`**: Run D's unit update reached diamond and yoinkerz only. It is installed here, though Run D showed its counters reset with every restart. **The byte count this run relies on is an `nft` counter table on UDP 4001**, the follow-up Run D wrote down. It only counts, its chains accept everything, and it is separate from chaos's `mesh_chaos` table.
+- **riverboat's unit predated `IPAccounting=yes`**: Run D's unit update reached diamond and yoinkerz only. It is installed here, though Run D showed its counters reset with every restart. **The byte count this run relies on is an `nft` counter table on UDP 4001**, the follow-up Run D wrote down. It only counts, its chains accept everything, and it is separate from chaos's `mesh_chaos` table. *(The first version written here put each chain on one line without a `;` before its closing brace, and `nft` rejected it on riverboat: untested, my error. Nothing was applied, because `nft -f` is all or nothing. The version below was checked with `nft -c`, applied, and seen to count on lightning first.)*
 - **No router change is needed.** riverboat holds `204.210.210.200:4001` by NAT-PMP.
 
 **Commands the human runs.** riverboat first, because it is the reachable end, and its address must be read from its own log.
@@ -1370,8 +1370,14 @@ sudo install -m 0644 logrotate.mesh-probe /etc/logrotate.d/mesh-probe
 sudo install -m 0644 mesh-node.service /etc/systemd/system/mesh-node.service && sudo systemctl daemon-reload
 sudo nft -f - <<'EOF'
 table inet rune_bytes {
-    chain in  { type filter hook input  priority 0; policy accept; udp dport 4001 counter }
-    chain out { type filter hook output priority 0; policy accept; udp sport 4001 counter }
+    chain in {
+        type filter hook input priority 0; policy accept;
+        udp dport 4001 counter
+    }
+    chain out {
+        type filter hook output priority 0; policy accept;
+        udp sport 4001 counter
+    }
 }
 EOF
 sudo ./timed-run.sh --label riverboat --mesh run-e --peer 127.0.0.1 --own --hours 8 --not-a-hotspot
@@ -1391,8 +1397,14 @@ sudo cp -n /etc/mesh-node/config /etc/mesh-node/config.before-run-e
 sudo sed -i 's|^JOB=.*|JOB=/var/lib/mesh-node/jobs/factory_job.wasm|' /etc/mesh-node/config
 sudo nft -f - <<'EOF'
 table inet rune_bytes {
-    chain in  { type filter hook input  priority 0; policy accept; udp dport 4001 counter }
-    chain out { type filter hook output priority 0; policy accept; udp sport 4001 counter }
+    chain in {
+        type filter hook input priority 0; policy accept;
+        udp dport 4001 counter
+    }
+    chain out {
+        type filter hook output priority 0; policy accept;
+        udp sport 4001 counter
+    }
 }
 EOF
 sudo ./timed-run.sh --label diamond --mesh run-e --peer 204.210.210.200 --hours 8 --not-a-hotspot
