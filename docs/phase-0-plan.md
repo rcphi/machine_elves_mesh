@@ -1593,6 +1593,31 @@ The four counts leaving zero would be a failure in their own right, as in every 
 - **Found while staging: yoinkerz's clock.** At boot it was **five hours behind**, at 13:01 UTC against 18:01. Its hardware clock is kept in local time, and NTP corrected the system clock four minutes after boot. The summary matches a chaos action on one machine to a takeover on another within 30 s, so a run started before that sync would have matched nothing. The command block checks for sync first.
 - **The bytes:** the `rune_bytes` nft table goes back on all three boxes, as in Run E. riverboat's and diamond's were deleted after Run E was read.
 
+**Started 2026-11-18:** riverboat armed at 18:27:39 UTC, diamond at 18:29:24 and yoinkerz at 18:31:39. riverboat holds `204.210.210.200:4001` again (`as_asked` true). yoinkerz appears on the carrier as `70.242.158.221:5465`: the carrier does not preserve the port.
+
+### Corrected before part 2, at 18:39 UTC
+
+**The first prediction is failing, and the table's reasoning about two owners was wrong.** Both corrections are written down before riverboat leaves, so that part 2 tests them rather than being explained by them.
+
+- **No direct link has formed.** diamond heard yoinkerz's address from riverboat at 18:31:38 and has dialled it every 2 s since, about 180 attempts in ten minutes. Not one connected. diamond's node has had no incoming connection at all, and its kernel log has no packet from the carrier's address. diamond "sees" yoinkerz only because riverboat forwards its messages, which is what `joined` without `connected` means. Why is not yet known. One possibility is a carrier that gives each destination its own port while the friend's router admits only the exact address and port it sent to. The other is that yoinkerz never dialled diamond. yoinkerz's log will say which.
+- **"Two owners at once: 0, because only riverboat claims on its own" confused claiming with taking over.** `--own` governs only the claim a node makes at startup when nobody answers. Any node holding the job takes over when the owner goes silent, and that is the whole mechanism Runs B–E measured. So with no direct link, losing riverboat splits the mesh in two:
+  - each side hears nothing from the other;
+  - whichever of the pair is standby takes over;
+  - **the job runs twice, once on each side, for all of part 2.**
+- **This has already happened in miniature.** At 18:32:28 yoinkerz's link to riverboat dropped for about a second. yoinkerz lost diamond with it, because diamond's messages reach yoinkerz only through riverboat. riverboat then logged `job-owner yoinkerz` at 18:32:29.680 and `job-owner diamond` 50 ms later: yoinkerz briefly ran the job as owner and stood down when diamond's state reached it again.
+
+**Revised predictions for parts 2 and 3:**
+
+| Question | Revised prediction |
+|---|---|
+| When riverboat leaves | diamond and yoinkerz each see the other vanish within about 2.5 s of riverboat's departure, and **both run the job**. The standby of the two takes over. |
+| Chaos on the pair in part 2 | almost nothing fires: chaos acts only on an owner with a peer present, and neither will have one |
+| The restart questions in the first table | not reached, for the same reason |
+| riverboat returns | both dial it, so it connects both sides again. **One of the two owners yields to the other**, by tick, within seconds. The job's items merge to nothing duplicated, because the same job from the same state makes the same serials. |
+| What part 2 costs | 55 minutes of the job computed twice. That is free for this deterministic job and would not be free for work §9.3 excludes from speculation. |
+
+If this is what happens, it is the first of the two outcomes the handover named: **the pair never connecting directly, so the mesh hangs off its one reachable member.** That means building relaying and coordinated punching before Phase 1.
+
 ## Open decisions
 
 - **The rendezvous fallback**, if no volunteer turns out to be directly reachable. Manual invite exchange covers address distribution but not simultaneous-transmission timing.
