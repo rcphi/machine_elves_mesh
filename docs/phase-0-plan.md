@@ -1543,6 +1543,56 @@ The link stayed up through the run and logged nothing from 00:40 to 14:25 UTC. I
 
 **It is not step 5.** It is the first run between two households, and the link is the kind a real player has. But both machines are the operator's own dedicated, wired, always-on Ubuntu Server boxes, and the data is one night on one pair of cable connections 41 ms apart. **Phase 0 results remain an upper bound.** This run moves the bound on one axis: the mesh met every criterion fixed before the run on an ordinary path between two homes.
 
+## Run F: handover (2026-11-18) — three connections, and the reachable one leaves
+
+**What this run tests.** Every internet run so far had two machines, and one of them was reachable. "One reachable member is enough" holds only while that member stays. Run F has three machines on three connections, only one of them reachable:
+- **`riverboat`, at home:** reachable. It holds `204.210.210.200:4001` by NAT-PMP.
+- **`diamond`, at the friend's house:** the router preserves ports, does not answer NAT-PMP, and admits nothing unsolicited.
+- **`yoinkerz`, on the phone hotspot:** carrier NAT. A new mapping gets a new port, but while a mapping lasts it uses the same port for every destination.
+
+**The node has no relay and no hole-punching protocol.** What it has is cruder. Every node announces the address it sees each peer at: once on first connection, and every 30 s after. A node that hears of a peer it is not connected to dials it at once, then every 2 s. So diamond and yoinkerz each learn the other's public address through riverboat, and both dial. Both NATs keep one public port per socket, which is the condition simultaneous dialling needs.
+
+The run asks two questions:
+1. Is that enough to connect the two unreachable machines directly?
+2. What happens to them when riverboat leaves?
+
+**Three parts, 2 h in all**, the hotspot limit `timed-run.sh` enforces:
+
+| | from yoinkerz's start | |
+|---|---|---|
+| 1 | 0:00–0:45 | All three, chaos on all three. The first three-node run across the internet: when the owner goes, two survivors must settle on one successor. |
+| 2 | 0:45–1:40 | **riverboat leaves:** its chaos is disarmed and its node stopped. Chaos continues on diamond and yoinkerz. |
+| 3 | 1:40–2:00 | riverboat returns, with chaos left off on it. Chaos disarms itself on the other two at 2:00. |
+
+**Two facts about the node decide the second question:**
+- **Memory across a restart:** a node keeps no record of its peers. It restarts knowing only its configured peer, which for both diamond and yoinkerz is riverboat.
+- **Claiming:** only riverboat runs with `--own`. So a node that comes up and finds nobody waits; it never starts a second copy of the job.
+
+| Question | Prediction, fixed before the run |
+|---|---|
+| **Do diamond and yoinkerz connect directly** while riverboat is up? | **Yes**, within a minute of yoinkerz starting. The evidence is a `connected` event on diamond naming the carrier's address. `joined` is not evidence: heartbeats reach a node through riverboat without any direct link. |
+| Part 1: orphaned, doubled, false alarm, unnoticed restart | 0 |
+| Part 1: detection and resume p95 | inside 2–3 s and 500 ms |
+| When riverboat leaves, does the pair stay connected? | Yes. The link is direct, so losing riverboat does not touch it. |
+| **After a restart in part 2, does the restarted node find its peer again?** | **Mostly.** The restarted node knows only riverboat, so re-meeting is up to the survivor. The survivor redials any address it once dialled successfully. Both routers should still hold the old connection's state, since a restart takes seconds and the routers keep idle flows for minutes. **Where the survivor only ever accepted the connection, it has no address to redial.** The restarted node then waits, idle, until riverboat returns. |
+| Part 2: two owners at once | 0, because only riverboat claims on its own |
+| Part 2: a partition of one of the pair | survives: the connection's idle timeout (120 s) outlasts the longest partition (60 s) |
+| riverboat returns | rejoins within seconds, because both nodes are still dialling its configured address. It stands by, and does not claim. |
+| yoinkerz's mesh bytes (UDP 4001, nft) | **40–70 MB for the run.** With three nodes, each standby receives the owner's messages twice, once directly and once forwarded. Run E's 14 MB/h for two nodes becomes about 25 MB/h here, and about 14 MB/h in part 2. |
+| The phone's own counter | **under 150 MB**, the mesh plus the laptop's own traffic, with snap refreshes held |
+
+**What would mean building relaying and coordinated punching before Phase 1:**
+- **the pair never connecting directly.** Then the mesh hangs off riverboat, and losing riverboat ends the pair's redundancy at once;
+- **a restarted node that never finds its peer again** while riverboat is away. That is a mesh that heals only while it has a reachable member, which is the case the plan calls "the case that decides Phase 0".
+
+The four counts leaving zero would be a failure in their own right, as in every earlier run.
+
+**Staged 2026-11-18.**
+- **The build:** the same `974cf23` build as Run E, on all three boxes (`mesh-node` sha256 `62ae4c69…`). yoinkerz's `~/rune` was copied from riverboat's staged set and checked against its `SHA256SUMS`.
+- **yoinkerz's node:** its installed unit already matches the staged one (`IPAccounting=yes`, no interface restriction, which the hotspot needs). Its job file is the same `9300437c…`. It was still running Run D's config and older binary, and is stopped before it leaves home Wi-Fi.
+- **Found while staging: yoinkerz's clock.** At boot it was **five hours behind**, at 13:01 UTC against 18:01. Its hardware clock is kept in local time, and NTP corrected the system clock four minutes after boot. The summary matches a chaos action on one machine to a takeover on another within 30 s, so a run started before that sync would have matched nothing. The command block checks for sync first.
+- **The bytes:** the `rune_bytes` nft table goes back on all three boxes, as in Run E. riverboat's and diamond's were deleted after Run E was read.
+
 ## Open decisions
 
 - **The rendezvous fallback**, if no volunteer turns out to be directly reachable. Manual invite exchange covers address distribution but not simultaneous-transmission timing.
