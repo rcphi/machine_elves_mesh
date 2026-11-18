@@ -16,7 +16,7 @@ mod ledger;
 mod peerbook;
 mod portmap;
 
-use std::collections::{HashMap, HashSet};
+use std::collections::{BTreeSet, HashMap, HashSet};
 use std::time::{Duration, Instant, SystemTime};
 
 use anyhow::{Context, Result};
@@ -1233,6 +1233,76 @@ impl Reachability {
     }
 }
 
+/// How many reachable members an unreachable node keeps introductions on, so
+/// that no single one of them is critical. The operator's call, 2026-11-18.
+const MAX_INTRODUCERS: usize = 3;
+
+/// Which members this node should hold introductions on.
+///
+/// None if this node is reachable itself: others can simply dial it. Otherwise
+/// members whose heartbeat says they are reachable and which this node is
+/// directly connected to — an introduction rides on that connection. Those
+/// already held are kept while they still qualify, so the set does not churn;
+/// the lowest identifiers among the rest fill any places left.
+fn choose_introducers(
+    me_reachable: bool,
+    members: &HashMap<PeerId, Member>,
+    directly_connected: &HashSet<PeerId>,
+    held: &BTreeSet<PeerId>,
+    max: usize,
+) -> BTreeSet<PeerId> {
+    if me_reachable {
+        return BTreeSet::new();
+    }
+    let qualifies = |peer: &PeerId| {
+        directly_connected.contains(peer) && members.get(peer).is_some_and(|m| m.reachable)
+    };
+    let mut chosen: BTreeSet<PeerId> = held.iter().filter(|p| qualifies(p)).copied().take(max).collect();
+    let mut others: Vec<PeerId> = members.keys().filter(|p| qualifies(p) && !chosen.contains(p)).copied().collect();
+    others.sort();
+    for peer in others {
+        if chosen.len() >= max {
+            break;
+        }
+        chosen.insert(peer);
+    }
+    chosen
+}
+
+/// Whether an address goes through an introducer.
+fn is_relayed(addr: &Multiaddr) -> bool {
+    addr.iter().any(|p| matches!(p, libp2p::multiaddr::Protocol::P2pCircuit))
+}
+
+/// The address to listen on for introductions through `relay`, reached at
+/// `relay_addr`: `relay_addr/p2p/<relay>/p2p-circuit`, naming the relay once.
+fn circuit_listen_addr(relay_addr: &Multiaddr, relay: PeerId) -> Multiaddr {
+    use libp2p::multiaddr::Protocol;
+    let mut addr = relay_addr.clone();
+    if !matches!(addr.iter().last(), Some(Protocol::P2p(p)) if p == relay) {
+        addr.push(Protocol::P2p(relay));
+    }
+    addr.with(Protocol::P2pCircuit)
+}
+
+/// The peer an address names last, if it names one.
+fn last_peer(addr: &Multiaddr) -> Option<PeerId> {
+    match addr.iter().last() {
+        Some(libp2p::multiaddr::Protocol::P2p(peer)) => Some(peer),
+        _ => None,
+    }
+}
+
+/// `addr` ending in `/p2p/<peer>`, which dialling through a circuit needs.
+fn dialable(addr: &Multiaddr, peer: PeerId) -> Multiaddr {
+    use libp2p::multiaddr::Protocol;
+    if matches!(addr.iter().last(), Some(Protocol::P2p(p)) if p == peer) {
+        addr.clone()
+    } else {
+        addr.clone().with(Protocol::P2p(peer))
+    }
+}
+
 fn build_swarm(config: &Config, keypair: libp2p::identity::Keypair) -> Result<libp2p::Swarm<MeshBehaviour>> {
     let swarm = libp2p::SwarmBuilder::with_existing_identity(keypair)
         .with_tokio()
@@ -1293,6 +1363,16 @@ async fn run(config: Config) -> Result<()> {
     let keypair = load_or_create_identity(&config)?;
     let mut swarm = build_swarm(&config, keypair)?;
     let mut reachability = Reachability::default();
+    // Introducers this node holds, by the listener each one's circuit is on.
+    let mut introducers: HashMap<PeerId, libp2p::core::transport::ListenerId> = HashMap::new();
+    // This node's addresses through its introducers, announced like any other.
+    let mut circuit_addrs: BTreeSet<Multiaddr> = BTreeSet::new();
+    // Other members' addresses through their introducers, kept so that losing
+    // a direct link to one of them can try a punch again.
+    let mut circuits_of: HashMap<PeerId, Vec<Multiaddr>> = HashMap::new();
+    // Connections that do not go through anyone, by connection, so that an
+    // introduction is only ever made over a direct one.
+    let mut direct: HashMap<libp2p::swarm::ConnectionId, PeerId> = HashMap::new();
 
     let topic = gossipsub::IdentTopic::new(heartbeat_topic(&config.mesh));
     swarm.behaviour_mut().gossipsub.subscribe(&topic)?;
@@ -1496,6 +1576,12 @@ async fn run(config: Config) -> Result<()> {
                 }
 
                 for addr in &dials.due(Instant::now()) {
+                    // A punch to a peer already connected — through an
+                    // introduction that is still open — would only open a
+                    // second one. The attempt is spent; the backoff goes on.
+                    if is_relayed(addr) && last_peer(addr).is_some_and(|p| swarm.is_connected(&p)) {
+                        continue;
+                    }
                     // Failures are expected and frequent: until the other side
                     // is also sending, there is nothing at the far end willing
                     // to answer. The attempt is worth making anyway, because
@@ -1608,6 +1694,13 @@ async fn run(config: Config) -> Result<()> {
                 for (peer, addr) in &seen_at {
                     let _ = swarm.behaviour_mut().gossipsub
                         .publish(topic.clone(), encode_observed(&config.label, peer, addr));
+                }
+                // Where this node can be reached through its introducers. A
+                // member that cannot reach it directly dials one of these, and
+                // the introduction is what lets DCUtR time their punch.
+                for addr in &circuit_addrs {
+                    let _ = swarm.behaviour_mut().gossipsub
+                        .publish(topic.clone(), encode_observed(&config.label, &me, addr));
                 }
             }
 
@@ -1756,6 +1849,36 @@ async fn run(config: Config) -> Result<()> {
 
             _ = sweep.tick() => {
                 let now = Instant::now();
+                // Introductions: held on up to MAX_INTRODUCERS reachable members
+                // this node is directly connected to, and none if it is
+                // reachable itself. Each rides on that direct connection.
+                {
+                    let direct_peers: HashSet<PeerId> = direct.values().copied().collect();
+                    let held: BTreeSet<PeerId> = introducers.keys().copied().collect();
+                    let chosen = choose_introducers(reachability.is_reachable(), &members,
+                                                    &direct_peers, &held, MAX_INTRODUCERS);
+                    for peer in held.difference(&chosen) {
+                        if let Some(id) = introducers.remove(peer) {
+                            swarm.remove_listener(id);
+                        }
+                    }
+                    for peer in chosen.difference(&held) {
+                        let Some(addr) = seen_at.get(peer).filter(|a| !is_relayed(a)).cloned() else { continue };
+                        match swarm.listen_on(circuit_listen_addr(&addr, *peer)) {
+                            Ok(id) => {
+                                introducers.insert(*peer, id);
+                            }
+                            Err(error) => {
+                                if let Some(repeats) = quiet.say("introducer", now) {
+                                    emit(&config, "introducer-lost",
+                                         &format!("could not ask for an introduction: {error}"),
+                                         &[("peer_id", &peer.to_string()), ("error", &error.to_string()),
+                                           ("repeats", &repeats.to_string())]);
+                                }
+                            }
+                        }
+                    }
+                }
                 if book_dirty && book_saved_at.is_none_or(|at| now.duration_since(at) >= BOOK_SAVE_EVERY) {
                     book_saved_at = Some(now);
                     match book.save(&book_path) {
@@ -1929,11 +2052,17 @@ async fn run(config: Config) -> Result<()> {
             }
 
             event = swarm.select_next_some() => match event {
-                SwarmEvent::ConnectionEstablished { peer_id, endpoint, .. } => {
+                SwarmEvent::ConnectionEstablished { peer_id, connection_id, endpoint, .. } => {
                     connected_at.entry(peer_id).or_insert_with(Instant::now);
-                    // Every address tagged with this peer stops being dialled,
-                    // whichever side opened the connection.
-                    dials.forget_peer(&peer_id);
+                    let relayed = is_relayed(endpoint.get_remote_address());
+                    if !relayed {
+                        // Every address tagged with this peer stops being
+                        // dialled, whichever side opened the connection. Not
+                        // for an introduction: that closes at its limit, and
+                        // the punch it was for must be tried again later.
+                        dials.forget_peer(&peer_id);
+                        direct.insert(connection_id, peer_id);
+                    }
                     // Stop dialling this one. The address matched must be the
                     // address *we asked for*, not the one the connection ended
                     // up on: a peer dialled at one address commonly answers
@@ -1943,7 +2072,7 @@ async fn run(config: Config) -> Result<()> {
                     // for the rest of the run.
                     let reached = endpoint.get_remote_address().clone();
                     let before = dials.len();
-                    if let libp2p::core::ConnectedPoint::Dialer { address, .. } = &endpoint {
+                    if let (false, libp2p::core::ConnectedPoint::Dialer { address, .. }) = (relayed, &endpoint) {
                         dials.remove(address);
                         // Every address known to reach this peer comes off the
                         // list, not only the one that happened to succeed.
@@ -1971,6 +2100,7 @@ async fn run(config: Config) -> Result<()> {
                          &format!("reached {peer_id} at {reached}"),
                          &[("peer_id", &peer_id.to_string()),
                            ("addr", &reached.to_string()),
+                           ("relayed", if relayed { "true" } else { "false" }),
                            ("after_attempts", &dial_attempts.to_string()),
                            ("still_pending", &dials.len().to_string())]);
                     if before > 0 && dials.len() == 0 {
@@ -1982,8 +2112,12 @@ async fn run(config: Config) -> Result<()> {
                     // announcement, an announcement prompts everyone to dial,
                     // and each dial makes another connection. Two nodes
                     // produced dozens within a second, all to each other.
-                    let is_news = seen_at.get(&peer_id) != Some(&reached);
-                    seen_at.insert(peer_id, reached.clone());
+                    // Only direct addresses: where a member sees a peer, not
+                    // which introducer carried a punch to it.
+                    let is_news = !relayed && seen_at.get(&peer_id) != Some(&reached);
+                    if !relayed {
+                        seen_at.insert(peer_id, reached.clone());
+                    }
                     if is_news {
                         // A newcomer is dialled by the whole mesh in the same
                         // moment, while it dials back — which is the only way
@@ -2020,6 +2154,9 @@ async fn run(config: Config) -> Result<()> {
                 }
 
                 SwarmEvent::NewListenAddr { address, .. } => {
+                    if is_relayed(&address) {
+                        circuit_addrs.insert(address.clone());
+                    }
                     emit(&config, "listening", &format!("listening on {address}"),
                          &[("addr", &address.to_string())]);
                 }
@@ -2275,6 +2412,18 @@ async fn run(config: Config) -> Result<()> {
                                 }
                                 continue;
                             }
+                            // An address through an introducer is dialled as
+                            // a punch: named with its peer, on the circuit
+                            // schedule, and remembered so that losing a direct
+                            // link to this peer can try again.
+                            let relayed = is_relayed(&addr);
+                            let addr = if relayed { dialable(&addr, peer) } else { addr };
+                            if relayed {
+                                let known = circuits_of.entry(peer).or_default();
+                                if !known.contains(&addr) {
+                                    known.push(addr.clone());
+                                }
+                            }
                             // Already connected, already trying, or already
                             // known to reach a peer we have — each is a reason
                             // not to dial again, and the last one matters most
@@ -2293,7 +2442,8 @@ async fn run(config: Config) -> Result<()> {
                             // Dial immediately as well as adding to the retry
                             // list. Everyone who heard this is dialling now,
                             // and arriving together is the entire point.
-                            if dials.add(addr.clone(), dialing::Kind::Observed, Some(peer), Instant::now()) {
+                            let kind = if relayed { dialing::Kind::Circuit } else { dialing::Kind::Observed };
+                            if dials.add(addr.clone(), kind, Some(peer), Instant::now()) {
                                 let _ = swarm.dial(addr);
                             }
                         }
@@ -2395,7 +2545,15 @@ async fn run(config: Config) -> Result<()> {
                     }
                 }
 
-                SwarmEvent::ConnectionClosed { peer_id, num_established, .. } => {
+                SwarmEvent::ConnectionClosed { peer_id, connection_id, num_established, .. } => {
+                    // A direct link lost: if this peer can be reached through
+                    // an introducer, one punch is tried at once (each address
+                    // is new to the schedule) and the circuit backoff follows.
+                    if direct.remove(&connection_id).is_some() && !direct.values().any(|p| *p == peer_id) {
+                        for addr in circuits_of.get(&peer_id).into_iter().flatten() {
+                            dials.add(addr.clone(), dialing::Kind::Circuit, Some(peer_id), Instant::now());
+                        }
+                    }
                     // Only the last connection closing means the transport is
                     // fully gone; a node may hold several at once, commonly one
                     // over QUIC and one over TCP.
@@ -2415,6 +2573,46 @@ async fn run(config: Config) -> Result<()> {
                         // one every time anything happens.
                         redial_lost_peer(&config, &peer_id, &reached_by,
                                          &mut dials, &mut dial_attempts);
+                    }
+                }
+
+                SwarmEvent::ExpiredListenAddr { address, .. } => {
+                    circuit_addrs.remove(&address);
+                }
+
+                SwarmEvent::ListenerClosed { listener_id, reason, addresses, .. } => {
+                    for address in &addresses {
+                        circuit_addrs.remove(address);
+                    }
+                    if let Some(peer) = introducers.iter().find(|(_, id)| **id == listener_id).map(|(p, _)| *p) {
+                        introducers.remove(&peer);
+                        let error = match reason { Ok(()) => "closed".to_string(), Err(e) => e.to_string() };
+                        emit(&config, "introducer-lost", &format!("an introducer stopped: {error}"),
+                             &[("peer_id", &peer.to_string()),
+                               ("label", &members.get(&peer).map(|m| m.label.clone()).unwrap_or_default()),
+                               ("error", &error)]);
+                    }
+                }
+
+                SwarmEvent::Behaviour(MeshBehaviourEvent::RelayClient(
+                    relay::client::Event::ReservationReqAccepted { relay_peer_id, renewal: false, .. },
+                )) => {
+                    let label = members.get(&relay_peer_id).map(|m| m.label.clone()).unwrap_or_default();
+                    emit(&config, "introducer-held",
+                         &format!("{label} will introduce this node to members it cannot reach"),
+                         &[("peer_id", &relay_peer_id.to_string()), ("label", &label)]);
+                }
+
+                SwarmEvent::Behaviour(MeshBehaviourEvent::Dcutr(dcutr::Event { remote_peer_id, result })) => {
+                    let label = members.get(&remote_peer_id).map(|m| m.label.clone()).unwrap_or_default();
+                    match result {
+                        Ok(_) => emit(&config, "punch-succeeded",
+                                      &format!("punched through to {label}: a direct link, no longer through anyone"),
+                                      &[("peer_id", &remote_peer_id.to_string()), ("label", &label)]),
+                        Err(error) => emit(&config, "punch-failed",
+                                           &format!("could not punch through to {label}: {error}"),
+                                           &[("peer_id", &remote_peer_id.to_string()), ("label", &label),
+                                             ("error", &error.to_string())]),
                     }
                 }
 
@@ -2958,6 +3156,88 @@ mod tests {
     /// runs full of disruptions, with backlogs seconds deep rather than days.
     /// `--no-mdns` must mean no mDNS behaviour, not an idle one: the idle one
     /// still joined 224.0.0.251 on every interface, LTE included.
+    fn reachable_member(reachable: bool) -> Member {
+        Member { label: "peer".into(), joined: Instant::now(), last_heard: Instant::now(),
+                 disconnected: false, run: Some(1), holding: Holding::Job(TEST_JOB), reachable }
+    }
+
+    /// Peers in ascending order, so "the lowest" is checkable.
+    fn sorted_peers(n: usize) -> Vec<PeerId> {
+        let mut peers: Vec<PeerId> = (0..n).map(|_| PeerId::random()).collect();
+        peers.sort();
+        peers
+    }
+
+    #[test]
+    fn a_reachable_node_holds_no_introducers() {
+        let p = sorted_peers(1);
+        let members = HashMap::from([(p[0], reachable_member(true))]);
+        let connected = HashSet::from([p[0]]);
+        assert!(choose_introducers(true, &members, &connected, &BTreeSet::new(), MAX_INTRODUCERS).is_empty());
+    }
+
+    #[test]
+    fn introducers_are_reachable_members_this_node_is_directly_connected_to() {
+        let p = sorted_peers(3);
+        let members = HashMap::from([
+            (p[0], reachable_member(true)),  // reachable, but not connected
+            (p[1], reachable_member(false)), // connected, but not reachable
+            (p[2], reachable_member(true)),  // both
+        ]);
+        let connected = HashSet::from([p[1], p[2]]);
+        assert_eq!(choose_introducers(false, &members, &connected, &BTreeSet::new(), MAX_INTRODUCERS),
+                   BTreeSet::from([p[2]]));
+    }
+
+    #[test]
+    fn at_most_three_introducers_and_the_ones_already_held_are_kept() {
+        assert_eq!(MAX_INTRODUCERS, 3);
+        let p = sorted_peers(5);
+        let members: HashMap<PeerId, Member> = p.iter().map(|&q| (q, reachable_member(true))).collect();
+        let connected: HashSet<PeerId> = p.iter().copied().collect();
+        let held = BTreeSet::from([p[4]]);
+        assert_eq!(choose_introducers(false, &members, &connected, &held, MAX_INTRODUCERS),
+                   BTreeSet::from([p[0], p[1], p[4]]),
+                   "the one held stays, and the lowest of the rest fill the other places");
+    }
+
+    #[test]
+    fn an_introducer_that_stops_being_reachable_is_dropped() {
+        let p = sorted_peers(2);
+        let members = HashMap::from([(p[0], reachable_member(false)), (p[1], reachable_member(true))]);
+        let connected = HashSet::from([p[0], p[1]]);
+        let held = BTreeSet::from([p[0]]);
+        assert_eq!(choose_introducers(false, &members, &connected, &held, MAX_INTRODUCERS),
+                   BTreeSet::from([p[1]]));
+    }
+
+    #[test]
+    fn a_circuit_address_is_recognised_and_a_direct_one_is_not() {
+        let relay = PeerId::random();
+        let direct: Multiaddr = "/ip4/204.210.210.200/udp/4001/quic-v1".parse().unwrap();
+        assert!(!is_relayed(&direct));
+        assert!(is_relayed(&circuit_listen_addr(&direct, relay)));
+    }
+
+    #[test]
+    fn a_circuit_listen_address_names_the_relay_once() {
+        let relay = PeerId::random();
+        let bare: Multiaddr = "/ip4/204.210.210.200/udp/4001/quic-v1".parse().unwrap();
+        let named = bare.clone().with(libp2p::multiaddr::Protocol::P2p(relay));
+        let want: Multiaddr = format!("{bare}/p2p/{relay}/p2p-circuit").parse().unwrap();
+        assert_eq!(circuit_listen_addr(&bare, relay), want);
+        assert_eq!(circuit_listen_addr(&named, relay), want);
+    }
+
+    #[test]
+    fn a_dialable_address_names_its_peer_once() {
+        let (relay, peer) = (PeerId::random(), PeerId::random());
+        let circuit = circuit_listen_addr(&"/ip4/192.0.2.10/udp/4001/quic-v1".parse().unwrap(), relay);
+        let want: Multiaddr = format!("{circuit}/p2p/{peer}").parse().unwrap();
+        assert_eq!(dialable(&circuit, peer), want);
+        assert_eq!(dialable(&want, peer), want);
+    }
+
     #[tokio::test]
     async fn the_swarm_builds_with_relaying_and_punching() {
         let mut config = default_config();

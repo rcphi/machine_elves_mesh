@@ -117,6 +117,7 @@ impl PeerBook {
         self.entries.values().filter(|e| e.reachable).flat_map(|e| e.addrs.iter().cloned()).collect()
     }
 
+    #[cfg(test)]
     pub fn get(&self, peer: &PeerId) -> Option<&Remembered> {
         self.entries.get(peer)
     }
