@@ -55,6 +55,9 @@ NOTABLE = {
     "ledger-saved-again": "wrote down {retried} items an earlier attempt could not",
     "ledger-comparing": "found {buckets} of 256 inventory buckets differing from {label}'s",
     "ledger-repairing": "sent {label} {items} items from {cells} differing cells of bucket {bucket}",
+    # Who it remembers.
+    "peer-book-loaded": "remembered {peers} peers ({skipped} unreadable lines skipped)",
+    "peer-book-not-saved": "could not write the peer book: {error}",
 }
 
 

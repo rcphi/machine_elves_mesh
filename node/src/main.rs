@@ -13,6 +13,7 @@
 mod dialing;
 mod job;
 mod ledger;
+mod peerbook;
 mod portmap;
 
 use std::collections::{HashMap, HashSet};
@@ -229,6 +230,10 @@ const DEFAULT_PORT: u16 = 4001;
 /// them sending outward at once, and each attempt is a packet outward. Whoever
 /// starts second would fail permanently if the first had given up.
 const DIAL_RETRY: Duration = Duration::from_secs(2);
+
+/// How often, at most, the peer book is written. It changes when a peer is
+/// first dialled or named, which is rare once a mesh has settled.
+const BOOK_SAVE_EVERY: Duration = Duration::from_secs(10);
 
 /// The retry timer, built so that a quiet mesh does not store up work for it.
 ///
@@ -574,6 +579,8 @@ struct Config {
     /// memory, a ledger was a tally of the current session wearing the name of
     /// a permanent record.
     ledger: String,
+    /// Where remembered peers live between runs. See [`peerbook`].
+    peer_book: String,
     /// Whether to ask the router to forward this node's port.
     ///
     /// On by default. A mesh where nobody is reachable cannot admit anyone it
@@ -896,6 +903,7 @@ fn parse_args() -> Result<Config> {
         port: DEFAULT_PORT,
         identity: "/var/lib/mesh-node/identity".to_string(),
         ledger: "/var/lib/mesh-node/ledger".to_string(),
+        peer_book: "/var/lib/mesh-node/peers".to_string(),
         map_port: true,
         mdns: true,
         own: false,
@@ -933,6 +941,7 @@ fn parse_args() -> Result<Config> {
             "--port" => config.port = args.next().context("--port needs a number")?.parse()?,
             "--identity" => config.identity = args.next().context("--identity needs a path")?,
             "--ledger" => config.ledger = args.next().context("--ledger needs a path")?,
+            "--peer-book" => config.peer_book = args.next().context("--peer-book needs a path")?,
             "--keepalive-ms" => {
                 config.keepalive = Duration::from_millis(
                     args.next().context("--keepalive-ms needs a number")?.parse()?,
@@ -1072,6 +1081,8 @@ fn print_usage() {
     println!("  --ledger <file>      where to keep what this node knows exists, so an");
     println!("                       inventory outlives the process that built it");
     println!("                       (default /var/lib/mesh-node/ledger)");
+    println!("  --peer-book <file>   where to remember peers, so a restarted node can find");
+    println!("                       its way back in (default /var/lib/mesh-node/peers)");
     println!("  --mesh <name>        which mesh to join (default \"default\"). Nodes in");
     println!("                       different meshes ignore each other entirely");
     println!("  --job <file.wasm>    hold this job, ready to run or to continue it");
@@ -1209,6 +1220,29 @@ async fn run(config: Config) -> Result<()> {
     for addr in &config.dial {
         dials.add(addr.clone(), dialing::Kind::Configured, None, Instant::now());
     }
+    // Remembered peers that were reachable are dialled as well, so that a node
+    // whose configured peer has gone can still find its way back in.
+    let book_path = std::path::PathBuf::from(&config.peer_book);
+    let mut book = match peerbook::PeerBook::load(&book_path) {
+        Ok((book, skipped)) => {
+            emit(&config, "peer-book-loaded",
+                 &format!("remembered {} peers ({skipped} unreadable lines skipped)", book.len()),
+                 &[("peers", &book.len().to_string()), ("skipped", &skipped.to_string())]);
+            book
+        }
+        Err(error) => {
+            emit(&config, "peer-book-loaded",
+                 &format!("could not read {}: {error}; remembering nobody", config.peer_book),
+                 &[("peers", "0"), ("skipped", "0"), ("error", &error.to_string())]);
+            peerbook::PeerBook::default()
+        }
+    };
+    for addr in book.addresses_to_dial() {
+        dials.add(addr, dialing::Kind::Remembered, None, Instant::now());
+    }
+    // Written at most every BOOK_SAVE_EVERY, and only when something changed.
+    let mut book_dirty = false;
+    let mut book_saved_at: Option<Instant> = None;
     // Which address reached which peer, so that losing the peer puts the
     // address back on the list. Without this a node dials until it succeeds
     // once and then never again: the first disconnection is permanent, and no
@@ -1631,6 +1665,19 @@ async fn run(config: Config) -> Result<()> {
 
             _ = sweep.tick() => {
                 let now = Instant::now();
+                if book_dirty && book_saved_at.is_none_or(|at| now.duration_since(at) >= BOOK_SAVE_EVERY) {
+                    book_saved_at = Some(now);
+                    match book.save(&book_path) {
+                        Ok(()) => book_dirty = false,
+                        Err(error) => {
+                            if let Some(repeats) = quiet.say("peer-book", now) {
+                                emit(&config, "peer-book-not-saved",
+                                     &format!("could not write the peer book: {error}"),
+                                     &[("error", &error.to_string()), ("repeats", &repeats.to_string())]);
+                            }
+                        }
+                    }
+                }
                 let gone: Vec<PeerId> = members
                     .iter()
                     .filter(|(_, m)| now.duration_since(m.last_heard) > config.detect)
@@ -1825,6 +1872,9 @@ async fn run(config: Config) -> Result<()> {
                         if !known.contains(address) {
                             known.push(address.clone());
                         }
+                        if book.dialled(peer_id, address, now_millis() as u64) {
+                            book_dirty = true;
+                        }
                     }
                     emit(&config, "connected",
                          &format!("reached {peer_id} at {reached}"),
@@ -1940,6 +1990,9 @@ async fn run(config: Config) -> Result<()> {
                             holding: Holding::Unknown,
                         });
                         once_members.insert(source);
+                        if book.named(source, &label) {
+                            book_dirty = true;
+                        }
                         emit(&config, "joined", &format!("{label} joined"),
                              &[("peer_id", &source.to_string()), ("label", &label)]);
                         // Answer immediately rather than waiting for the next

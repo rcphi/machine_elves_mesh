@@ -65,8 +65,8 @@ run_case() {
     # Each node needs a port, an identity and an inventory of its own. The
     # defaults suit one node per machine; on one host, every node would share
     # port 4001 and all but the first would fail to start.
-    own_files() { echo --port "$1" --no-map-port --identity "$OUT/$2.identity" --ledger "$OUT/$2.ledger"; }
-    rm -f "$OUT"/*.identity "$OUT"/*.ledger
+    own_files() { echo --port "$1" --no-map-port --identity "$OUT/$2.identity" --ledger "$OUT/$2.ledger" --peer-book "$OUT/$2.peers"; }
+    rm -f "$OUT"/*.identity "$OUT"/*.ledger "$OUT"/*.peers
 
     # shellcheck disable=SC2046
     "$BIN" --label owner --mesh "$mesh" --job "$JOB" --own --detect-ms "$DETECT_MS" --json \
@@ -173,14 +173,14 @@ run_case() {
 # so this is the ordinary case, not a contrived one.
 return_case() {
     local signal="$1" name="$2" budget_ms=8000
-    rm -f "$OUT"/*.log "$OUT"/*.identity "$OUT"/*.ledger
+    rm -f "$OUT"/*.log "$OUT"/*.identity "$OUT"/*.ledger "$OUT"/*.peers
     cleanup
     local mesh="rig-$$-$RANDOM-return"
 
     start_node() {
         "$BIN" --label "$1" --mesh "$mesh" --json --detect-ms "$DETECT_MS" \
             --port "$2" --no-map-port --no-mdns --peer "/ip4/127.0.0.1/udp/$3/quic-v1" \
-            --identity "$OUT/$1.identity" --ledger "$OUT/$1.ledger" "${EXTRA[@]}" >> "$OUT/$1.log" 2>&1 &
+            --identity "$OUT/$1.identity" --ledger "$OUT/$1.ledger" --peer-book "$OUT/$1.peers" "${EXTRA[@]}" >> "$OUT/$1.log" 2>&1 &
         pids+=($!)
     }
     start_node stays $((BASE + 11)) $((BASE + 12))
