@@ -23,7 +23,7 @@ use anyhow::{Context, Result};
 use futures::StreamExt;
 use libp2p::swarm::behaviour::toggle::Toggle;
 use libp2p::swarm::SwarmEvent;
-use libp2p::{gossipsub, identify, mdns, noise, ping, tcp, yamux, Multiaddr, PeerId};
+use libp2p::{autonat, dcutr, gossipsub, identify, mdns, noise, ping, relay, tcp, yamux, Multiaddr, PeerId};
 
 /// The topic nodes of one mesh publish to, namespaced by the mesh's name.
 ///
@@ -525,6 +525,19 @@ const DEFAULT_DETECT_MS: u64 = 2_000;
 
 #[derive(libp2p::swarm::NetworkBehaviour)]
 struct MeshBehaviour {
+    /// Introduces two members that cannot reach each other, so that DCUtR can
+    /// time their punch. On every node, because behaviours are fixed when the
+    /// swarm is built and reachability changes while it runs; who is *asked*
+    /// to introduce is decided by the heartbeat's reachable flag. Default
+    /// limits: see [`relay_config`].
+    relay: relay::Behaviour,
+    relay_client: relay::client::Behaviour,
+    /// Coordinated hole punching over an introduction.
+    dcutr: dcutr::Behaviour,
+    /// Whether members can reach this node: a member dials back, and only a
+    /// connection that arrives counts. Members are the only servers asked.
+    autonat_client: autonat::v2::client::Behaviour,
+    autonat_server: autonat::v2::server::Behaviour,
     /// Carries heartbeats. Gossip rather than direct messaging, so that
     /// membership does not require every node to hold a connection to every
     /// other — §11.6 rules out a full mesh.
@@ -905,8 +918,9 @@ fn main() -> Result<()> {
     runtime.block_on(run(config))
 }
 
-fn parse_args() -> Result<Config> {
-    let mut config = Config {
+/// Every setting at its default, as a node started with no flags has them.
+fn default_config() -> Config {
+    Config {
         label: hostname(),
         listen: Vec::new(),
         dial: Vec::new(),
@@ -925,7 +939,11 @@ fn parse_args() -> Result<Config> {
         map_port: true,
         mdns: true,
         own: false,
-    };
+    }
+}
+
+fn parse_args() -> Result<Config> {
+    let mut config = default_config();
 
     let mut args = std::env::args().skip(1);
     while let Some(arg) = args.next() {
@@ -1178,9 +1196,45 @@ fn load_or_create_identity(config: &Config) -> Result<libp2p::identity::Keypair>
     Ok(keypair)
 }
 
-async fn run(config: Config) -> Result<()> {
-    let keypair = load_or_create_identity(&config)?;
-    let mut swarm = libp2p::SwarmBuilder::with_existing_identity(keypair)
+/// The relay at libp2p's defaults: 2 minutes and 128 KiB per introduction.
+fn relay_config() -> relay::Config {
+    relay::Config::default()
+}
+
+/// How often AutoNAT asks a member to dial this node back. Its own default is
+/// every 5 s.
+const AUTONAT_PROBE_EVERY: Duration = Duration::from_secs(60);
+/// How many of this node's candidate addresses it tests.
+const AUTONAT_MAX_CANDIDATES: usize = 4;
+
+/// Whether a member has confirmed it can reach this node, at any address.
+#[derive(Default)]
+struct Reachability {
+    confirmed: std::collections::BTreeSet<Multiaddr>,
+}
+
+impl Reachability {
+    /// Records a confirmed address; true when this makes the node reachable.
+    fn confirm(&mut self, addr: Multiaddr) -> bool {
+        let was = self.is_reachable();
+        self.confirmed.insert(addr);
+        !was
+    }
+
+    /// Forgets an address; true when the last one goes.
+    fn expire(&mut self, addr: &Multiaddr) -> bool {
+        let was = self.is_reachable();
+        self.confirmed.remove(addr);
+        was && !self.is_reachable()
+    }
+
+    fn is_reachable(&self) -> bool {
+        !self.confirmed.is_empty()
+    }
+}
+
+fn build_swarm(config: &Config, keypair: libp2p::identity::Keypair) -> Result<libp2p::Swarm<MeshBehaviour>> {
+    let swarm = libp2p::SwarmBuilder::with_existing_identity(keypair)
         .with_tokio()
         .with_tcp(
             tcp::Config::default(),
@@ -1188,7 +1242,9 @@ async fn run(config: Config) -> Result<()> {
             yamux::Config::default,
         )?
         .with_quic()
-        .with_behaviour(|key| {
+        .with_relay_client(noise::Config::new, yamux::Config::default)?
+        .with_behaviour(|key, relay_client| {
+            let me = key.public().to_peer_id();
             let keepalive = config.keepalive;
             let use_mdns = config.mdns;
             let gossipsub = gossipsub::Behaviour::new(
@@ -1214,12 +1270,29 @@ async fn run(config: Config) -> Result<()> {
                 // them open, rather than because gossip happens to be chatty
                 // enough this week.
                 ping: ping::Behaviour::new(ping::Config::new().with_interval(keepalive)),
+                relay: relay::Behaviour::new(me, relay_config()),
+                relay_client,
+                dcutr: dcutr::Behaviour::new(me),
+                autonat_client: autonat::v2::client::Behaviour::new(
+                    rand_core::OsRng,
+                    autonat::v2::client::Config::default()
+                        .with_probe_interval(AUTONAT_PROBE_EVERY)
+                        .with_max_candidates(AUTONAT_MAX_CANDIDATES),
+                ),
+                autonat_server: autonat::v2::server::Behaviour::default(),
             })
         })?
         // Comfortably longer than the keepalive, or a connection would be
         // dropped for idleness between the very pokes meant to preserve it.
         .with_swarm_config(|c| c.with_idle_connection_timeout(config.keepalive * 3))
         .build();
+    Ok(swarm)
+}
+
+async fn run(config: Config) -> Result<()> {
+    let keypair = load_or_create_identity(&config)?;
+    let mut swarm = build_swarm(&config, keypair)?;
+    let mut reachability = Reachability::default();
 
     let topic = gossipsub::IdentTopic::new(heartbeat_topic(&config.mesh));
     swarm.behaviour_mut().gossipsub.subscribe(&topic)?;
@@ -1544,7 +1617,7 @@ async fn run(config: Config) -> Result<()> {
                 // is the only one subscribed to the topic; `published` says so
                 // only for the failures that are not that.
                 published(&config, &mut quiet, "heartbeat", swarm.behaviour_mut().gossipsub
-                    .publish(topic.clone(), encode_heartbeat(&config.label, counter, run, my_job.as_ref(), false)));
+                    .publish(topic.clone(), encode_heartbeat(&config.label, counter, run, my_job.as_ref(), reachability.is_reachable())));
             }
 
             _ = job_tick.tick() => {
@@ -2021,7 +2094,7 @@ async fn run(config: Config) -> Result<()> {
                         // else is also continuing.
                         counter += 1;
                         let _ = swarm.behaviour_mut().gossipsub
-                            .publish(topic.clone(), encode_heartbeat(&config.label, counter, run, my_job.as_ref(), false));
+                            .publish(topic.clone(), encode_heartbeat(&config.label, counter, run, my_job.as_ref(), reachability.is_reachable()));
                         // And say what we hold, for the same reason. A node
                         // that has just arrived has missed everything made
                         // before it did, and waiting for the periodic digest
@@ -2045,6 +2118,9 @@ async fn run(config: Config) -> Result<()> {
                         if let Some(member) = members.get_mut(&source) {
                             member.holding = *holding;
                             member.reachable = member_reachable(&parsed);
+                            if book.set_reachable(source, member.reachable) {
+                                book_dirty = true;
+                            }
                         }
                     }
 
@@ -2350,6 +2426,22 @@ async fn run(config: Config) -> Result<()> {
                            ("rtt_ms", &rtt.as_millis().to_string())]);
                 }
 
+                // A member reached this node at an address it announced, on a
+                // connection of its own: that, and nothing less, is reachable.
+                SwarmEvent::ExternalAddrConfirmed { address } => {
+                    if reachability.confirm(address.clone()) {
+                        emit(&config, "reachable",
+                             &format!("a member reached this node at {address}: it can introduce others"),
+                             &[("addr", &address.to_string())]);
+                    }
+                }
+                SwarmEvent::ExternalAddrExpired { address } => {
+                    if reachability.expire(&address) {
+                        emit(&config, "unreachable",
+                             &format!("no member can reach this node at {address} any more"),
+                             &[("addr", &address.to_string())]);
+                    }
+                }
                 _ => {}
             }
         }
@@ -2866,6 +2958,45 @@ mod tests {
     /// runs full of disruptions, with backlogs seconds deep rather than days.
     /// `--no-mdns` must mean no mDNS behaviour, not an idle one: the idle one
     /// still joined 224.0.0.251 on every interface, LTE included.
+    #[tokio::test]
+    async fn the_swarm_builds_with_relaying_and_punching() {
+        let mut config = default_config();
+        config.mdns = false;
+        assert!(build_swarm(&config, libp2p::identity::Keypair::generate_ed25519()).is_ok());
+    }
+
+    /// The relay is used only to introduce two members for a punch. Its
+    /// default limits are the point: long enough to arrange the meeting, too
+    /// short to become a path the mesh's traffic quietly depends on.
+    #[test]
+    fn introductions_keep_the_relays_default_limits() {
+        let c = relay_config();
+        assert_eq!(c.max_circuit_duration, Duration::from_secs(120));
+        assert_eq!(c.max_circuit_bytes, 131_072);
+    }
+
+    #[test]
+    fn reachable_once_any_address_is_confirmed_and_until_the_last_expires() {
+        let a: Multiaddr = "/ip4/204.210.210.200/udp/4001/quic-v1".parse().unwrap();
+        let b: Multiaddr = "/ip4/204.210.210.200/tcp/4001".parse().unwrap();
+        let mut r = Reachability::default();
+        assert!(!r.is_reachable());
+        assert!(r.confirm(a.clone()), "the first confirmation makes it reachable");
+        assert!(!r.confirm(b.clone()), "a second changes nothing that is said");
+        assert!(!r.expire(&a), "still reachable at b");
+        assert!(r.is_reachable());
+        assert!(r.expire(&b), "the last one going is the change");
+        assert!(!r.is_reachable());
+    }
+
+    /// AutoNAT's own default is every 5 s, which on a hotspot is data spent
+    /// asking a question whose answer changes rarely.
+    #[test]
+    fn autonat_probes_no_more_than_once_a_minute() {
+        assert!(AUTONAT_PROBE_EVERY >= Duration::from_secs(60));
+        assert!(AUTONAT_MAX_CANDIDATES <= 4);
+    }
+
     #[tokio::test]
     async fn no_mdns_builds_no_mdns_behaviour() {
         let me = libp2p::identity::Keypair::generate_ed25519().public().to_peer_id();

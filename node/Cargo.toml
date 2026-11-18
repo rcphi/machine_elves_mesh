@@ -7,7 +7,10 @@ description = "Phase 0 mesh node: forms an overlay, tracks membership, notices w
 [dependencies]
 anyhow = "1.0.104"
 futures = "0.3.34"
-libp2p = { version = "0.56.0", features = ["tokio", "quic", "tcp", "noise", "yamux", "gossipsub", "mdns", "identify", "ping", "macros"] }
+libp2p = { version = "0.56.0", features = ["tokio", "quic", "tcp", "noise", "yamux", "gossipsub", "mdns", "identify", "ping", "macros", "relay", "dcutr", "autonat"] }
+# AutoNAT v2 takes its randomness as a parameter; this is the generator it
+# defaults to, named so its probe interval can be set.
+rand_core = { version = "0.6", features = ["getrandom"] }
 sha2 = "0.11.0"
 tokio = { version = "1.53.1", features = ["rt-multi-thread", "macros", "time", "signal"] }
 wasmtime = "48.0.0"

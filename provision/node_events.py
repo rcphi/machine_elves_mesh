@@ -42,6 +42,8 @@ NOTABLE = {
     "my-address": "learned its own address: {addr}",
     "silent-connection": "dropped a connection that never spoke",
     # Reachability.
+    "reachable": "a member reached this node at {addr}: it can introduce others",
+    "unreachable": "no member can reach this node at {addr} any more",
     "port-mapped": "the router opened {external}",
     "port-map-failed": "the router did not grant a mapping: {error}",
     "listen-failed": "could not listen on an address",

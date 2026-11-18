@@ -86,7 +86,7 @@ The operator chose A on 2026-11-18.
 
 **An introduction** is how two members that cannot reach each other still meet. Both can reach a third member, which passes each of them the other's current address and tells them to send now. Both then send at the same moment, and each router lets the other's packets in because its own machine has just sent to that address. The introducer only arranges the meeting. It lasts a couple of minutes at most, and carries none of their traffic afterwards. That is libp2p's relay, used with its short default limits.
 
-- **Who runs what.** Every confirmed-reachable member runs the relay server with the default limits. Every node runs the relay client.
+- **Who runs what.** Every node runs the relay server with the default limits, and the relay client. Only members whose heartbeat says they are confirmed reachable are *asked* to introduce. *(Changed while planning, 2026-11-18: the first version ran the server only on confirmed-reachable members. libp2p fixes a node's behaviours when the swarm is built, while reachability changes as it runs, so the choice moved to who is asked.)*
 - **Reservations.** A node that is not confirmed reachable keeps reservations on up to three reachable members, or on all of them if there are fewer, and renews them.
 - **Announcing.** It announces the addresses it can be reached at through those relays, using the existing announcement (`Observed`, every 30 s), extended to carry relay addresses.
 - **Punching.** When a node has no direct link to a member, and neither of them is confirmed reachable, it dials that member through a relay. DCUtR then times both sides' sends.
