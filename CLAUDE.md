@@ -55,14 +55,18 @@ Violating any of these silently invalidates the experiment.
 Done: the connection probe, the provisioning, and the mesh node — overlay and
 gossip, sandboxed WASM jobs with fuel and memory limits, checkpointing, and
 takeover with speculative resume — measured on real boxes in Night A and Runs
-B–E. diamond has lived at a friend's house since 2026-11-12, managed over an
+B–F. diamond has lived at a friend's house since 2026-11-12, managed over an
 LTE back channel. Run E (2026-11-17) put it against riverboat at home, the
 first run across two households, and met every criterion fixed before it.
+Run F (2026-11-18) added the laptop on a hotspot: the two unreachable machines
+never connected to each other, so losing riverboat split the mesh and ran the
+job twice for 57 minutes.
 An external review (`CODE_REVIEW_2026-11-07.md`) is being worked through; its
 completion record says what is fixed.
 
-Next: not yet decided. `docs/phase-0-plan.md` is the record, and its "Open
-decisions" are where the choice starts.
+Next: relaying through a reachable member, with coordinated hole punching as
+the upgrade and a backoff on dial retries, before Phase 1. Not yet designed.
+`docs/phase-0-plan.md` is the record; Run F's section says why.
 
 Available: 3 home connections and one friend's. No VPSs, by decision.
 

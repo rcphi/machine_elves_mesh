@@ -1543,7 +1543,7 @@ The link stayed up through the run and logged nothing from 00:40 to 14:25 UTC. I
 
 **It is not step 5.** It is the first run between two households, and the link is the kind a real player has. But both machines are the operator's own dedicated, wired, always-on Ubuntu Server boxes, and the data is one night on one pair of cable connections 41 ms apart. **Phase 0 results remain an upper bound.** This run moves the bound on one axis: the mesh met every criterion fixed before the run on an ordinary path between two homes.
 
-## Run F: handover (2026-11-18) — three connections, and the reachable one leaves
+## Run F: handover (2026-11-18) — three connections, and the reachable one leaves; run the same day, results below
 
 **What this run tests.** Every internet run so far had two machines, and one of them was reachable. "One reachable member is enough" holds only while that member stays. Run F has three machines on three connections, only one of them reachable:
 - **`riverboat`, at home:** reachable. It holds `204.210.210.200:4001` by NAT-PMP.
@@ -1618,9 +1618,84 @@ The four counts leaving zero would be a failure in their own right, as in every 
 
 If this is what happens, it is the first of the two outcomes the handover named: **the pair never connecting directly, so the mesh hangs off its one reachable member.** That means building relaying and coordinated punching before Phase 1.
 
+## Run F: three connections, measured — 2026-11-18
+
+riverboat at home (reachable), diamond at the friend's house, yoinkerz on the phone hotspot. Mesh `run-f`, chaos armed 18:27–20:31 UTC. riverboat left at 19:16:40 and came back at 20:14:08. There were 13 disruptions. **The two unreachable machines never connected to each other. When riverboat left, the mesh split and ran the job twice for 57 minutes, and it healed 1.3 s after riverboat returned.** That is the first of the two outcomes the handover named as meaning relaying and coordinated punching must be built before Phase 1.
+
+| | Prediction | Run F | |
+|---|---|---|---|
+| diamond and yoinkerz connect directly | yes | **never, in over two hours** | **missed** |
+| Detection / resume p95 | inside 2–3 s / 500 ms | **2489 / 200 ms** (n=9 / 8) | held, on a small sample |
+| Visible gap p95 | | 1188 ms (n=8) | |
+| Nobody took over / more than one took over | 0 / 0 | **0 of 13 / 0** | held |
+| False alarms | 0 | **27** | **missed**: the hotspot, and the split (below) |
+| Yields | | **21**, of which the partitions explain 3 | churn, as in Run D |
+| When riverboat leaves | the pair stays connected; corrected before part 2 to **the mesh splits and both run the job** | **split: both ran the job for 57 min** | the correction held |
+| Re-meeting after a restart in part 2 | "mostly"; corrected to not reached | not reached: chaos found no peer at every fire | as corrected |
+| riverboat returns | one owner yields within seconds | **1.3 s** | held |
+| yoinkerz's mesh bytes | 40–70 MB | **65.4 MB**, about two-thirds of it failed dialling | inside the range, for the wrong reason |
+| The phone's own counter | under 150 MB | not read: no reading was taken before the run | not obtained |
+
+### The two unreachable machines never met, and neither NAT's type explains it
+
+- **Both learned the other's address within 21 s.** riverboat's announcements reached diamond at 18:31:38 and yoinkerz at 18:31:59. Both dialled every 2 s from then until the end.
+- **Both sent correctly, and neither received anything.** Packet captures at about 20:42 UTC on both ends show each node sending from its listening port 4001 to the other's correct public address: diamond to `70.242.158.221:5465`, yoinkerz to `75.118.77.81:4001`. Each sent about 6 packets of 1,228 bytes every 2 s, and neither capture holds a single packet from the other side. yoinkerz's firewall admits 4001, and diamond's does too.
+- **Both NATs are the friendly kind.** The probe, run on each after the run, reports both as `nat-endpoint-independent`: the same public port for every destination. That is the condition hole punching needs, and here it was not sufficient. **The packets were lost between the two routers.** From the two ends it is not possible to say whose equipment dropped them.
+
+Two corrections to things said during the run:
+- **"Corrected before part 2" cited diamond's kernel log** as showing no packet from the carrier. That log could not have shown one: ufw admits 4001 and logs only what it blocks. The capture is the evidence, and it says the same thing.
+- **I suggested during the run that the probe's August hotspot result might be the old comparison of ports alone.** It was not: the corrected probe gives the same answer, endpoint-independent.
+
+### Part 2: the mesh split in two, and both halves ran the job
+
+| UTC | |
+|---|---|
+| 19:16:40.155 | riverboat leaves, announcing it |
+| 19:16:41.103 | yoinkerz hears nothing from diamond for 979 ms and starts the job speculatively |
+| 19:16:42.603 | yoinkerz **takes over**, while diamond is still running the job |
+| 19:17–20:14 | **both run the job for 57 minutes**: diamond tick 15,203 → 32,003, yoinkerz 15,347 → 32,147. About 16,800 ticks were computed twice. |
+| 20:14:08.764 | riverboat starts. diamond reaches it 45 ms later, yoinkerz 0.9 s later. |
+| 20:14:10.027 | yoinkerz hears diamond through riverboat and **yields**, 5 ticks behind |
+
+- **For this job the split cost compute and nothing else.** The same job from the same state makes the same serials, so the two halves' inventories merge without duplicates. That holds for a deterministic simulation and would not hold for work §9.3 excludes from speculation, nor for anything a player can see happening in two places at once.
+- **Chaos could not act on the pair in part 2.** diamond's chaos found "no peer to take the job over" at all 13 of its fires.
+- **Healing took 1.3 s** once a reachable member was back, with no intervention.
+
+### Part 1: three nodes, and a hub that is also a single point of failure
+
+The takeover thresholds held, though on 9 unannounced losses rather than Run E's 92. Nobody failed to take over, and no disruption was taken over twice. The churn is the hotspot's, as in Run D, made worse by the topology:
+- **27 false alarms and 18 yields beyond the partitions.** Two of the false alarms are the part-2 split itself, seen from each side. Run D's hotspot gave 17 false alarms in 2.1 h.
+- **Each drop of the hotspot's one link cut yoinkerz off from both peers at once**, because it reached diamond only through riverboat. So each drop briefly made two owners, as at 18:32:28, and each ended in a yield.
+- **One disruption hit a second owner.** The kill of yoinkerz at 19:33:26 hit a node that believed it owned the job while diamond was also running it.
+- **Speculation:** 43 started, 8 confirmed, 17 abandoned (13 `checkpoint`, 4 `heard-again`), 9 ended by a yield, and **9 unaccounted**. Run E had none unaccounted, and these 9 are not yet investigated.
+
+### The bytes, and a cost nobody predicted
+
+| | in | out | counted over |
+|---|---|---|---|
+| `riverboat` | 46.7 MB | 29.7 MB | 2.3 h, including 55 min stopped while both others dialled it |
+| `diamond` | 14.5 MB | 52.8 MB | 2.2 h |
+| `yoinkerz` (hotspot) | 14.4 MB | 50.9 MB | 2.2 h; **65.4 MB** in all |
+
+**A node dials every address it cannot reach every 2 s, indefinitely.** At the captured rate, 6 packets of 1,228 bytes every 2 s, that is **about 13 MB/h for each unreachable address**.
+- **How much of each box's traffic it was:** the node's own `dialling` lines put diamond and yoinkerz at 3.2 address-hours each. At that rate that is about 42–43 MB, roughly four-fifths of each box's outgoing bytes, against 14.5 MB of real traffic received.
+- **How firm the figure is:** the rate rests on two 3-second captures, so it is approximate. That the retries dominated is not in doubt.
+- **On a metered link it matters:** about two-thirds of the laptop's 65.4 MB was spent dialling an address that never answered.
+
+### What Run F settles
+
+- **"One reachable member is enough" is true only while that member stays.** Without a relay, two unreachable members reach each other only through it. When it leaves, the mesh splits, and every split is a second owner. That held here for 57 minutes, and in miniature at every drop of the hotspot.
+- **Hole punching cannot be assumed, even between two endpoint-independent NATs.** So relaying through a reachable member is not an optimisation. It is the fallback the mesh needs, with coordinated punching as the upgrade when a punch works.
+- **Healing is fast once a reachable member returns:** 1.3 s, by tick number, with nothing lost.
+- **Retries need a backoff.** 13 MB/h per unreachable address, for as long as the node runs, is a real cost on a metered link and noise at a router.
+
+**What Run F is not.** It is one pair of routers and one carrier, on one afternoon. It shows that punching *can* fail between friendly NATs, not how often it does. The machines are still the operator's, and Phase 0 results remain an upper bound.
+
+Logs: `provision/results/run-f/`, not committed, as for every run.
+
 ## Open decisions
 
-- **The rendezvous fallback**, if no volunteer turns out to be directly reachable. Manual invite exchange covers address distribution but not simultaneous-transmission timing.
+- **The rendezvous fallback**, if no volunteer turns out to be directly reachable. Manual invite exchange covers address distribution but not simultaneous-transmission timing. **Run F (2026-11-18) made this concrete:** two unreachable members never connected to each other, even though both NATs are endpoint-independent and both dialled the right address for two hours. With no relay, losing the one reachable member split the mesh and ran the job twice for 57 minutes. A relay on a reachable member, with coordinated punching as the upgrade, is now a requirement rather than a fallback to decide on.
 - ~~**The threshold for an acceptable stall**~~ — settled 2026-08-21: 2–3 s detection, 500 ms resume, at p95.
 - **How many volunteers** the go/no-go can honestly rest on, given three is enough to detect a problem class but not to estimate its frequency.
 - **Whether the detection window should be fixed or per-link.** Run D showed 2–3 s thrashing on a phone hotspot — work migrating for a peer that never left, once every fourteen minutes. The threshold stays as fixed on 2026-08-21, because changing a criterion after seeing the measurement is the thing this plan refuses to do. But the measurement is now in hand, and the question it raises is open: a single global window is set by the worst link any player has, the same shape of problem as the keepalive interval in step 1a. Deciding it needs a case where wrong suspicion is *not* free — work §9.3 excludes from speculation — and Run D did not measure that. Run E found no thrashing on household broadband: 0 false alarms in 8.1 h. On the evidence so far, then, the link that sets a global window is a mobile one.
