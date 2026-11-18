@@ -280,7 +280,7 @@ enum Message {
     /// peer that went silent and came back had restarted or had merely been
     /// unreachable — and those are different failures that must not be counted
     /// together.
-    Heartbeat { label: String, run: Option<u64>, holding: Holding },
+    Heartbeat { label: String, run: Option<u64>, holding: Holding, reachable: Option<bool> },
     Departing { label: String },
     Checkpoint { label: String, job: [u8; 32], tick: u64, state: Vec<u8> },
     Observed { label: String, peer: PeerId, addr: Multiaddr },
@@ -333,7 +333,7 @@ enum Holding {
     Job([u8; 32]),
 }
 
-fn encode_heartbeat(label: &str, counter: u64, run: u64, job: Option<&[u8; 32]>) -> Vec<u8> {
+fn encode_heartbeat(label: &str, counter: u64, run: u64, job: Option<&[u8; 32]>, reachable: bool) -> Vec<u8> {
     let mut out = vec![KIND_HEARTBEAT];
     put_str(&mut out, label);
     out.extend_from_slice(&counter.to_le_bytes());
@@ -346,7 +346,15 @@ fn encode_heartbeat(label: &str, counter: u64, run: u64, job: Option<&[u8; 32]>)
             out.extend_from_slice(id);
         }
     }
+    // Appended again: whether a member has confirmed it can reach this node,
+    // which is what makes it worth asking for introductions.
+    out.push(u8::from(reachable));
     out
+}
+
+/// Whether a heartbeat says its sender can be reached. Unsaid is no.
+fn member_reachable(message: &Message) -> bool {
+    matches!(message, Message::Heartbeat { reachable: Some(true), .. })
 }
 
 fn encode_departing(label: &str) -> Vec<u8> {
@@ -437,15 +445,22 @@ fn parse_message(bytes: &[u8]) -> Option<Message> {
             // optional, so a node built before runs existed is still heard as
             // alive rather than dropped as malformed.
             let run = take_u64(bytes, &mut at).and_then(|_| take_u64(bytes, &mut at));
-            let holding = match bytes.get(at) {
-                Some(0) => Holding::Nothing,
-                Some(1) => bytes
-                    .get(at + 1..at + 33)
-                    .map(|id| Holding::Job(id.try_into().expect("32 bytes")))
-                    .unwrap_or(Holding::Unknown),
-                _ => Holding::Unknown,
+            let (holding, after) = match bytes.get(at) {
+                Some(0) => (Holding::Nothing, Some(at + 1)),
+                Some(1) => match bytes.get(at + 1..at + 33) {
+                    Some(id) => (Holding::Job(id.try_into().expect("32 bytes")), Some(at + 33)),
+                    None => (Holding::Unknown, None),
+                },
+                _ => (Holding::Unknown, None),
             };
-            Some(Message::Heartbeat { label, run, holding })
+            // Absent from a node built before it was said: not reachable, so
+            // never asked to introduce anyone.
+            let reachable = after.and_then(|at| match bytes.get(at) {
+                Some(0) => Some(false),
+                Some(1) => Some(true),
+                _ => None,
+            });
+            Some(Message::Heartbeat { label, run, holding, reachable })
         }
         KIND_DEPARTING => Some(Message::Departing { label }),
         KIND_CHECKPOINT => {
@@ -791,6 +806,9 @@ struct Member {
     run: Option<u64>,
     /// Which job it holds, once a heartbeat has said. See [`Holding`].
     holding: Holding,
+    /// Whether its heartbeat says a member has confirmed it can be reached.
+    /// False until said, and for a node built before it was said.
+    reachable: bool,
 }
 
 /// Peers declared gone, remembered so their return can be classified.
@@ -1526,7 +1544,7 @@ async fn run(config: Config) -> Result<()> {
                 // is the only one subscribed to the topic; `published` says so
                 // only for the failures that are not that.
                 published(&config, &mut quiet, "heartbeat", swarm.behaviour_mut().gossipsub
-                    .publish(topic.clone(), encode_heartbeat(&config.label, counter, run, my_job.as_ref())));
+                    .publish(topic.clone(), encode_heartbeat(&config.label, counter, run, my_job.as_ref(), false)));
             }
 
             _ = job_tick.tick() => {
@@ -1988,6 +2006,7 @@ async fn run(config: Config) -> Result<()> {
                             disconnected: false,
                             run: None,
                             holding: Holding::Unknown,
+                            reachable: false,
                         });
                         once_members.insert(source);
                         if book.named(source, &label) {
@@ -2002,7 +2021,7 @@ async fn run(config: Config) -> Result<()> {
                         // else is also continuing.
                         counter += 1;
                         let _ = swarm.behaviour_mut().gossipsub
-                            .publish(topic.clone(), encode_heartbeat(&config.label, counter, run, my_job.as_ref()));
+                            .publish(topic.clone(), encode_heartbeat(&config.label, counter, run, my_job.as_ref(), false));
                         // And say what we hold, for the same reason. A node
                         // that has just arrived has missed everything made
                         // before it did, and waiting for the periodic digest
@@ -2025,6 +2044,7 @@ async fn run(config: Config) -> Result<()> {
                     if let Message::Heartbeat { holding, .. } = &parsed {
                         if let Some(member) = members.get_mut(&source) {
                             member.holding = *holding;
+                            member.reachable = member_reachable(&parsed);
                         }
                     }
 
@@ -2918,12 +2938,12 @@ mod tests {
     #[test]
     fn messages_survive_a_round_trip() {
         assert_eq!(
-            parse_message(&encode_heartbeat("diamond", 42, 9, Some(&TEST_JOB))),
-            Some(Message::Heartbeat { label: "diamond".into(), run: Some(9), holding: Holding::Job(TEST_JOB) })
+            parse_message(&encode_heartbeat("diamond", 42, 9, Some(&TEST_JOB), false)),
+            Some(Message::Heartbeat { label: "diamond".into(), run: Some(9), holding: Holding::Job(TEST_JOB), reachable: Some(false) })
         );
         assert_eq!(
-            parse_message(&encode_heartbeat("diamond", 42, 9, None)),
-            Some(Message::Heartbeat { label: "diamond".into(), run: Some(9), holding: Holding::Nothing })
+            parse_message(&encode_heartbeat("diamond", 42, 9, None, false)),
+            Some(Message::Heartbeat { label: "diamond".into(), run: Some(9), holding: Holding::Nothing, reachable: Some(false) })
         );
         assert_eq!(
             parse_message(&encode_departing("diamond")),
@@ -2958,7 +2978,7 @@ mod tests {
         let mut members = HashMap::new();
         members.insert(present, Member {
             label: "present".into(), joined: long_ago, last_heard: now,
-            disconnected: false, run: None, holding: Holding::Job(TEST_JOB),
+            disconnected: false, run: None, holding: Holding::Job(TEST_JOB), reachable: false,
         });
 
         // A connection just made has not had time to speak; one to a node of
@@ -2975,7 +2995,7 @@ mod tests {
         old.extend_from_slice(&42u64.to_le_bytes());
         assert_eq!(
             parse_message(&old),
-            Some(Message::Heartbeat { label: "diamond".into(), run: None, holding: Holding::Unknown })
+            Some(Message::Heartbeat { label: "diamond".into(), run: None, holding: Holding::Unknown, reachable: None })
         );
     }
 
@@ -2989,8 +3009,39 @@ mod tests {
         old.extend_from_slice(&9u64.to_le_bytes());
         assert_eq!(
             parse_message(&old),
-            Some(Message::Heartbeat { label: "diamond".into(), run: Some(9), holding: Holding::Unknown })
+            Some(Message::Heartbeat { label: "diamond".into(), run: Some(9), holding: Holding::Unknown, reachable: None })
         );
+    }
+
+    #[test]
+    fn reachability_survives_a_round_trip() {
+        for (job, holding) in [(Some(&TEST_JOB), Holding::Job(TEST_JOB)), (None, Holding::Nothing)] {
+            for reachable in [true, false] {
+                assert_eq!(
+                    parse_message(&encode_heartbeat("riverboat", 1, 2, job, reachable)),
+                    Some(Message::Heartbeat { label: "riverboat".into(), run: Some(2), holding, reachable: Some(reachable) })
+                );
+            }
+        }
+    }
+
+    /// A node built before heartbeats said whether they could be reached is
+    /// never asked to introduce anyone: assuming it could would send others to
+    /// reserve introductions on a machine that may not be able to make them.
+    #[test]
+    fn a_heartbeat_from_before_reachability_was_said_is_unreachable() {
+        let mut old = vec![KIND_HEARTBEAT];
+        put_str(&mut old, "riverboat");
+        old.extend_from_slice(&1u64.to_le_bytes());
+        old.extend_from_slice(&2u64.to_le_bytes());
+        old.push(1);
+        old.extend_from_slice(&TEST_JOB);
+        let parsed = parse_message(&old);
+        assert_eq!(
+            parsed,
+            Some(Message::Heartbeat { label: "riverboat".into(), run: Some(2), holding: Holding::Job(TEST_JOB), reachable: None })
+        );
+        assert!(!member_reachable(&parsed.unwrap()));
     }
 
     /// The old checkpoint kind carried no job, so it cannot be checked, and
@@ -3007,7 +3058,7 @@ mod tests {
 
     fn holding(h: Holding) -> Member {
         Member { label: "peer".into(), joined: Instant::now(), last_heard: Instant::now(),
-                 disconnected: false, run: Some(1), holding: h }
+                 disconnected: false, run: Some(1), holding: h, reachable: false }
     }
 
     /// Finding 5's first case: the lowest identifier in the mesh holds no job.
@@ -3442,6 +3493,7 @@ mod tests {
             disconnected: false,
             run: None,
             holding: Holding::Job(TEST_JOB),
+            reachable: false,
         };
 
         let mut winners = 0;
@@ -3495,6 +3547,7 @@ mod tests {
             disconnected: false,
             run: None,
             holding: Holding::Job(TEST_JOB),
+            reachable: false,
         });
         assert!(Work::should_take_over(&me, &members, &TEST_JOB));
     }
@@ -3536,7 +3589,7 @@ mod tests {
     }
 
     fn member_last_heard(at: Instant) -> Member {
-        Member { label: "peer".into(), joined: at, last_heard: at, disconnected: false, run: Some(1), holding: Holding::Job(TEST_JOB) }
+        Member { label: "peer".into(), joined: at, last_heard: at, disconnected: false, run: Some(1), holding: Holding::Job(TEST_JOB), reachable: false }
     }
 
     #[test]
