@@ -110,7 +110,7 @@ The operator chose A on 2026-11-18.
 Each address keeps its own schedule.
 - **Retries start at 2 s,** as now. A restart is still redialled within seconds, and that path must not get slower.
 - **They then double, to a cap of about 5 minutes** for remembered and observed addresses, and about 60 s for configured ones, which are the way in.
-- **A schedule resets** when the address is announced afresh, or when its peer is heard from in any other way.
+- **A schedule resets** when the address is first learned, or when a direct connection to its peer is lost. Hearing a peer through a forwarder must not reset it: that is Run F's case, where diamond heard yoinkerz every second through riverboat. A periodic re-announcement must not reset it either. *(Corrected 2026-11-18, while planning: the first version said "or when its peer is heard from in any other way", which would have restored Run F's cost.)*
 
 **The requirement, whatever the numbers:** rejoining after a restart is no slower than today, and an address that never answers costs under 1 MB/h.
 

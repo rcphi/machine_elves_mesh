@@ -10,6 +10,7 @@
 //! Membership came first, because everything else is built on knowing who is
 //! here; the rest is measured in `docs/phase-0-plan.md`.
 
+mod dialing;
 mod job;
 mod ledger;
 mod portmap;
@@ -231,7 +232,7 @@ const DIAL_RETRY: Duration = Duration::from_secs(2);
 
 /// The retry timer, built so that a quiet mesh does not store up work for it.
 ///
-/// Its arm in the event loop is guarded by `!pending.is_empty()`, so while
+/// Its arm in the event loop is guarded by `dials.len() > 0`, so while
 /// every peer is reachable the interval is never polled at all.
 fn dial_retry_interval() -> tokio::time::Interval {
     let mut retry = tokio::time::interval(DIAL_RETRY);
@@ -1201,7 +1202,13 @@ async fn run(config: Config) -> Result<()> {
     // dialled once and forgotten, because a single attempt only succeeds if the
     // other side happened to already be listening — and neither side can be
     // listening in any useful sense while behind address translation.
-    let mut pending: Vec<Multiaddr> = config.dial.clone();
+    //
+    // Each address keeps its own backoff (see `dialing`): Run F spent about
+    // 13 MB/h on every address that never answered, dialled every 2 s.
+    let mut dials = dialing::Schedule::new();
+    for addr in &config.dial {
+        dials.add(addr.clone(), dialing::Kind::Configured, None, Instant::now());
+    }
     // Which address reached which peer, so that losing the peer puts the
     // address back on the list. Without this a node dials until it succeeds
     // once and then never again: the first disconnection is permanent, and no
@@ -1349,7 +1356,7 @@ async fn run(config: Config) -> Result<()> {
 
     loop {
         tokio::select! {
-            _ = dial_retry.tick(), if !pending.is_empty() => {
+            _ = dial_retry.tick(), if dials.len() > 0 => {
                 dial_attempts += 1;
                 // Anything already reaching a live peer is skipped. A retry
                 // loop that keeps dialling a connected peer opens a new
@@ -1359,9 +1366,11 @@ async fn run(config: Config) -> Result<()> {
                     .filter(|(peer, _)| swarm.is_connected(peer))
                     .flat_map(|(_, addrs)| addrs.iter().cloned())
                     .collect();
-                pending.retain(|addr| !live.contains(addr));
+                for addr in &live {
+                    dials.remove(addr);
+                }
 
-                for addr in &pending {
+                for addr in &dials.due(Instant::now()) {
                     // Failures are expected and frequent: until the other side
                     // is also sending, there is nothing at the far end willing
                     // to answer. The attempt is worth making anyway, because
@@ -1370,8 +1379,8 @@ async fn run(config: Config) -> Result<()> {
                 }
                 if dial_attempts == 1 || dial_attempts % 15 == 0 {
                     emit(&config, "dialling",
-                         &format!("still trying {} peer(s), attempt {dial_attempts}", pending.len()),
-                         &[("peers", &pending.len().to_string()),
+                         &format!("still trying {} peer(s), attempt {dial_attempts}", dials.len()),
+                         &[("peers", &dials.len().to_string()),
                            ("attempts", &dial_attempts.to_string())]);
                 }
             }
@@ -1657,7 +1666,7 @@ async fn run(config: Config) -> Result<()> {
                         // Silence is the only warning a vanished machine gives,
                         // so it has to be what starts the search for it again.
                         redial_lost_peer(&config, &peer, &reached_by,
-                                         &mut pending, &mut dial_attempts);
+                                         &mut dials, &mut dial_attempts);
 
                         if let Some(w) = work.as_mut() {
                             if w.owner == Some(peer) {
@@ -1774,7 +1783,7 @@ async fn run(config: Config) -> Result<()> {
                                                now, config.detect * 2) {
                     connected_at.remove(&peer);
                     let _ = swarm.disconnect_peer_id(peer);
-                    redial_lost_peer(&config, &peer, &reached_by, &mut pending, &mut dial_attempts);
+                    redial_lost_peer(&config, &peer, &reached_by, &mut dials, &mut dial_attempts);
                     emit(&config, "silent-connection",
                          "connected to a former member that has said nothing — reconnecting",
                          &[("peer_id", &peer.to_string())]);
@@ -1784,6 +1793,9 @@ async fn run(config: Config) -> Result<()> {
             event = swarm.select_next_some() => match event {
                 SwarmEvent::ConnectionEstablished { peer_id, endpoint, .. } => {
                     connected_at.entry(peer_id).or_insert_with(Instant::now);
+                    // Every address tagged with this peer stops being dialled,
+                    // whichever side opened the connection.
+                    dials.forget_peer(&peer_id);
                     // Stop dialling this one. The address matched must be the
                     // address *we asked for*, not the one the connection ended
                     // up on: a peer dialled at one address commonly answers
@@ -1792,15 +1804,17 @@ async fn run(config: Config) -> Result<()> {
                     // that leaves the peer on the list forever, quietly dialled
                     // for the rest of the run.
                     let reached = endpoint.get_remote_address().clone();
-                    let before = pending.len();
+                    let before = dials.len();
                     if let libp2p::core::ConnectedPoint::Dialer { address, .. } = &endpoint {
-                        pending.retain(|addr| addr != address);
+                        dials.remove(address);
                         // Every address known to reach this peer comes off the
                         // list, not only the one that happened to succeed.
                         // Otherwise the others keep being dialled at a peer
                         // already sitting on the other end of a connection.
                         if let Some(known) = reached_by.get(&peer_id) {
-                            pending.retain(|addr| !known.contains(addr));
+                            for addr in known {
+                                dials.remove(addr);
+                            }
                         }
                         // Remembered so it can be dialled again later. A peer
                         // reached once is a peer worth trying to reach again,
@@ -1817,8 +1831,8 @@ async fn run(config: Config) -> Result<()> {
                          &[("peer_id", &peer_id.to_string()),
                            ("addr", &reached.to_string()),
                            ("after_attempts", &dial_attempts.to_string()),
-                           ("still_pending", &pending.len().to_string())]);
-                    if before > 0 && pending.is_empty() {
+                           ("still_pending", &dials.len().to_string())]);
+                    if before > 0 && dials.len() == 0 {
                         emit(&config, "all-reached", "every peer given on the command line answered", &[]);
                     }
 
@@ -2118,7 +2132,7 @@ async fn run(config: Config) -> Result<()> {
                             // during a burst, when is_connected can still be
                             // false for a connection halfway through opening.
                             if swarm.is_connected(&peer)
-                                || pending.contains(&addr)
+                                || dials.contains(&addr)
                                 || reached_by.values().any(|known| known.contains(&addr))
                             {
                                 continue;
@@ -2130,8 +2144,9 @@ async fn run(config: Config) -> Result<()> {
                             // Dial immediately as well as adding to the retry
                             // list. Everyone who heard this is dialling now,
                             // and arriving together is the entire point.
-                            let _ = swarm.dial(addr.clone());
-                            pending.push(addr);
+                            if dials.add(addr.clone(), dialing::Kind::Observed, Some(peer), Instant::now()) {
+                                let _ = swarm.dial(addr);
+                            }
                         }
 
                         Message::Checkpoint { job, tick, state, .. } => {
@@ -2250,7 +2265,7 @@ async fn run(config: Config) -> Result<()> {
                         // treats it as final is a mesh that quietly shrinks by
                         // one every time anything happens.
                         redial_lost_peer(&config, &peer_id, &reached_by,
-                                         &mut pending, &mut dial_attempts);
+                                         &mut dials, &mut dial_attempts);
                     }
                 }
 
@@ -2489,16 +2504,20 @@ fn redial_lost_peer(
     config: &Config,
     peer: &PeerId,
     reached_by: &HashMap<PeerId, Vec<Multiaddr>>,
-    pending: &mut Vec<Multiaddr>,
+    dials: &mut dialing::Schedule,
     attempts: &mut u32,
 ) {
     let Some(addresses) = reached_by.get(peer) else { return };
     let mut resumed = 0;
+    let now = Instant::now();
     for addr in addresses {
-        if !pending.contains(addr) {
-            pending.push(addr.clone());
-            resumed += 1;
+        // The one event that brings an address forward: a direct connection
+        // to its peer was lost, so the peer may be back within seconds.
+        let kind = if config.dial.contains(addr) { dialing::Kind::Configured } else { dialing::Kind::Observed };
+        if !dials.add(addr.clone(), kind, Some(*peer), now) {
+            dials.reset(addr, now);
         }
+        resumed += 1;
     }
     if resumed > 0 {
         *attempts = 0;
