@@ -2,6 +2,8 @@
 
 2026-11-18. For the Phase 0 mesh node (`node/`). Follows Run F (`docs/phase-0-plan.md`, "Run F: three connections, measured").
 
+**Approved by the operator, 2026-11-18.**
+
 ## Why
 
 Run F put three machines on three connections, and only `riverboat` was reachable.
@@ -21,7 +23,7 @@ What each job does when the mesh splits anyway was decided in the same conversat
 ## Goals
 
 1. **More reachable members.** A node asks its router for a port by UPnP as well as NAT-PMP. Today it speaks only NAT-PMP, which the friend's router ignores.
-2. **Every reachable member offers introductions.** It runs libp2p's relay with the default limits, which are long enough to coordinate a punch and too short to carry the mesh's traffic. An unreachable member holds introductions on up to three reachable members, so no single one is critical.
+2. **Every reachable member offers introductions.** It runs libp2p's relay with the default limits, which are long enough to coordinate a punch and too short to carry the mesh's traffic. An unreachable member holds introductions on up to three reachable members, so no single one is critical. *(Three: the operator's call, 2026-11-18.)*
 3. **Unreachable pairs try a coordinated punch.** They use libp2p's DCUtR, run over an introduction. A punch that works gives a direct link that survives the introducer leaving. A punch that fails costs redundancy, not connectivity, because gossip keeps forwarding through the reachable members.
 4. **Healing across restarts.** A node remembers its peers on disk and uses them to get back in.
 5. **Cheap retries.** An address that never answers costs well under 1 MB/h, instead of 13 MB/h.
@@ -71,9 +73,10 @@ The operator chose A on 2026-11-18.
 ### Reachability
 
 - **Asking the router.** A node asks for a port by NAT-PMP as now, and by UPnP as well, using libp2p's `upnp` behaviour. Whichever router answers grants the mapping, and both outcomes are reported as events. NAT-PMP keeps its current renewal. UPnP uses the behaviour's own.
-- **Knowing it is reachable.** A node counts itself reachable only once a member has confirmed it, by dialling it back at its external address. This uses libp2p's `autonat`, with members as the only servers it asks. A mapping that was granted but never confirmed does not count.
+- **Knowing it is reachable.** A node counts itself reachable only once a member has made a successful connection to it at its external address. That happens either because the member dialled the announced address, or through libp2p's `autonat` dial-back, with members as the only servers it asks. A mapping that was granted but never connected through does not count. *(The operator's call, 2026-11-18.)*
 - **What a confirmed node does:** it says so in its heartbeat, and it serves introductions.
-- **Found 2026-11-18: a host that keeps away from its household cannot use multicast.** diamond's `isolate-lan` rejects all outgoing multicast, so that it cannot talk to the friend's other devices, and UPnP's discovery step is multicast. The gateway itself is exempt, because DHCP and NAT-PMP need it. So the node asks the gateway directly first (unicast), and tries multicast only where the host allows it.
+- **Found 2026-11-18: a host that keeps away from its household cannot use multicast.** diamond's `isolate-lan` rejects all outgoing multicast, so that it cannot talk to the friend's other devices, and UPnP's discovery step is multicast. The gateway itself is exempt, because DHCP and NAT-PMP need it. So the node asks the gateway directly first (unicast), then by multicast, which is how most routers are found.
+  - **Multicast is used because players' machines should need no router setup.** In the operator's words: "I want this game to work on as many computers as possible with the least router configuration done by the user. Let's take advantage of the probability of some users having UPnP enabled." Where a host blocks multicast, as diamond does, that attempt fails harmlessly and is reported. `isolate-lan` is unchanged, because the friend's router does not answer UPnP even when multicast is let out.
   - libp2p's `upnp` behaviour may search by multicast only. If so, the builder uses `igd-next` directly, pointed at the gateway.
   - **Checked 2026-11-18: the friend's router does not answer UPnP.** `provision/upnp-check.py` was run on diamond with two temporary openings in place: SSDP multicast let out, and UDP from the gateway let in. The router answered neither the direct query nor the multicast one, so it lacks UPnP or has it switched off. It also ignores NAT-PMP.
   - **diamond therefore stays unreachable.** In Run F's topology, only a coordinated punch can keep diamond and yoinkerz together once riverboat has gone.
