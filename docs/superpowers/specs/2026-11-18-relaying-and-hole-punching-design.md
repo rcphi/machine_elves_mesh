@@ -75,7 +75,9 @@ The operator chose A on 2026-11-18.
 - **What a confirmed node does:** it says so in its heartbeat, and it serves introductions.
 - **Found 2026-11-18: a host that keeps away from its household cannot use multicast.** diamond's `isolate-lan` rejects all outgoing multicast, so that it cannot talk to the friend's other devices, and UPnP's discovery step is multicast. The gateway itself is exempt, because DHCP and NAT-PMP need it. So the node asks the gateway directly first (unicast), and tries multicast only where the host allows it.
   - libp2p's `upnp` behaviour may search by multicast only. If so, the builder uses `igd-next` directly, pointed at the gateway.
-  - Whether the friend's router answers a direct question at all is being checked (`provision/upnp-check.py`). It ignored one on 2026-11-18, which is common: many routers answer only the multicast form. If that is what it does, making diamond reachable means letting SSDP multicast out through `isolate-lan`. That is the operator's decision, because it touches the household.
+  - **Checked 2026-11-18: the friend's router does not answer UPnP.** `provision/upnp-check.py` was run on diamond with two temporary openings in place: SSDP multicast let out, and UDP from the gateway let in. The router answered neither the direct query nor the multicast one, so it lacks UPnP or has it switched off. It also ignores NAT-PMP.
+  - **diamond therefore stays unreachable.** In Run F's topology, only a coordinated punch can keep diamond and yoinkerz together once riverboat has gone.
+  - **If the friend turns UPnP on in the router's settings**, the same script answers whether diamond could then become a second reachable member. The node would also need SSDP let out through `isolate-lan` permanently, which touches the household, so that is the operator's decision.
 
 ### Introductions and punching
 
@@ -138,7 +140,10 @@ Each address keeps its own schedule.
    - **One NAT with randomised ports** (`masquerade random,fully-random`), where the punch must fail. Pass: the pair stays in touch through the public member while it is up, retries stay cheap, and the split and heal behave as in Run F.
 
    **UPnP** is tested in the rig if `miniupnpd` can run in the NAT namespace. Otherwise it is tested against a real router.
-4. **Run G:** Run F's three boxes, running the new node, with predictions fixed before the run as for every run. It needs one check first, by the operator with sudo: whether the friend's router answers UPnP. That decides whether diamond becomes a second reachable member, and so whether losing riverboat still splits the mesh.
+4. **Run G:** Run F's three boxes, running the new node, with predictions fixed before the run as for every run.
+   - **What it can and cannot show:** the friend's router answers neither NAT-PMP nor UPnP (checked 2026-11-18), so riverboat is still the only reachable member. Run G therefore tests whether a *coordinated* punch connects diamond and yoinkerz where Run F's blind simultaneous dialling did not.
+   - **If the punch fails,** losing riverboat still splits the mesh as in Run F. What Run G then measures is the rest: retries that cost little, introductions renewed and not churned, and a split that still heals.
+   - **Avoiding the split altogether** needs a second reachable member. In this topology that is the friend turning UPnP on, or a fourth machine on a connection whose router grants mappings.
 
 ## Decided for the next design: jobs that must not run twice
 
