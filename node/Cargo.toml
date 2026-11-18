@@ -11,6 +11,10 @@ libp2p = { version = "0.56.0", features = ["tokio", "quic", "tcp", "noise", "yam
 # AutoNAT v2 takes its randomness as a parameter; this is the generator it
 # defaults to, named so its probe interval can be set.
 rand_core = { version = "0.6", features = ["getrandom"] }
+# UPnP, asked of the gateway directly before by multicast. libp2p's own upnp
+# behaviour searches by multicast only, which a host kept away from its
+# household (isolate-lan) may not send.
+igd-next = { version = "0.16", default-features = false, features = ["aio_tokio"] }
 sha2 = "0.11.0"
 tokio = { version = "1.53.1", features = ["rt-multi-thread", "macros", "time", "signal"] }
 wasmtime = "48.0.0"

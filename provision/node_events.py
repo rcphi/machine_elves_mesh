@@ -48,7 +48,7 @@ NOTABLE = {
     "punch-failed": "could not punch through to {label}: {error}",
     "reachable": "a member reached this node at {addr}: it can introduce others",
     "unreachable": "no member can reach this node at {addr} any more",
-    "port-mapped": "the router opened {external}",
+    "port-mapped": "the router opened {external} by {method}",
     "port-map-failed": "the router did not grant a mapping: {error}",
     "listen-failed": "could not listen on an address",
     "publish-failed": "could not send a {what}: {error}",

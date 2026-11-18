@@ -15,6 +15,7 @@ mod job;
 mod ledger;
 mod peerbook;
 mod portmap;
+mod upnp;
 
 use std::collections::{BTreeSet, HashMap, HashSet};
 use std::time::{Duration, Instant, SystemTime};
@@ -1433,6 +1434,8 @@ async fn run(config: Config) -> Result<()> {
     let mut since_summary: HashMap<String, u64> = HashMap::new();
     let mut ticks_since_summary: u64 = 0;
     let mut mapping: Option<portmap::Mapping> = None;
+    // Which protocol granted it, so the goodbye withdraws it the same way.
+    let mut mapped_by: Option<portmap::Method> = None;
     // The renewal's answer, carried back from a task rather than awaited here.
     //
     // A router that does not speak NAT-PMP never replies, and asking costs the
@@ -1446,7 +1449,7 @@ async fn run(config: Config) -> Result<()> {
     // So the ask happens elsewhere and the answer arrives as a message. The
     // loop keeps turning while the router is being waited on.
     let (mapping_tx, mut mapping_rx) =
-        tokio::sync::mpsc::channel::<std::result::Result<portmap::Mapping, String>>(1);
+        tokio::sync::mpsc::channel::<std::result::Result<(portmap::Mapping, portmap::Method), String>>(1);
     // One outstanding request at a time. The renewal interval is fifteen
     // minutes and a request gives up after six seconds, so this should never
     // engage — but if a router ever holds the socket open longer than the
@@ -1609,9 +1612,11 @@ async fn run(config: Config) -> Result<()> {
                 let port = config.port;
                 let tx = mapping_tx.clone();
                 tokio::spawn(async move {
-                    let answer = portmap::request(port, portmap::LIFETIME_SECS)
-                        .await
-                        .map_err(|error| error.to_string());
+                    // NAT-PMP first, then UPnP: whichever the router speaks.
+                    let answer = portmap::first_granted(
+                        async { portmap::request(port, portmap::LIFETIME_SECS).await.map_err(|e| e.to_string()) },
+                        || upnp::request(port, portmap::LIFETIME_SECS),
+                    ).await;
                     // The receiver lives as long as the loop, and the loop
                     // outlives this task in every case that matters. If it has
                     // gone, the node is shutting down and the answer is moot.
@@ -1622,15 +1627,17 @@ async fn run(config: Config) -> Result<()> {
             Some(answer) = mapping_rx.recv() => {
                 renewing = false;
                 match answer {
-                    Ok(now) => {
-                        if mapping != Some(now) {
+                    Ok((now, method)) => {
+                        if mapping != Some(now) || mapped_by != Some(method) {
                             emit(&config, "port-mapped",
-                                 &format!("the router forwards {}:{} to this node for {}s",
-                                          now.external_ip, now.external_port, now.lifetime),
+                                 &format!("the router forwards {}:{} to this node for {}s, by {}",
+                                          now.external_ip, now.external_port, now.lifetime, method.name()),
                                  &[("external", &format!("{}:{}", now.external_ip, now.external_port)),
+                                   ("method", method.name()),
                                    ("lifetime", &now.lifetime.to_string()),
                                    ("as_asked", if now.external_port == config.port { "true" } else { "false" })]);
                             mapping = Some(now);
+                            mapped_by = Some(method);
                         }
                     }
                     Err(error) => {
@@ -1844,8 +1851,8 @@ async fn run(config: Config) -> Result<()> {
             // Announce the departure rather than simply exiting, so peers learn
             // immediately instead of waiting out the detection window. This is
             // the whole difference between a planned handoff and a hole.
-            _ = terminate.recv() => { return depart(&mut swarm, &topic, &config).await; }
-            _ = interrupt.recv() => { return depart(&mut swarm, &topic, &config).await; }
+            _ = terminate.recv() => { return depart(&mut swarm, &topic, &config, mapped_by).await; }
+            _ = interrupt.recv() => { return depart(&mut swarm, &topic, &config, mapped_by).await; }
 
             _ = sweep.tick() => {
                 let now = Instant::now();
@@ -3035,6 +3042,7 @@ async fn depart(
     swarm: &mut libp2p::Swarm<MeshBehaviour>,
     topic: &gossipsub::IdentTopic,
     config: &Config,
+    mapped_by: Option<portmap::Method>,
 ) -> Result<()> {
     let published = swarm
         .behaviour_mut()
@@ -3062,7 +3070,14 @@ async fn depart(
     // function exists to deliver, and every restart along with it. The mapping
     // expires by itself within the hour, so the courtesy is not worth waiting on.
     if config.map_port {
-        let _ = tokio::time::timeout(Duration::from_secs(1), portmap::release(config.port)).await;
+        match mapped_by {
+            Some(portmap::Method::Upnp) => {
+                let _ = tokio::time::timeout(Duration::from_secs(1), upnp::release(config.port)).await;
+            }
+            _ => {
+                let _ = tokio::time::timeout(Duration::from_secs(1), portmap::release(config.port)).await;
+            }
+        }
     }
 
     let deadline = tokio::time::Instant::now() + Duration::from_millis(500);
