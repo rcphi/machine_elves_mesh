@@ -55,13 +55,14 @@ Violating any of these silently invalidates the experiment.
 Done: the connection probe, the provisioning, and the mesh node — overlay and
 gossip, sandboxed WASM jobs with fuel and memory limits, checkpointing, and
 takeover with speculative resume — measured on real boxes in Night A and Runs
-B–D. diamond has lived at a friend's house since 2026-11-12, managed over an
-LTE back channel; the inbound idle-timeout test runs there against riverboat.
+B–E. diamond has lived at a friend's house since 2026-11-12, managed over an
+LTE back channel. Run E (2026-11-17) put it against riverboat at home, the
+first run across two households, and met every criterion fixed before it.
 An external review (`CODE_REVIEW_2026-11-07.md`) is being worked through; its
 completion record says what is fixed.
 
-Next: Run E — diamond at the friend's house against riverboat at home, the
-first run across two households. `docs/phase-0-plan.md` is the record.
+Next: not yet decided. `docs/phase-0-plan.md` is the record, and its "Open
+decisions" are where the choice starts.
 
 Available: 3 home connections and one friend's. No VPSs, by decision.
 

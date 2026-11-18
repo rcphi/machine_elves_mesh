@@ -1,6 +1,6 @@
 # Phase 0 — Mesh Spike
 
-**Status:** Built and measured. Night A and Runs B–D are done; diamond has been at a friend's house since 2026-11-12; Run E, across two households, is next. Every result is an upper bound — see "Ubuntu Server, and what that costs". *(This line said "Planning. No code yet." until 2026-11-14.)*
+**Status:** Built and measured. Night A and Runs B–E are done; diamond has been at a friend's house since 2026-11-12, and Run E (2026-11-17), the first across two households, met every criterion fixed before it. Every result is an upper bound — see "Ubuntu Server, and what that costs". *(This line said "Planning. No code yet." until 2026-11-14.)*
 **Language:** Rust — Wasmtime is Rust-native and provides the fuel metering §11.4 requires, libp2p's Rust implementation covers §11.6's overlay and gossip, and it produces a single static binary volunteers can run without setup.
 **Started:** 2026-08-20
 **Design document:** `../machine_elves/docs/superpowers/specs/2026-07-31-machine-elves-design.md` — §11 (compute mesh), §9 (persistence and degradation), §19 (MVP scope). This repo implements only what §19.5 calls Phase 0.
@@ -906,6 +906,28 @@ Remote management of machines behind NAT is *the same problem Phase 0 exists to 
   The last two minutes were riverboat, not the modem; see the operator limitation below. The watchdog also reconnected the bearer at 23:47:23, which was not needed: the tunnel was being refused by riverboat, not black-holed, and its own retry would have got in at the same moment. That cost a second bearer, and nothing else.
 - **What this does not prove.** The test rebooted a healthy modem; it could not hang one on demand. That the reboot clears a QMI hang rests on what the replug did on 2026-11-16, and the reboot is the software version of a replug. Two modem failures in four days at the friend's, and none on record before the move, mean the next real one will probably come during Run E. If the reboot does not clear it, the fallback is a USB hub that can switch off a port's power.
 
+**The first real failures under the new recovery — 2026-11-17/18.** There were none during Run E. In the 27 hours after it there were five. Each began with `qmi_wwan 1-7:1.5: Unexpected error -71`, the USB protocol error that began Friday's, and each recovered with nobody at the box:
+
+| began (UTC) | link back | took | what cleared it |
+|---|---|---|---|
+| Tue 14:25:00 | 14:36:17 | 11 min | see below |
+| Wed 01:43:54 | 01:49:06 | 5 min | the modem reboot |
+| Wed 06:14:33 | 06:25:50 | 11 min | see below |
+| Wed 06:26:22 | 06:32:02 | 6 min | the modem reboot |
+| Wed 16:55:56 | 17:07:06 | 11 min | see below |
+
+In each of the three 11-minute cases the steps ran like this:
+1. Restarting ModemManager did nothing.
+2. The modem rebooted and returned to USB, and the same error came back 12–21 s later.
+3. The USB reset left the modem listed with no bearer.
+4. Restarting ModemManager again, 240 s later, cleared it.
+
+Separately, at 08:10 on Wednesday the network dropped the bearer (`connected -> registered`), and the link reconnected it in 29 s. That was not a hang.
+
+- **The recovery works.** The same failure took 48 hours and a trip to the box before `0020abb`. It now takes 5–11 minutes and nobody.
+- **Something physical is probably wrong.** The error came back within seconds of a freshly rebooted modem reaching USB, which a hang inside the modem's firmware would not do. There were five failures in 27 hours, against two in the first five days at the friend's, with the same error each time. That points at the USB link itself: power, the cable, the port, or the modem. Software cannot fix any of those. A powered hub with per-port power switching would rule out power and would also be the fallback named above.
+- **The ladder's slow path costs about 6 minutes.** In the three slow cases, the step that worked was a ModemManager restart after the USB reset, reached only after the doubled 240 s wait. Nothing has been changed; this is a note.
+
 **One limitation for the operator.** sshd only checks for a dead session when that session has been idle for 30 s, and a login attempt through 2201 counts as activity. So retrying the login in a tight loop keeps a dead session alive. After a reboot this held recovery to 9 minutes instead of about 1. **After diamond drops off, wait 2 minutes before trying.**
 
 **Data cost.** It's small: tens of KB an hour while idle, and about 25 MB a month of keepalives against the 2 GB plan.
@@ -1042,6 +1064,7 @@ Household isolation (`--isolate-lan`) is opt-in, verifies internet reachability 
 4a. **Speculative resume** — *done, and measured on real boxes.* Run C (2026-09-24) put the visible gap at **1060 ms p95** against a 2651 ms baseline, with detection and resume unchanged. A standby begins continuing a suspected-gone owner's job from `detect/4` (500 ms) of silence, rather than waiting out the full detection window, so the visible gap should fall from the ~2.45 s Night A measured toward the resume budget alone. `node/migration-rig.sh` passes with speculation on (the default) and, now that `MESH_NODE_EXTRA` plumbs flags through to every node it starts, with `--speculate-after-ms 0` forcing it off — a flag that could not be turned off in the rig could not have been A/B tested on a box either. `sudo node/chaos-rig.sh 15` ran 17 disruptions (10 kill, 4 partition, 3 announced) with the same four counts at zero (orphaned, doubled, false alarms, unnoticed restarts) it has always required, plus a `SPECULATION` block of 14 started, 14 confirmed, 0 abandoned — exactly one suspicion per unannounced disruption and none during the announced ones, which is the answer to "does suspicion fire when nothing is wrong?" that loopback *can* give. The visible gap fell to p50 842 ms / p95 1199 ms: a real improvement on 2.45 s, but not the clean ~600 ms a 500 ms threshold implies, because the sweep that raises suspicion is periodic and can lag the threshold by up to its own interval before it fires. **These figures were re-derived from the same logs after a bug was fixed in the tool that produced them** (a takeover could borrow a later disruption's resume, which would have biased the gap optimistic). They did not move — not one number in this paragraph — because the rig fired its disruptions 33 s apart at the closest and the tool matches within a 30 s window, so no takeover here could reach the next one's evidence. That is the rig's pacing saving it, not the old tool being right. What loopback cannot answer — how often suspicion fires when nothing is wrong, *on a connection where things are sometimes slow or lost* — is what Run C was for. It ran on 2026-09-24: **0 false suspicions in 93**, but on two boxes sharing a switch, which has neither loss nor jitter, so that is the condition Run C could not make adverse. **Run D took it to a phone hotspot on 2026-10-10 and the condition became real: 36 wrong suspicions in 73**, exited by `checkpoint` 28 and `heard-again` 8 — the latter being the cause `a6cdc78` was written for, firing in the field for the first time. The gap held at 1076 ms p95 across two carriers against Run C's 1060 ms on one switch, and the whole of the wrong suspicion cost 0.29% of the run's ticks.
 5. **Volunteer run** — *not run, and not currently possible.* The same binary on connections the operator does not own, measured against the stop criteria. **No volunteers are available** (2026-09-25), so this step has no path as written, and nothing that follows substitutes for it: three machines in one household, two of them on the same switch, are not ordinary people's machines on ordinary connections. Every conclusion Phase 0 reaches must say so.
 5a. **Run D** — *done, 2026-10-10.* The nearest the available rig reaches: `diamond` on broadband and `yoinkerz` on a phone hotspot, two carriers, speculation on. It answered the one question Run C could not — false suspicion on a link that genuinely loses and delays packets — and re-tested the visible gap across a real internet path against Run B's pre-speculation 2566 ms, which held at **1076 ms p95**. It also **met two of its own pre-declared failure conditions**: 17 false alarms and 19 yields the partitions do not explain, at a measured cost of 0.29% of the run's ticks and nothing a player could see. **It does not answer step 5**, and no result in it should be read as if it did.
+5b. **Run E** — *done, 2026-11-17.* `riverboat` at home against `diamond` at a friend's house, two households on cable broadband, 8.1 h, 120 disruptions. Every condition fixed before the run held: detection p95 2496 ms, resume p95 200 ms, visible gap p95 **1118 ms**, the four counts at zero, **0 false alarms**, 1 yield beyond the partitions, 4 wrong suspicions in 96, and 0.06% of ticks wasted. One prediction missed: RTT p99 was 276 ms against under 200 ms, nearly all from one 25-minute stretch on the path. Mesh traffic was 14 MB/h per box. **It does not answer step 5 either**: both machines are still the operator's.
 
 ## Run C: handover (2026-09-22) — run on 2026-09-24, results in the section after this one
 
@@ -1322,7 +1345,7 @@ First read, Run D reported **2 orphaned jobs** and **19 unaccounted speculations
 
 **It is not step 5.** Two internet connections in one household, both machines owned and administered by the operator, one of them a laptop carried to a hotspot for the afternoon. It is the nearest the available rig reaches to a volunteer run and it is not one. **Phase 0 results remain an upper bound**, and this run moves the bound on one axis only: the link is now genuinely lossy, while the machines are still dedicated and still the operator's.
 
-## Run E: handover (2026-11-16) — two households
+## Run E: handover (2026-11-16) — two households; run that night, results in the section after this one
 
 **What this run tests.** The same takeover criterion as Runs B–D, for the first time between two households on ordinary broadband. `riverboat` is at home behind the home router (`204.210.210.200`); `diamond` is at a friend's house behind theirs (`75.118.77.81`). Run C had a switch between the boxes, and Run D had a phone hotspot. This is the case in between, and the one a real player is in. It is also:
 - the first run with one box unattended in someone else's home, reachable only over its LTE back channel;
@@ -1424,9 +1447,105 @@ sudo nft list table inet rune_bytes      # on each box, then: sudo nft delete ta
 ```
 What each box runs after the run is a separate decision. `--revert` would put riverboat back on Run C's config, which dials diamond's old home address, and put diamond back on its pre-review binary. Neither is wanted.
 
+## Run E: two households, measured — 2026-11-17
+
+`riverboat` at home and `diamond` at a friend's house, two households on ordinary cable broadband, no rented infrastructure, mesh `run-e`. Chaos was armed from 00:50 to 08:56 UTC (8.1 h). **There were 120 disruptions, and the job advanced 145,009 ticks without stopping.** None of the failure conditions fixed in the handover was met. One of my own predictions missed: the tail of the round-trip times.
+
+| | Baseline | **Run E** | Prediction, fixed before the run | Judged |
+|---|---|---|---|---|
+| Detection p95 | 2463 ms (Run D) | **2496 ms** (n=92) | unchanged, inside 2–3 s | held — **2–3 s met** |
+| Resume p95 | 200 ms (Run D) | **200 ms** (n=92) | unchanged, about 200 ms | held — **500 ms met** |
+| **Visible gap p95** | 1060 ms (Run C), 1076 ms (Run D) | **1118 ms** (n=92) | near 1060–1076 ms | **landed**, 42 ms above Run D |
+| Visible gap p50 | 831 ms (Run D) | **823 ms** | | |
+| Orphaned / doubled / unnoticed restart | 0 | **0 / 0 / 0** of 120 | must stay 0 | held |
+| False alarms | 17 (Run D) | **0** | 0 | held |
+| Yields beyond the partitions | 19 (Run D) | **1** (23 yields, 22 explained) | 0–2 | held |
+| False suspicion | 36 of 73 (Run D) | **4 of 96** (4%) | under 10% | held |
+| RTT p50 | 85 ms (Run D) | **41 ms** (n=2,361) | under 60 ms | held |
+| **RTT p99** | 599 ms (Run D) | **276 ms** | under 200 ms | **missed** |
+| Mesh bytes, UDP 4001, per box | not measurable (Run D) | **14.1 and 14.5 MB/h** | 10–60 MB/h | held, at the low end |
+
+- **The disruptions:** 70 kills, 22 partitions and 28 clean shutdowns. diamond took over 63 times and riverboat 57.
+- **Skipped:** 68 chaos fires, because the box was standby, had no peer, or had not settled.
+- **Worst cases:** every category in both directions met both thresholds. The worst single detection was 2,499 ms, and the worst resume 200 ms.
+
+### The third path gives the same answer
+
+The visible gap p95 on each path so far:
+- 1060 ms on a switch (Run C);
+- 1076 ms across two carriers, one of them a phone hotspot (Run D);
+- **1118 ms between two households** (Run E).
+
+`chaos-rig.sh` on this same build, on loopback, gave 1143 ms. So the internet between two houses added nothing that the build does not already show without a network. The 42 ms over Run D comes with the build, not the path. That rig sample was small (n=20).
+
+### The round trip, and the stretch that missed
+
+| | Run D (two carriers, hotspot) | **Run E (two households)** |
+|---|---|---|
+| RTT p50 | 85 ms | **41 ms** |
+| RTT p95 | 192 ms | **53 ms** |
+| RTT p99 | 599 ms | **276 ms** |
+| RTT max | 666 ms | **881 ms** |
+
+These are the node's own `rtt` events, n=2,361 across both nodes inside the armed window.
+
+**The p99 miss comes almost entirely from one stretch, 01:15–01:41 UTC** (20:15–20:41 at home):
+- Both nodes measured round trips of 200–881 ms at the same moments. The median inside the stretch stayed at 43 ms.
+- 31 of the run's 33 samples over 200 ms fall inside it.
+- Outside it, p99 is **59 ms** (n=2,236).
+
+**The prediction missed, and the split does not change that.** It said p99 under 200 ms over the run, and the run's p99 is 276 ms. The split explains the miss; it does not undo it. An evening on household broadband contains stretches like this one, which is part of why a real evening was worth measuring.
+
+- **The mesh did not cause it.** Repair traffic inside those 25 minutes was in the same range as at any other time: 0–82 items per node per 10 minutes. The run averaged 31 kbit/s per box.
+- **The logs cannot say which household's link it was.** All three of the run's abandoned suspicions fell inside the stretch, at 01:38–01:40, and all three were riverboat suspecting diamond. So at least diamond's messages were arriving late, which means either the friend's upload or the home download. One guess is household traffic queueing on someone's router, but it is only a guess.
+- **What it cost:** three wrong suspicions, 3 ticks discarded, and no false alarm. No peer was declared gone that had not gone. Every takeover inside the stretch met both thresholds.
+
+### What wrong suspicion cost
+
+| | |
+|---|---|
+| started | **96** suspicions acted on before any decision |
+| confirmed | **92** the owner really had gone |
+| abandoned | **3**, all `checkpoint`: the owner came back and kept the job. 1, 2 and 0 ticks discarded |
+| ended by a yield | **1** |
+| unaccounted | **0** |
+
+**The one yield without a partition behind it was a one-second hiccup on the path.** At 08:20:46, 138 s after the last chaos action and with nothing restarting, diamond heard nothing from riverboat for 997 ms. It started a speculative run at tick 135,043 and yielded 153 ms later, when riverboat's tick 135,045 arrived. riverboat's `working` line for that minute shows 300 ticks, unbroken.
+
+**The other 22 yields each came within a second of a partition ending.** The yielding node was behind by 3 ticks at p50 and 5 at most, the same as Run D.
+
+- **Duplicated by yields:** 80 ticks.
+- **Discarded by wrong suspicions:** 3 ticks.
+- **Total wasted: 83 ticks of 145,009, which is 0.06%.** Run D's was 0.29%.
+
+**On household broadband, the 2–3 s window did not thrash.** Run D found it migrating work for a peer that never left about once every fourteen minutes on a phone hotspot. Here there were no false alarms in 8.1 hours. One night between one pair of households cannot set a rate, but it does place Run D's thrashing on the hotspot, not on internet paths in general.
+
+### Data
+
+| | in | out | slice | per box |
+|---|---|---|---|---|
+| `riverboat` | 54.8 MB | 58.0 MB | 7.99 h | **14.1 MB/h** (31 kbit/s) |
+| `diamond` | 57.9 MB | 57.1 MB | 7.94 h | **14.5 MB/h** (32 kbit/s) |
+
+**This is the first total any run has produced. It comes from the `nft` counter table, which outlives restarts.**
+- **When the counters ran:** the tables were created at 00:49:34 (riverboat) and 00:54:05 (diamond), and read at about 17:30 on 2026-11-18.
+- **How the run's share is separated:** the counters kept counting after the run. So the run's share is the counter minus systemd's `IPAccounting` for the node's last start, interpolated to the minute the counters were read. Those last starts were at 08:48:58 and 08:50:28, eight minutes before chaos disarmed.
+- **What the slice covers:** it runs from each counter's creation to that last start, 7.99 h and 7.94 h of the 8.1 h armed.
+- **After the run**, with one steady owner and nothing disrupting it, each box used **10.8 MB/h** over 32.7 h. The owner sent 8.3 MB/h (18 kbit/s) and the standby 2.5 MB/h. Chaos adds about a third.
+- **The two ends agree to within 4%.** riverboat sent 58.0 MB, and diamond counted 57.9 MB in. diamond sent 57.1 MB, and riverboat counted 54.8 MB in. Part of the gap is how the counters are placed: chaos's partition table drops at priority −10, ahead of the counter at 0, so packets a partition dropped were never counted on the partitioned side. riverboat was partitioned 14 times, diamond 8. The rest is whatever the path lost. The per-box rates do not depend on this.
+- **Against the uplinks:** about 16 kbit/s each way is far below a cable uplink, and the friend's connection is uncapped. **Peaks were not measured.** The counters give totals, not bursts.
+
+### The back channel
+
+The link stayed up through the run and logged nothing from 00:40 to 14:25 UTC. In the 27 hours after the run, the modem failed five times. Each recovered with nobody at the box. See "diamond's LTE back channel", where they are recorded.
+
+### What Run E is not
+
+**It is not step 5.** It is the first run between two households, and the link is the kind a real player has. But both machines are the operator's own dedicated, wired, always-on Ubuntu Server boxes, and the data is one night on one pair of cable connections 41 ms apart. **Phase 0 results remain an upper bound.** This run moves the bound on one axis: the mesh met every criterion fixed before the run on an ordinary path between two homes.
+
 ## Open decisions
 
 - **The rendezvous fallback**, if no volunteer turns out to be directly reachable. Manual invite exchange covers address distribution but not simultaneous-transmission timing.
 - ~~**The threshold for an acceptable stall**~~ — settled 2026-08-21: 2–3 s detection, 500 ms resume, at p95.
 - **How many volunteers** the go/no-go can honestly rest on, given three is enough to detect a problem class but not to estimate its frequency.
-- **Whether the detection window should be fixed or per-link.** Run D showed 2–3 s thrashing on a phone hotspot — work migrating for a peer that never left, once every fourteen minutes. The threshold stays as fixed on 2026-08-21, because changing a criterion after seeing the measurement is the thing this plan refuses to do. But the measurement is now in hand, and the question it raises is open: a single global window is set by the worst link any player has, the same shape of problem as the keepalive interval in step 1a. Deciding it needs a case where wrong suspicion is *not* free — work §9.3 excludes from speculation — and Run D did not measure that.
+- **Whether the detection window should be fixed or per-link.** Run D showed 2–3 s thrashing on a phone hotspot — work migrating for a peer that never left, once every fourteen minutes. The threshold stays as fixed on 2026-08-21, because changing a criterion after seeing the measurement is the thing this plan refuses to do. But the measurement is now in hand, and the question it raises is open: a single global window is set by the worst link any player has, the same shape of problem as the keepalive interval in step 1a. Deciding it needs a case where wrong suspicion is *not* free — work §9.3 excludes from speculation — and Run D did not measure that. Run E found no thrashing on household broadband: 0 false alarms in 8.1 h. On the evidence so far, then, the link that sets a global window is a mobile one.
