@@ -73,8 +73,13 @@ The operator chose A on 2026-11-18.
 - **Asking the router.** A node asks for a port by NAT-PMP as now, and by UPnP as well, using libp2p's `upnp` behaviour. Whichever router answers grants the mapping, and both outcomes are reported as events. NAT-PMP keeps its current renewal. UPnP uses the behaviour's own.
 - **Knowing it is reachable.** A node counts itself reachable only once a member has confirmed it, by dialling it back at its external address. This uses libp2p's `autonat`, with members as the only servers it asks. A mapping that was granted but never confirmed does not count.
 - **What a confirmed node does:** it says so in its heartbeat, and it serves introductions.
+- **Found 2026-11-18: a host that keeps away from its household cannot use multicast.** diamond's `isolate-lan` rejects all outgoing multicast, so that it cannot talk to the friend's other devices, and UPnP's discovery step is multicast. The gateway itself is exempt, because DHCP and NAT-PMP need it. So the node asks the gateway directly first (unicast), and tries multicast only where the host allows it.
+  - libp2p's `upnp` behaviour may search by multicast only. If so, the builder uses `igd-next` directly, pointed at the gateway.
+  - Whether the friend's router answers a direct question at all is being checked (`provision/upnp-check.py`). It ignored one on 2026-11-18, which is common: many routers answer only the multicast form. If that is what it does, making diamond reachable means letting SSDP multicast out through `isolate-lan`. That is the operator's decision, because it touches the household.
 
 ### Introductions and punching
+
+**An introduction** is how two members that cannot reach each other still meet. Both can reach a third member, which passes each of them the other's current address and tells them to send now. Both then send at the same moment, and each router lets the other's packets in because its own machine has just sent to that address. The introducer only arranges the meeting. It lasts a couple of minutes at most, and carries none of their traffic afterwards. That is libp2p's relay, used with its short default limits.
 
 - **Who runs what.** Every confirmed-reachable member runs the relay server with the default limits. Every node runs the relay client.
 - **Reservations.** A node that is not confirmed reachable keeps reservations on up to three reachable members, or on all of them if there are fewer, and renews them.
@@ -137,15 +142,18 @@ Each address keeps its own schedule.
 
 ## Decided for the next design: jobs that must not run twice
 
-**The operator's decision, 2026-11-18:** the split rule is chosen per job, by whether the job can repeat. Jobs that can repeat keep running on every side of a split, as now. Jobs that cannot repeat, or cannot be duplicated, run only on a side that sees a majority of their holders. In their words: "I would rather the game pause or lose partial service over the game's logic breaking."
+**The operator's decisions, 2026-11-18:**
+- **The rule is chosen per job,** by whether the job can repeat. Jobs that can repeat keep running on every side of a split, as now. Jobs that cannot run only on a side that sees a majority of their holders. In their words: "I would rather the game pause or lose partial service over the game's logic breaking."
+- **Computing work twice during a brief disconnect is fine** — "ignore my 'never duplicated' comment". What must happen only once is a result *counting*. Strict jobs follow §9.3 as written: "Quorum consensus before commit."
+- **It is built on an established consensus library,** not hand-written.
 
 **What reading this design as its builder found it requires.** It is more than a pause rule, and it is why this is a second project.
-- **"Never duplicated" needs a majority before anything counts.** An owner cut off from the majority can compute a few ticks, about one detection window's worth, before it can know to stop. If its successor resumes from an older checkpoint, those ticks happen twice. Ruling that out means a tick's results count only once a majority of the job's holders holds the checkpoint they came from. That is §9.3's Strict tier as written: "Quorum consensus before commit."
+- **A result that counts once needs a majority before it counts.** An owner cut off from the majority can compute a few ticks, about one detection window's worth, before it can know to stop. If its successor resumes from an older checkpoint, those ticks happen twice. Ruling that out means a tick's results count only once a majority of the job's holders holds the checkpoint they came from. That is §9.3's Strict tier as written: "Quorum consensus before commit."
 - **That brings the usual parts of a consensus protocol:**
   - ownership terms, so that an old owner cannot gather a majority once a successor has started;
   - a successor that resumes from the newest checkpoint any member of its majority holds;
   - holder-set changes, joins and departures, decided by a majority the same way. Membership change is where majority designs usually break.
-- **The first choice there is how to build it:** an established Raft library, or a minimal protocol over the existing gossip. Hand-written consensus is where subtle bugs live.
+- **Built on a library,** as the operator decided. Which library, and how it carries its messages over the mesh, is that design's first question.
 
 **Consequences already known, and accepted by the operator's preference:**
 - A strict job never speculates, so its takeover takes about a detection window, roughly 2.5–3 s, where a repeatable job's gap is about 1 s.
