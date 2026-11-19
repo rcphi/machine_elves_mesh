@@ -38,6 +38,13 @@ pub const FIRST_RETRY: Duration = Duration::from_secs(2);
 /// The first retry for a circuit: a punch that failed will fail again at once.
 pub const CIRCUIT_FIRST_RETRY: Duration = Duration::from_secs(60);
 
+/// How long after losing a direct connection its addresses are retried at
+/// `FIRST_RETRY`, before the backoff starts. Found in the chaos rig: a peer
+/// just lost is usually back soon — a partition ends, a restart completes, a
+/// hotspot reconnects — and a backoff begun at once rejoined up to a minute
+/// late. A peer that never returns costs about 60 quick attempts, once.
+pub const FAST_AFTER_LOSS: Duration = Duration::from_secs(120);
+
 /// The longest wait between two attempts at one address.
 pub fn cap(kind: Kind) -> Duration {
     match kind {
@@ -56,6 +63,8 @@ struct Entry {
     peer: Option<PeerId>,
     next: Instant,
     interval: Duration,
+    /// Until when retries stay at the first interval, after a loss.
+    fast_until: Option<Instant>,
 }
 
 /// Every address this node is trying to reach, and when it tries each next.
@@ -83,7 +92,7 @@ impl Schedule {
             }
             return false;
         }
-        self.entries.insert(addr, Entry { kind, peer, next: now, interval: first(kind) });
+        self.entries.insert(addr, Entry { kind, peer, next: now, interval: first(kind), fast_until: None });
         true
     }
 
@@ -97,6 +106,7 @@ impl Schedule {
             if entry.kind != Kind::Circuit {
                 entry.next = now;
                 entry.interval = first(entry.kind);
+                entry.fast_until = Some(now + FAST_AFTER_LOSS);
             }
         }
     }
@@ -122,7 +132,9 @@ impl Schedule {
             if entry.next <= now {
                 due.push(addr.clone());
                 entry.next = now + entry.interval;
-                entry.interval = (entry.interval * 2).min(cap(entry.kind));
+                if entry.fast_until.is_none_or(|until| now >= until) {
+                    entry.interval = (entry.interval * 2).min(cap(entry.kind));
+                }
             }
         }
         due
@@ -258,6 +270,40 @@ mod tests {
         assert!(s.contains(&addr(3)));
         s.remove(&addr(3));
         assert_eq!(s.len(), 0);
+    }
+
+    /// Found in the chaos rig: a 51 s partition ended between the backoff's
+    /// 30 s and 62 s attempts, so the two nodes rejoined 23 s after the
+    /// network had healed, where a 2 s retry had always rejoined within 2 s.
+    /// A peer just lost is usually back soon: retries stay at 2 s for a while.
+    #[test]
+    fn after_a_lost_connection_retries_stay_at_two_seconds_for_two_minutes() {
+        let t0 = Instant::now();
+        let mut s = Schedule::new();
+        s.add(addr(1), Kind::Configured, None, t0);
+        s.due(t0);
+        s.reset(&addr(1), t0);
+        let mut hits = Vec::new();
+        for sec in 0..300 {
+            if !s.due(t0 + Duration::from_secs(sec)).is_empty() {
+                hits.push(sec);
+            }
+        }
+        let gaps: Vec<u64> = hits.windows(2).map(|w| w[1] - w[0]).collect();
+        assert!(gaps.iter().take_while(|&&g| g == 2).count() >= 59, "{gaps:?}");
+        assert_eq!(FAST_AFTER_LOSS, Duration::from_secs(120));
+        assert!(gaps.iter().any(|&g| g > 2), "and then it backs off: {gaps:?}");
+    }
+
+    #[test]
+    fn a_lost_peer_that_never_returns_costs_under_130_attempts_in_its_first_hour() {
+        let t0 = Instant::now();
+        let mut s = Schedule::new();
+        s.add(addr(1), Kind::Configured, None, t0);
+        s.due(t0);
+        s.reset(&addr(1), t0);
+        let n = (0..3600).filter(|&sec| !s.due(t0 + Duration::from_secs(sec)).is_empty()).count();
+        assert!(n <= 130, "{n}");
     }
 
     #[test]

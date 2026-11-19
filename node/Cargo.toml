@@ -15,6 +15,9 @@ rand_core = { version = "0.6", features = ["getrandom"] }
 # behaviour searches by multicast only, which a host kept away from its
 # household (isolate-lan) may not send.
 igd-next = { version = "0.16", default-features = false, features = ["aio_tokio"] }
+# MESH_NODE_TRACE=<filter> prints libp2p's own diagnostics to stderr: AutoNAT
+# drops some outcomes without an event, and explains them only there.
+tracing-subscriber = { version = "0.3", default-features = false, features = ["env-filter", "fmt", "ansi"] }
 sha2 = "0.11.0"
 tokio = { version = "1.53.1", features = ["rt-multi-thread", "macros", "time", "signal"] }
 wasmtime = "48.0.0"

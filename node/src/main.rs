@@ -899,6 +899,15 @@ struct Speculating {
 }
 
 fn main() -> Result<()> {
+    // Off unless asked for: the event log on stdout is the record, and this is
+    // a diagnostic beside it, for what libp2p explains only in its own logs.
+    if let Ok(filter) = std::env::var("MESH_NODE_TRACE") {
+        let _ = tracing_subscriber::fmt()
+            .with_env_filter(tracing_subscriber::EnvFilter::new(filter))
+            .with_writer(std::io::stderr)
+            .with_ansi(false)
+            .try_init();
+    }
     // Running a job takes no network and no peers, so it is handled before the
     // swarm exists rather than as a mode of it.
     let args: Vec<String> = std::env::args().collect();
@@ -1208,6 +1217,33 @@ const AUTONAT_PROBE_EVERY: Duration = Duration::from_secs(60);
 /// How many of this node's candidate addresses it tests.
 const AUTONAT_MAX_CANDIDATES: usize = 4;
 
+/// How long after dialling an address a connection from it still proves
+/// nothing about this node's reachability.
+const UNSOLICITED_AFTER: Duration = Duration::from_secs(600);
+
+/// The IP address an address names, if it names one.
+fn ip_of(addr: &Multiaddr) -> Option<std::net::IpAddr> {
+    addr.iter().find_map(|p| match p {
+        libp2p::multiaddr::Protocol::Ip4(ip) => Some(std::net::IpAddr::V4(ip)),
+        libp2p::multiaddr::Protocol::Ip6(ip) => Some(std::net::IpAddr::V6(ip)),
+        _ => None,
+    })
+}
+
+/// Whether a connection arriving from `remote` proves this node reachable:
+/// true unless this node dialled that address within `UNSOLICITED_AFTER`.
+///
+/// Found in the NAT rig, 2026-11-18: AutoNAT v2's server answers only on
+/// connections it received, so a node is only ever tested by peers it dialled.
+/// A reachable member is the one everybody dials and that dials nobody, so it
+/// was never tested and never introduced anyone. Routers that admit only
+/// replies — both of Run F's did — let in a connection from an address this
+/// node has not sent to only if its door is open, which is the operator's
+/// rule exactly: reachability confirmed by a successful connection.
+fn unsolicited(remote: std::net::IpAddr, dialled: &HashMap<std::net::IpAddr, Instant>, now: Instant) -> bool {
+    dialled.get(&remote).is_none_or(|at| now.duration_since(*at) > UNSOLICITED_AFTER)
+}
+
 /// Whether a member has confirmed it can reach this node, at any address.
 #[derive(Default)]
 struct Reachability {
@@ -1217,6 +1253,11 @@ struct Reachability {
 impl Reachability {
     /// Records a confirmed address; true when this makes the node reachable.
     fn confirm(&mut self, addr: Multiaddr) -> bool {
+        // An address through an introducer is someone else's door, not this
+        // node's: holding one says nothing about being reachable directly.
+        if is_relayed(&addr) {
+            return false;
+        }
         let was = self.is_reachable();
         self.confirmed.insert(addr);
         !was
@@ -1270,9 +1311,39 @@ fn choose_introducers(
     chosen
 }
 
+/// How long an introducer that refused, or whose introduction ended in an
+/// error, waits before it is asked again.
+const INTRODUCER_RETRY: Duration = Duration::from_secs(60);
+
+/// The directly connected members that may be asked to introduce now: all of
+/// them except those that refused within `INTRODUCER_RETRY`.
+fn eligible_introducers(
+    directly_connected: &HashSet<PeerId>,
+    refused_at: &HashMap<PeerId, Instant>,
+    now: Instant,
+) -> HashSet<PeerId> {
+    directly_connected
+        .iter()
+        .filter(|p| refused_at.get(p).is_none_or(|at| now.duration_since(*at) >= INTRODUCER_RETRY))
+        .copied()
+        .collect()
+}
+
 /// Whether an address goes through an introducer.
 fn is_relayed(addr: &Multiaddr) -> bool {
     addr.iter().any(|p| matches!(p, libp2p::multiaddr::Protocol::P2pCircuit))
+}
+
+/// Whether a connection goes through an introducer, from either end: the
+/// dialling end sees the circuit in the remote address, the receiving end in
+/// its local one (its remote is only `/p2p/<peer>`).
+fn connection_relayed(endpoint: &libp2p::core::ConnectedPoint) -> bool {
+    match endpoint {
+        libp2p::core::ConnectedPoint::Dialer { address, .. } => is_relayed(address),
+        libp2p::core::ConnectedPoint::Listener { local_addr, send_back_addr } => {
+            is_relayed(local_addr) || is_relayed(send_back_addr)
+        }
+    }
 }
 
 /// The address to listen on for introductions through `relay`, reached at
@@ -1364,6 +1435,14 @@ async fn run(config: Config) -> Result<()> {
     let keypair = load_or_create_identity(&config)?;
     let mut swarm = build_swarm(&config, keypair)?;
     let mut reachability = Reachability::default();
+    // When this node last dialled each IP, so that a connection back from one
+    // it dialled is not taken as proof that it can be reached.
+    let mut dialled_ips: HashMap<std::net::IpAddr, Instant> = HashMap::new();
+    // Connections that arrived unasked, waiting for identify to say which
+    // address the member reached this node at.
+    let mut proven_conns: HashSet<libp2p::swarm::ConnectionId> = HashSet::new();
+    // When each introducer last refused, so it is not asked twice a second.
+    let mut introducer_refused: HashMap<PeerId, Instant> = HashMap::new();
     // Introducers this node holds, by the listener each one's circuit is on.
     let mut introducers: HashMap<PeerId, libp2p::core::transport::ListenerId> = HashMap::new();
     // This node's addresses through its introducers, announced like any other.
@@ -1589,6 +1668,9 @@ async fn run(config: Config) -> Result<()> {
                     // is also sending, there is nothing at the far end willing
                     // to answer. The attempt is worth making anyway, because
                     // the outgoing packet is what opens this side's path.
+                    if let Some(ip) = ip_of(addr) {
+                        dialled_ips.insert(ip, Instant::now());
+                    }
                     let _ = swarm.dial(addr.clone());
                 }
                 if dial_attempts == 1 || dial_attempts % 15 == 0 {
@@ -1647,6 +1729,17 @@ async fn run(config: Config) -> Result<()> {
                         emit(&config, "port-map-failed", &error,
                              &[("error", &error),
                                ("was_mapped", if mapping.is_some() { "true" } else { "false" })]);
+                        // The door this node held is closing: what members
+                        // proved through it no longer holds.
+                        if mapping.is_some() {
+                            for addr in reachability.confirmed.clone() {
+                                if reachability.expire(&addr) {
+                                    emit(&config, "unreachable",
+                                         &format!("the router stopped forwarding, so {addr} may be closed"),
+                                         &[("addr", &addr.to_string())]);
+                                }
+                            }
+                        }
                         mapping = None;
                     }
                 }
@@ -1860,7 +1953,8 @@ async fn run(config: Config) -> Result<()> {
                 // this node is directly connected to, and none if it is
                 // reachable itself. Each rides on that direct connection.
                 {
-                    let direct_peers: HashSet<PeerId> = direct.values().copied().collect();
+                    let direct_peers = eligible_introducers(&direct.values().copied().collect(),
+                                                            &introducer_refused, now);
                     let held: BTreeSet<PeerId> = introducers.keys().copied().collect();
                     let chosen = choose_introducers(reachability.is_reachable(), &members,
                                                     &direct_peers, &held, MAX_INTRODUCERS);
@@ -1876,6 +1970,7 @@ async fn run(config: Config) -> Result<()> {
                                 introducers.insert(*peer, id);
                             }
                             Err(error) => {
+                                introducer_refused.insert(*peer, now);
                                 if let Some(repeats) = quiet.say("introducer", now) {
                                     emit(&config, "introducer-lost",
                                          &format!("could not ask for an introduction: {error}"),
@@ -2061,7 +2156,16 @@ async fn run(config: Config) -> Result<()> {
             event = swarm.select_next_some() => match event {
                 SwarmEvent::ConnectionEstablished { peer_id, connection_id, endpoint, .. } => {
                     connected_at.entry(peer_id).or_insert_with(Instant::now);
-                    let relayed = is_relayed(endpoint.get_remote_address());
+                    let relayed = connection_relayed(&endpoint);
+                    // A member reached this node from an address it had not
+                    // dialled: the door is open. See `unsolicited`.
+                    // Which address it reached is what identify will say next:
+                    // the listening address is only 0.0.0.0.
+                    if let libp2p::core::ConnectedPoint::Listener { send_back_addr, .. } = &endpoint {
+                        if !relayed && ip_of(send_back_addr).is_some_and(|ip| unsolicited(ip, &dialled_ips, Instant::now())) {
+                            proven_conns.insert(connection_id);
+                        }
+                    }
                     if !relayed {
                         // Every address tagged with this peer stops being
                         // dialled, whichever side opened the connection. Not
@@ -2189,6 +2293,9 @@ async fn run(config: Config) -> Result<()> {
                         // node that sees itself can never continue a job.
                         if peer == me { continue }
                         swarm.behaviour_mut().gossipsub.add_explicit_peer(&peer);
+                        if let Some(ip) = ip_of(&addr) {
+                            dialled_ips.insert(ip, Instant::now());
+                        }
                         let _ = swarm.dial(addr);
                     }
                 }
@@ -2451,6 +2558,9 @@ async fn run(config: Config) -> Result<()> {
                             // and arriving together is the entire point.
                             let kind = if relayed { dialing::Kind::Circuit } else { dialing::Kind::Observed };
                             if dials.add(addr.clone(), kind, Some(peer), Instant::now()) {
+                                if let Some(ip) = ip_of(&addr) {
+                                    dialled_ips.insert(ip, Instant::now());
+                                }
                                 let _ = swarm.dial(addr);
                             }
                         }
@@ -2593,6 +2703,9 @@ async fn run(config: Config) -> Result<()> {
                     }
                     if let Some(peer) = introducers.iter().find(|(_, id)| **id == listener_id).map(|(p, _)| *p) {
                         introducers.remove(&peer);
+                        if reason.is_err() {
+                            introducer_refused.insert(peer, Instant::now());
+                        }
                         let error = match reason { Ok(()) => "closed".to_string(), Err(e) => e.to_string() };
                         emit(&config, "introducer-lost", &format!("an introducer stopped: {error}"),
                              &[("peer_id", &peer.to_string()),
@@ -2608,6 +2721,35 @@ async fn run(config: Config) -> Result<()> {
                     emit(&config, "introducer-held",
                          &format!("{label} will introduce this node to members it cannot reach"),
                          &[("peer_id", &relay_peer_id.to_string()), ("label", &label)]);
+                }
+
+                // A member that reached this node unasked says where it found
+                // it. That address is this node's own, as far as introducing
+                // goes: the relay grants nothing until it knows one, because
+                // it has to tell the other side where to reach it.
+                SwarmEvent::Behaviour(MeshBehaviourEvent::Identify(identify::Event::Received {
+                    connection_id, info, ..
+                })) if proven_conns.remove(&connection_id) => {
+                    let observed = info.observed_addr;
+                    swarm.add_external_address(observed.clone());
+                    if reachability.confirm(observed.clone()) {
+                        emit(&config, "reachable",
+                             &format!("a member reached this node at {observed} unasked: it can introduce others"),
+                             &[("addr", &observed.to_string()), ("by", "connection")]);
+                    }
+                }
+
+                // Every reachability test, whatever its outcome: a node that is
+                // never confirmed reachable is otherwise silent about why.
+                SwarmEvent::Behaviour(MeshBehaviourEvent::AutonatClient(autonat::v2::client::Event {
+                    tested_addr, server, result, ..
+                })) => {
+                    let label = members.get(&server).map(|m| m.label.clone()).unwrap_or_default();
+                    let outcome = match &result { Ok(()) => "reached".to_string(), Err(e) => e.to_string() };
+                    emit(&config, "reachability-tested",
+                         &format!("{label} tried to reach this node at {tested_addr}: {outcome}"),
+                         &[("addr", &tested_addr.to_string()), ("label", &label),
+                           ("ok", if result.is_ok() { "true" } else { "false" }), ("outcome", &outcome)]);
                 }
 
                 SwarmEvent::Behaviour(MeshBehaviourEvent::Dcutr(dcutr::Event { remote_peer_id, result })) => {
@@ -2637,7 +2779,7 @@ async fn run(config: Config) -> Result<()> {
                     if reachability.confirm(address.clone()) {
                         emit(&config, "reachable",
                              &format!("a member reached this node at {address}: it can introduce others"),
-                             &[("addr", &address.to_string())]);
+                             &[("addr", &address.to_string()), ("by", "autonat")]);
                     }
                 }
                 SwarmEvent::ExternalAddrExpired { address } => {
@@ -2884,9 +3026,8 @@ fn redial_lost_peer(
         // The one event that brings an address forward: a direct connection
         // to its peer was lost, so the peer may be back within seconds.
         let kind = if config.dial.contains(addr) { dialing::Kind::Configured } else { dialing::Kind::Observed };
-        if !dials.add(addr.clone(), kind, Some(*peer), now) {
-            dials.reset(addr, now);
-        }
+        dials.add(addr.clone(), kind, Some(*peer), now);
+        dials.reset(addr, now);
         resumed += 1;
     }
     if resumed > 0 {
@@ -3183,6 +3324,19 @@ mod tests {
         peers
     }
 
+    /// Found in the NAT rig: a refused introduction was asked for again at
+    /// every sweep, twice a second, for as long as the refusal lasted.
+    #[test]
+    fn an_introducer_that_refused_waits_a_minute_before_it_is_asked_again() {
+        let t0 = Instant::now();
+        let p = sorted_peers(2);
+        let direct = HashSet::from([p[0], p[1]]);
+        let refused = HashMap::from([(p[0], t0)]);
+        assert_eq!(eligible_introducers(&direct, &refused, t0 + Duration::from_secs(1)), HashSet::from([p[1]]));
+        assert_eq!(eligible_introducers(&direct, &refused, t0 + INTRODUCER_RETRY), direct);
+        assert_eq!(INTRODUCER_RETRY, Duration::from_secs(60));
+    }
+
     #[test]
     fn a_reachable_node_holds_no_introducers() {
         let p = sorted_peers(1);
@@ -3234,6 +3388,34 @@ mod tests {
         assert!(is_relayed(&circuit_listen_addr(&direct, relay)));
     }
 
+    /// Found in the NAT rig: the receiving end of an introduction sees only
+    /// `/p2p/<peer>` as the remote address. The circuit is in its local one, so
+    /// a check of the remote alone counted the introduction as a direct link.
+    #[test]
+    fn a_connection_through_an_introducer_is_relayed_from_both_ends() {
+        use libp2p::core::{ConnectedPoint, Endpoint, transport::PortUse};
+        let relay = PeerId::random();
+        let peer = PeerId::random();
+        let circuit = circuit_listen_addr(&"/ip4/192.0.2.10/udp/4001/quic-v1".parse().unwrap(), relay);
+        let receiving = ConnectedPoint::Listener {
+            local_addr: circuit.clone(),
+            send_back_addr: Multiaddr::empty().with(libp2p::multiaddr::Protocol::P2p(peer)),
+        };
+        let dialling = ConnectedPoint::Dialer {
+            address: dialable(&circuit, peer),
+            role_override: Endpoint::Dialer,
+            port_use: PortUse::Reuse,
+        };
+        let direct = ConnectedPoint::Dialer {
+            address: "/ip4/198.51.100.1/udp/4001/quic-v1".parse().unwrap(),
+            role_override: Endpoint::Dialer,
+            port_use: PortUse::Reuse,
+        };
+        assert!(connection_relayed(&receiving));
+        assert!(connection_relayed(&dialling));
+        assert!(!connection_relayed(&direct));
+    }
+
     #[test]
     fn a_circuit_listen_address_names_the_relay_once() {
         let relay = PeerId::random();
@@ -3268,6 +3450,42 @@ mod tests {
         let c = relay_config();
         assert_eq!(c.max_circuit_duration, Duration::from_secs(120));
         assert_eq!(c.max_circuit_bytes, 131_072);
+    }
+
+    /// Both of Run F's routers admit only replies, so a connection arriving
+    /// from an address this node has not sent to proves the door is open. One
+    /// from an address it just dialled proves nothing: that is a punch, or a
+    /// blind dial met halfway.
+    #[test]
+    fn only_a_connection_from_an_address_not_dialled_recently_proves_reachability() {
+        let t0 = Instant::now();
+        let peer: std::net::IpAddr = "203.0.113.1".parse().unwrap();
+        let mut dialled = HashMap::new();
+        assert!(unsolicited(peer, &dialled, t0), "never dialled: it found us");
+        dialled.insert(peer, t0);
+        assert!(!unsolicited(peer, &dialled, t0 + Duration::from_secs(60)), "we sent to it a minute ago");
+        assert!(unsolicited(peer, &dialled, t0 + UNSOLICITED_AFTER + Duration::from_secs(1)));
+    }
+
+    #[test]
+    fn an_address_names_its_ip() {
+        let quic: Multiaddr = "/ip4/192.0.2.10/udp/4001/quic-v1".parse().unwrap();
+        assert_eq!(ip_of(&quic), Some("192.0.2.10".parse().unwrap()));
+        let none: Multiaddr = "/dns4/example.org/udp/4001/quic-v1".parse().unwrap();
+        assert_eq!(ip_of(&none), None);
+    }
+
+    /// Found in the NAT rig: holding an introduction makes libp2p confirm the
+    /// relayed address as this node's own, and a node that took that as
+    /// reachable dropped the very introductions that gave it the address.
+    #[test]
+    fn an_address_through_an_introducer_never_makes_a_node_reachable() {
+        let relay = PeerId::random();
+        let circuit = circuit_listen_addr(&"/ip4/192.0.2.10/udp/4001/quic-v1".parse().unwrap(), relay)
+            .with(libp2p::multiaddr::Protocol::P2p(PeerId::random()));
+        let mut r = Reachability::default();
+        assert!(!r.confirm(circuit));
+        assert!(!r.is_reachable());
     }
 
     #[test]
