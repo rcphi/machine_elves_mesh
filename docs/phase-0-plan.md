@@ -1695,7 +1695,7 @@ Logs: `provision/results/run-f/`, not committed, as for every run.
 
 ## Run G: handover (2026-11-18) — Run F again, with relaying and coordinated punching
 
-**What changed since Run F** is the relaying design (`docs/superpowers/specs/2026-11-18-relaying-and-hole-punching-design.md`, built on branch `relaying-and-punching`, release `59450fb`):
+**What changed since Run F** is the relaying design (`docs/superpowers/specs/2026-11-18-relaying-and-hole-punching-design.md`, built on branch `relaying-and-punching`, release `d941bec`):
 - **Dial backoff:** every address keeps its own schedule. Retries start at 2 s and stay there for two minutes after a lost connection, then double, to 60 s for configured addresses and 300 s for others.
 - **A peer book** on disk (`--peer-book`; `timed-run.sh` points it at `peers-<mesh>`).
 - **Reachability** is learned from members: by a connection that arrives unasked, or by AutoNAT's dial-back. Heartbeats carry it.
@@ -1734,7 +1734,7 @@ Same three parts as Run F, 2 h, the hotspot limit:
 
 **What would mean the punch is not worth keeping:** yoinkerz's bytes reaching Run F's 65.4 MB, because then the introductions and punches cost what the failed dialling did.
 
-**Staged 2026-11-18:** the static build of `59450fb` (`mesh-node` sha256 `5d7cc042…`) and the new `timed-run.sh` (`8730fc11…`) are in `~/rune` on riverboat, diamond (over LTE) and yoinkerz, checked against lightning's hashes, with each box's `SHA256SUMS` rewritten. The rest of `~/rune` is Run F's, unchanged.
+**Staged 2026-11-18:** the static build of `d941bec` (`mesh-node` sha256 `32941167…`), after the review's fixes and the operator's option 2 for rejoining, and the new `timed-run.sh` (`8730fc11…`) are in `~/rune` on riverboat, diamond (over LTE) and yoinkerz, checked against lightning's hashes, with each box's `SHA256SUMS` rewritten. The rest of `~/rune` is Run F's, unchanged.
 
 **Commands,** in Run F's order. First, on yoinkerz while still on home Wi-Fi:
 ```
