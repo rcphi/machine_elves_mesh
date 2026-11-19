@@ -1758,6 +1758,70 @@ sudo ./timed-run.sh --label yoinkerz  --mesh run-g --peer 204.210.210.200 --hour
 - **Afterwards:** on each box, `sudo nft list table inet rune_bytes && sudo nft delete table inet rune_bytes`. Then on yoinkerz, `sudo systemctl stop mesh-node` and `sudo snap refresh --unhold`, and read the phone's counter again.
 - **The analysis:** `takeover-summary.py` and `link-summary.py` over the three boxes' logs.
 
+## Run G: the unreachable pair met, and the mesh stopped splitting — 2026-11-19
+
+The same three machines and connections as Run F, on the relaying build (`d941bec`), mesh `run-g`. Chaos ran 02:51–03:38 UTC. The laptop started at 02:53:52; riverboat left at 25:26 and returned at 32:33. **diamond and yoinkerz connected directly 14 minutes in, on the real routers where Run F never managed it in two hours, and stayed connected while riverboat was away.** The coordinated punch played no part: all 9 attempts failed. What made the link was the dial backoff.
+
+| | Prediction | Run G | |
+|---|---|---|---|
+| riverboat reachable | yes, by connection | **yes**, 1.2 s after its start | held |
+| diamond and yoinkerz reachable | no | **no**: diamond's 7 AutoNAT tests all failed | held |
+| Introductions on riverboat | both | **both**: diamond 5 times, yoinkerz 7 | held |
+| **A direct diamond–yoinkerz link** | not predicted | **yes, from 13:56**, by simultaneous dial, not by DCUtR | **missed, in the good direction** |
+| Coordinated punches | on the circuit schedule | **9 failures logged, none succeeded** ("giving up after 3 dial attempts") | as predicted; DCUtR never worked here |
+| When riverboat leaves | the split recurs | **no split**: the pair stayed connected, and survived a restart of diamond in that window by reconnecting directly in 8 s | better than predicted |
+| When it returns | heals within seconds | **0.06 s to diamond and 0.09 s to yoinkerz**, by its own dials to where it last saw them (option 2) | held |
+| Detection / resume p95 | as before | **2390 / 201 ms** (n=6) | held |
+| Work done twice | (Run F: ~18,000 ticks) | **569 ticks**, all before the direct link formed | |
+| yoinkerz's mesh bytes | 8–14 MB | **30.9 MB in about 47 min** (14.8 in, 16.1 out); the phone counter went from 4.49 to 4.54 GB | **missed**: see below |
+| The not-worth-keeping line | Run F's rate, ~30 MB/h | **~39 MB/h** | **met as written**, judged the wrong measure (below) |
+
+### How the direct link formed
+
+- **The two learned each other's addresses at the same moment.** riverboat's announcement reached both, about 30 s in.
+- **Their redials stayed in step.** Both followed the same backoff: 2, 4, 8 … 256 s, then every 300 s. At about 13:56 both dialled within the same millisecond, and the QUIC connections opened from both ends: diamond to `70.242.193.12:6690`, yoinkerz to `75.118.77.81:4001`.
+- **Why that worked when Run F's two hours of dialling did not** is the NAT rig's finding at zero delay, now seen on real routers. A packet that reaches a router before its own machine has sent is recorded, and the machine's own packet is then given another port. Run F retried every 2 s, so those stray records never expired. With retries minutes apart, they lapse between attempts, and a pair of dials in step crosses cleanly. This is a reading of the evidence, not a proof: the routers cannot be inspected.
+- **DCUtR's coordinated punch never succeeded**, in 9 attempts. Its sends come in quick succession, which on this reading recreates exactly the stray records the slow schedule avoids.
+
+### When riverboat left, nothing split
+
+- **Before the direct link, splits still happened.** At 4:36 riverboat restarted under chaos, the pair lost each other, and both took over the job. That is the run's one "more than one took over"; it healed with a yield 10 s later. Two false alarms and one yield beyond the partitions came from the same moments.
+- **After it, the pair no longer depended on riverboat.**
+  - During riverboat's 7-minute absence they stayed connected. Chaos restarted diamond in that window, and it reconnected to yoinkerz **directly in 8 s**, with no reachable member anywhere in the mesh.
+  - That is the self-healing the design was for, and Run F's 57-minute split did not recur.
+- **riverboat's return took 0.06–0.09 s**, by its own dials to the addresses it had last seen them at, through the doors their once-a-minute dials held open. Without option 2 it would have taken up to a minute.
+
+### The data, and a criterion that measured the wrong thing
+
+| | in | out | total |
+|---|---|---|---|
+| `riverboat` | 20.5 MB | 21.3 MB | 41.8 MB |
+| `diamond` | 16.7 MB | 16.6 MB | 33.3 MB |
+| `yoinkerz` (hotspot) | 14.8 MB | 16.1 MB | **30.9 MB**, about 39 MB/h |
+
+**The prediction missed, and the kill criterion written before the run is met as written.** It said yoinkerz reaching Run F's ~30 MB/h would mean the punch was not worth keeping.
+
+**Both were built on Run F's topology**, where yoinkerz had one link. In Run G it had two direct peers for most of the run, and it owned the job for about 55% of it (7,360 owner ticks, against diamond's 4,732). The owner sends five checkpoints a second to each peer.
+- **The arithmetic:** Run E's owner sent 8.3 MB/h to one peer, which predicts about 17–20 MB/h out to two. yoinkerz sent about 21 MB/h.
+- **What that rules out:** failed dialling was about two-thirds of Run F's bytes, and is gone; traffic is balanced in and out on every box. The relaying pieces checked are small: about 800 repair items, introductions capped at 128 KiB each, and 9 reachability tests.
+
+**So the criterion counted a working direct link as overhead.** That reading is inferred from the totals and the owner time; the counters do not split bytes by peer. *The operator accepted this reading on 2026-11-19.* A controlled comparison in the NAT rig, bytes per connection on Run F's build against this one, would settle it if it matters later.
+
+**Two consequences for the design:**
+- **A node on a metered link costs about 20 MB/h while it owns a job with two peers, rising with every peer.** Owner placement should prefer unmetered members. That is a later design question, not a Phase 0 one.
+- **The dial schedule, not DCUtR, made the link.** DCUtR may be kept, since it costs little, but nothing here shows it earning its place.
+
+### Other findings
+
+- **AutoNAT tested a relayed address once** (diamond, at `/p2p-circuit`). It was harmless, since relayed addresses never count, but it is wasted effort.
+- **The review's deferred minors stand.** One is now seen in the logs: `link-summary.py` counts a punch from both ends.
+
+### What Run G is not
+
+**It is one run of 47 minutes on one pair of routers and one carrier.** The direct link formed once and was rebuilt five times, always by dials in step. It shows that the backoff can open a path these routers refused under constant retries, not how often it will elsewhere. The machines are still the operator's, and Phase 0 results remain an upper bound.
+
+Logs: `provision/results/run-g/`, not committed, as for every run.
+
 ## Open decisions
 
 - **The rendezvous fallback**, if no volunteer turns out to be directly reachable. Manual invite exchange covers address distribution but not simultaneous-transmission timing. **Run F (2026-11-18) made this concrete:** two unreachable members never connected to each other, even though both NATs are endpoint-independent and both dialled the right address for two hours. With no relay, losing the one reachable member split the mesh and ran the job twice for 57 minutes. A relay on a reachable member, with coordinated punching as the upgrade, is now a requirement rather than a fallback to decide on.

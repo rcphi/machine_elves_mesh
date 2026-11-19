@@ -55,18 +55,22 @@ Violating any of these silently invalidates the experiment.
 Done: the connection probe, the provisioning, and the mesh node — overlay and
 gossip, sandboxed WASM jobs with fuel and memory limits, checkpointing, and
 takeover with speculative resume — measured on real boxes in Night A and Runs
-B–F. diamond has lived at a friend's house since 2026-11-12, managed over an
+B–G. diamond has lived at a friend's house since 2026-11-12, managed over an
 LTE back channel. Run E (2026-11-17) put it against riverboat at home, the
 first run across two households, and met every criterion fixed before it.
 Run F (2026-11-18) added the laptop on a hotspot: the two unreachable machines
 never connected to each other, so losing riverboat split the mesh and ran the
-job twice for 57 minutes.
+job twice for 57 minutes. The relaying design followed (branch
+`relaying-and-punching`), and Run G (2026-11-19) repeated Run F on it: the pair
+connected directly after 14 minutes — by the dial backoff, not by DCUtR's punch
+— and losing riverboat no longer split anything.
 An external review (`CODE_REVIEW_2026-11-07.md`) is being worked through; its
 completion record says what is fixed.
 
-Next: relaying through a reachable member, with coordinated hole punching as
-the upgrade and a backoff on dial retries, before Phase 1. Not yet designed.
-`docs/phase-0-plan.md` is the record; Run F's section says why.
+Next: merge `relaying-and-punching`; then the design for jobs that must not
+run twice (a consensus library for §9.3's Strict tier — the starting point is
+recorded in the relaying design); then the Phase 0 decision record.
+`docs/phase-0-plan.md` is the record.
 
 Available: 3 home connections and one friend's. No VPSs, by decision.
 
