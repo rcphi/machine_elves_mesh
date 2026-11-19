@@ -236,6 +236,12 @@ const DIAL_RETRY: Duration = Duration::from_secs(2);
 /// first dialled or named, which is rare once a mesh has settled.
 const BOOK_SAVE_EVERY: Duration = Duration::from_secs(10);
 
+/// How recently a peer must have been seen for a restarted node to dial
+/// where it last saw it. Generous, because what matters is whether the peer
+/// is still trying to reach this node, not how long this node was away:
+/// Run F's part 2 lasted 57 minutes.
+const RETURN_DIAL_WITHIN: Duration = Duration::from_secs(24 * 3600);
+
 /// The retry timer, built so that a quiet mesh does not store up work for it.
 ///
 /// Its arm in the event loop is guarded by `dials.len() > 0`, so while
@@ -1562,6 +1568,13 @@ async fn run(config: Config) -> Result<()> {
     for addr in book.addresses_to_dial() {
         dials.add(addr, dialing::Kind::Remembered, None, Instant::now());
     }
+    // And, briefly, where peers that cannot be dialled were last seen: they
+    // have been dialling this node while it was away, which holds their
+    // routers open toward it, so this gets through at once instead of waiting
+    // up to a minute for their next try. The operator's option 2, 2026-11-18.
+    for (peer, addr) in book.seen_recently(now_millis() as u64, RETURN_DIAL_WITHIN.as_millis() as u64) {
+        dials.add_briefly(addr, Some(peer), Instant::now(), dialing::FAST_AFTER_LOSS);
+    }
     // Written at most every BOOK_SAVE_EVERY, and only when something changed.
     let mut book_dirty = false;
     let mut book_saved_at: Option<Instant> = None;
@@ -2256,10 +2269,14 @@ async fn run(config: Config) -> Result<()> {
                     if proves_reachable(&endpoint, &dialled_ips, Instant::now()) {
                         proven_conns.insert(connection_id);
                     }
-                    // Any direct connection, either way, is contact.
+                    // Any direct connection, either way, is contact, and is
+                    // where to look for this peer after a long absence.
                     if !relayed {
                         if let Some(ip) = ip_of(endpoint.get_remote_address()) {
                             dialled_ips.insert(ip, Instant::now());
+                        }
+                        if book.seen(peer_id, endpoint.get_remote_address(), now_millis() as u64) {
+                            book_dirty = true;
                         }
                     }
                     if !relayed {

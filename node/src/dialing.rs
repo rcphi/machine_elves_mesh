@@ -65,6 +65,8 @@ struct Entry {
     interval: Duration,
     /// Until when retries stay at the first interval, after a loss.
     fast_until: Option<Instant>,
+    /// When a brief entry stops being dialled at all.
+    until: Option<Instant>,
 }
 
 /// Every address this node is trying to reach, and when it tries each next.
@@ -92,7 +94,7 @@ impl Schedule {
             }
             return false;
         }
-        self.entries.insert(addr, Entry { kind, peer, next: now, interval: first(kind), fast_until: None });
+        self.entries.insert(addr, Entry { kind, peer, next: now, interval: first(kind), fast_until: None, until: None });
         true
     }
 
@@ -111,6 +113,30 @@ impl Schedule {
         }
     }
 
+    /// Schedules `addr` to be tried every `FIRST_RETRY` for `lasting`, and then
+    /// not at all; true if it was new. An address already scheduled keeps its
+    /// own schedule.
+    ///
+    /// For a node back from a long absence: its peers behind translation are
+    /// dialling it on their own backoff, which keeps their routers open toward
+    /// it, so dialling where it last saw them gets through at once instead of
+    /// waiting up to a minute for their next attempt. The operator's choice,
+    /// 2026-11-18 (option 2 of three).
+    pub fn add_briefly(&mut self, addr: Multiaddr, peer: Option<PeerId>, now: Instant, lasting: Duration) -> bool {
+        if self.entries.contains_key(&addr) {
+            return false;
+        }
+        self.entries.insert(addr, Entry {
+            kind: Kind::Remembered,
+            peer,
+            next: now,
+            interval: FIRST_RETRY,
+            fast_until: Some(now + lasting),
+            until: Some(now + lasting),
+        });
+        true
+    }
+
     /// Stops trying every address tagged with `peer`, which is now connected.
     pub fn forget_peer(&mut self, peer: &PeerId) {
         self.entries.retain(|_, entry| entry.peer.as_ref() != Some(peer));
@@ -127,6 +153,7 @@ impl Schedule {
     /// The addresses due at `now`. Each is moved to `now` plus its interval,
     /// and the interval doubles, up to its kind's cap.
     pub fn due(&mut self, now: Instant) -> Vec<Multiaddr> {
+        self.entries.retain(|_, entry| entry.until.is_none_or(|until| now < until));
         let mut due = Vec::new();
         for (addr, entry) in &mut self.entries {
             if entry.next <= now {
@@ -304,6 +331,32 @@ mod tests {
         s.reset(&addr(1), t0);
         let n = (0..3600).filter(|&sec| !s.due(t0 + Duration::from_secs(sec)).is_empty()).count();
         assert!(n <= 130, "{n}");
+    }
+
+    /// The operator's option 2, 2026-11-18: a node back from a long absence
+    /// dials where it last saw its peers, quickly, for a short while, and then
+    /// stops — those peers are dialling it too, and that is what reaches it
+    /// once the brief window is over.
+    #[test]
+    fn a_brief_address_is_tried_every_two_seconds_and_then_dropped() {
+        let t0 = Instant::now();
+        let mut s = Schedule::new();
+        assert!(s.add_briefly(addr(1), None, t0, FAST_AFTER_LOSS));
+        let hits: Vec<u64> = (0..400).filter(|&sec| !s.due(t0 + Duration::from_secs(sec)).is_empty()).collect();
+        assert_eq!(hits.first(), Some(&0));
+        assert!(hits.windows(2).all(|w| w[1] - w[0] == 2), "{hits:?}");
+        assert!(*hits.last().unwrap() < 120, "nothing after the window: {hits:?}");
+        assert_eq!(s.len(), 0, "and it is gone");
+    }
+
+    #[test]
+    fn an_address_already_scheduled_is_not_made_brief() {
+        let t0 = Instant::now();
+        let mut s = Schedule::new();
+        s.add(addr(1), Kind::Configured, None, t0);
+        assert!(!s.add_briefly(addr(1), None, t0, FAST_AFTER_LOSS));
+        let late = (130..400).any(|sec| !s.due(t0 + Duration::from_secs(sec)).is_empty());
+        assert!(late, "a configured address keeps being dialled");
     }
 
     #[test]

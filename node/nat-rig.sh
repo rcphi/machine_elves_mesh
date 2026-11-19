@@ -88,6 +88,14 @@ table ip nat {
     chain post { type nat hook postrouting priority 100; oif "bo" $B_NAT; }
 }
 NFT
+# Both NATs keep a UDP flow 120 s, the friend's router's measured figure
+# (Linux's own default for a flow with no reply is 30 s). Option 2's rejoin
+# depends on it: a member that dials pub once a minute holds its router open
+# toward pub, so pub, back, can dial straight in.
+for ns in mer-nata mer-natb; do
+    ip netns exec "$ns" sysctl -qw net.netfilter.nf_conntrack_udp_timeout=120
+    ip netns exec "$ns" sysctl -qw net.netfilter.nf_conntrack_udp_timeout_stream=120
+done
 # What each side spends dialling the other's public address, as Run F's
 # captures measured it.
 ip netns exec mer-a nft -f - <<'NFT'
@@ -212,12 +220,21 @@ else
     check "exactly one of a and b took the job over" '(( took == 1 ))'
 fi
 
-# And comes back. a and b redial it on their configured schedule, which caps
-# at 60 s.
+# And comes back. In randomised, after longer than a and b's two minutes of
+# quick redials, as riverboat's 55 minutes in Run F part 2: they are down to
+# one dial a minute, and pub must dial where it last saw them (option 2) to
+# rejoin in seconds rather than at their next try.
+if [[ $SCENARIO == randomised ]]; then
+    while (( $(now_ms) - T_KILL < 150000 )); do sleep 2; done
+    REJOIN=15
+else
+    REJOIN=75
+fi
 start pub mer-pub --own --no-map-port
 T_BACK=$(now_ms)
-wait_for 75 '[[ $(count pub joined "$T_BACK") -gt 0 ]]' || true
-check "pub rejoins within 75 s" '[[ $(count pub joined "$T_BACK") -gt 0 ]]'
+wait_for "$REJOIN" '[[ $(count pub joined "$T_BACK") -gt 0 ]]' || true
+echo "      pub rejoined after $(( ($(now_ms) - T_BACK) / 1000 )) s"
+check "pub rejoins within $REJOIN s" '[[ $(count pub joined "$T_BACK") -gt 0 ]]'
 if [[ $SCENARIO == randomised ]]; then
     wait_for 30 '[[ $(( $(count a yielded "$T_BACK") + $(count b yielded "$T_BACK") )) -gt 0 ]]' || true
     check "the split heals: one of a and b yields" '[[ $(( $(count a yielded "$T_BACK") + $(count b yielded "$T_BACK") )) -gt 0 ]]'

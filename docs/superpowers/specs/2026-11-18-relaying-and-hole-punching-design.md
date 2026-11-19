@@ -119,6 +119,11 @@ Each address keeps its own schedule.
 
 **The requirement, whatever the numbers:** rejoining after a restart is no slower than today, and an address that never answers costs under 1 MB/h.
 
+**Rejoining after a long absence** (the operator's option 2 of three, 2026-11-18). The review found that a member back after more than two minutes away waited up to 60 s for the others' next redial, where Run F had taken 1.3 s.
+- **The fix:** the peer book also keeps where each peer was last seen, reachable or not, and a restarted node dials those addresses every 2 s for two minutes, then drops them.
+- **Why it works:** its peers behind translation have been dialling it all along, which holds their routers open toward it.
+- **Measured in the NAT rig:** after an absence of 2.5 minutes, the reachable member rejoined in 1 s, by its own dials.
+
 ### Jobs during a split
 
 **Unchanged.** Every job behaves as it does today: speculation, takeover on silence, both sides running during a split, and a yield by tick when the sides rejoin. The next design changes this for jobs that must not run twice.

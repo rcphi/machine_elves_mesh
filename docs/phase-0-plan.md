@@ -1728,7 +1728,7 @@ Same three parts as Run F, 2 h, the hotspot limit:
 | **A direct diamond–yoinkerz link** | **not predicted.** Run F's packets were lost in both directions despite two hours of continuous sending. The rig found a mechanism that would explain that: an unsolicited packet arriving before a side has sent makes a Linux-style NAT give that side's packet a different port. DCUtR's sends are timed to avoid exactly that, so a punch could work. But the friend's router and the carrier may differ in ways the rig cannot model. If a punch works, it most likely works only after the blind dialling has backed off. |
 | Punch attempts | no more often than the circuit schedule: 60 s, then 120, 240 … to 1,800 s |
 | When riverboat leaves, without a working punch | the split recurs as in Run F |
-| When it returns | the split heals within about a minute (configured redials cap at 60 s after the first two minutes), not 1.3 s as in Run F |
+| When it returns | the split heals within seconds: riverboat dials where it last saw diamond and yoinkerz (the operator's option 2), through the doors their own once-a-minute dials hold open. The NAT rig rejoined in 1 s after 2.5 minutes away. |
 | yoinkerz's mesh bytes (nft, UDP 4001) | **20–35 MB**, against Run F's 65.4 MB, two-thirds of which was failed dialling |
 | The four counts, the thresholds | as in Run F: the hotspot's false alarms and the split are expected, and detection and resume p95 hold |
 

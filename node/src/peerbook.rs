@@ -7,8 +7,17 @@
 //! cannot dial will remember you.** Every peer is recorded, but only those
 //! known to be reachable are dialled on start.
 //!
+//! **Where each peer was last seen is kept too, reachable or not**, for one
+//! use: a node back from a long absence dials those addresses briefly. Its
+//! peers behind translation have been dialling it all along, which holds
+//! their routers open toward it, so it gets through at once instead of
+//! waiting up to a minute for their next attempt (the operator's option 2,
+//! 2026-11-18).
+//!
 //! The file is one line per peer, tab-separated: peer id, reachable (0 or 1),
-//! when last heard (unix ms), label, then addresses separated by spaces. It is
+//! when last heard (unix ms), label, addresses separated by spaces, and the
+//! address it was last seen at (empty if none). A line from before that last
+//! field existed has five fields and still reads. It is
 //! written whole to a temporary file and renamed over the old one, so a crash
 //! mid-write leaves the previous book, never half of one. A line that cannot
 //! be read is skipped and counted: a damaged book costs some memory, never the
@@ -20,6 +29,10 @@ use std::path::Path;
 
 use libp2p::{Multiaddr, PeerId};
 
+/// How stale a last-seen time may grow before seeing the peer again is worth
+/// a write: it decides only whether a peer counts as recent.
+pub const SEEN_REFRESH_MS: u64 = 600_000;
+
 /// How many addresses are kept for one peer: the most recently dialled.
 pub const MAX_ADDRS_PER_PEER: usize = 4;
 
@@ -29,6 +42,8 @@ pub struct Remembered {
     pub addrs: Vec<Multiaddr>,
     pub reachable: bool,
     pub last_heard_unix_ms: u64,
+    /// The address this node last had a direct connection with it at.
+    pub last_seen_at: Option<Multiaddr>,
 }
 
 #[derive(Default)]
@@ -70,7 +85,8 @@ impl PeerBook {
         for (peer, e) in &self.entries {
             let label: String = e.label.chars().map(|c| if c == '\t' || c == '\n' { ' ' } else { c }).collect();
             let addrs: Vec<String> = e.addrs.iter().map(|a| a.to_string()).collect();
-            text.push_str(&format!("{peer}\t{}\t{}\t{label}\t{}\n",
+            let seen = e.last_seen_at.as_ref().map(|a| a.to_string()).unwrap_or_default();
+            text.push_str(&format!("{peer}\t{}\t{}\t{label}\t{}\t{seen}\n",
                                    u8::from(e.reachable), e.last_heard_unix_ms, addrs.join(" ")));
         }
         let mut file = std::fs::File::create(&tmp)?;
@@ -112,6 +128,30 @@ impl PeerBook {
         true
     }
 
+    /// Records a direct connection with `peer` at `addr`. True when that is
+    /// worth writing: a new place, or a last-seen time gone stale.
+    pub fn seen(&mut self, peer: PeerId, addr: &Multiaddr, now_unix_ms: u64) -> bool {
+        let entry = self.entries.entry(peer).or_default();
+        let moved = entry.last_seen_at.as_ref() != Some(addr);
+        let stale = now_unix_ms.saturating_sub(entry.last_heard_unix_ms) > SEEN_REFRESH_MS;
+        if moved || stale {
+            entry.last_seen_at = Some(addr.clone());
+            entry.last_heard_unix_ms = now_unix_ms;
+            return true;
+        }
+        false
+    }
+
+    /// Peers not remembered as reachable, seen within `within_ms` of
+    /// `now_unix_ms`, with where they were last seen.
+    pub fn seen_recently(&self, now_unix_ms: u64, within_ms: u64) -> Vec<(PeerId, Multiaddr)> {
+        self.entries
+            .iter()
+            .filter(|(_, e)| !e.reachable && now_unix_ms.saturating_sub(e.last_heard_unix_ms) <= within_ms)
+            .filter_map(|(peer, e)| e.last_seen_at.clone().map(|a| (*peer, a)))
+            .collect()
+    }
+
     /// Every address of every peer remembered as reachable.
     pub fn addresses_to_dial(&self) -> Vec<Multiaddr> {
         self.entries.values().filter(|e| e.reachable).flat_map(|e| e.addrs.iter().cloned()).collect()
@@ -143,10 +183,14 @@ fn parse_line(line: &str) -> Option<(PeerId, Remembered)> {
         .filter(|a| !a.is_empty())
         .map(|a| a.parse().ok())
         .collect::<Option<Vec<Multiaddr>>>()?;
+    let last_seen_at = match fields.next() {
+        None | Some("") => None,
+        Some(text) => Some(text.parse().ok()?),
+    };
     if fields.next().is_some() {
         return None;
     }
-    Some((peer, Remembered { label, addrs, reachable, last_heard_unix_ms }))
+    Some((peer, Remembered { label, addrs, reachable, last_heard_unix_ms, last_seen_at }))
 }
 
 #[cfg(test)]
@@ -243,6 +287,53 @@ mod tests {
         }
         assert_eq!(book.get(&a).unwrap().addrs, vec![addr(3), addr(4), addr(5), addr(6)]);
         assert_eq!(MAX_ADDRS_PER_PEER, 4);
+    }
+
+    #[test]
+    fn where_a_peer_was_last_seen_survives_a_round_trip() {
+        let path = scratch("seen");
+        let a = PeerId::random();
+        let mut book = PeerBook::default();
+        assert!(book.seen(a, &addr(5465), 1_000));
+        book.save(&path).unwrap();
+        let (loaded, skipped) = PeerBook::load(&path).unwrap();
+        assert_eq!(skipped, 0);
+        assert_eq!(loaded.get(&a).unwrap().last_seen_at, Some(addr(5465)));
+    }
+
+    /// A book written before last-seen addresses existed has five fields.
+    #[test]
+    fn a_book_from_before_last_seen_addresses_still_reads() {
+        let path = scratch("five-fields");
+        let a = PeerId::random();
+        std::fs::write(&path, format!("{a}\t1\t7\triverboat\t{}\n", addr(4001))).unwrap();
+        let (loaded, skipped) = PeerBook::load(&path).unwrap();
+        assert_eq!((loaded.len(), skipped), (1, 0));
+        assert_eq!(loaded.get(&a).unwrap().last_seen_at, None);
+    }
+
+    /// Where to dial on coming back: peers seen within the window, at the
+    /// address they were last seen at, except those remembered as reachable,
+    /// which are dialled anyway.
+    #[test]
+    fn peers_seen_recently_are_dialled_briefly_on_return() {
+        let (recent, old, reachable) = (PeerId::random(), PeerId::random(), PeerId::random());
+        let mut book = PeerBook::default();
+        book.seen(recent, &addr(1), 10_000_000);
+        book.seen(old, &addr(2), 1_000);
+        book.seen(reachable, &addr(3), 10_000_000);
+        book.set_reachable(reachable, true);
+        assert_eq!(book.seen_recently(10_000_000 + 3_600_000, 86_400_000 / 24 * 2), vec![(recent, addr(1))]);
+    }
+
+    #[test]
+    fn seeing_a_peer_where_it_was_already_seen_changes_nothing_worth_writing() {
+        let a = PeerId::random();
+        let mut book = PeerBook::default();
+        assert!(book.seen(a, &addr(1), 1_000));
+        assert!(!book.seen(a, &addr(1), 2_000), "a minute later, same place: not worth a write");
+        assert!(book.seen(a, &addr(1), 1_000 + SEEN_REFRESH_MS + 1), "but it is kept roughly current");
+        assert!(book.seen(a, &addr(2), 1_000 + SEEN_REFRESH_MS + 2), "and a new place is news");
     }
 
     #[test]
