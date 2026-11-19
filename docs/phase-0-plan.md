@@ -1710,13 +1710,16 @@ Logs: `provision/results/run-f/`, not committed, as for every run.
 
 **What Run G can and cannot show.** The friend's router answers neither NAT-PMP nor UPnP (checked 2026-11-18), so riverboat is still the only reachable member. Run G tests the one thing the rig could not: **whether DCUtR's coordinated punch connects diamond and yoinkerz on the real path where Run F's blind simultaneous dialling did not.** If it does not, losing riverboat still splits the mesh, and Run G measures the rest.
 
-Same three parts as Run F, 2 h, the hotspot limit:
+Three parts like Run F's, **shortened to 45 minutes** (the operator's call, 2026-11-19, before the run). Run F's 2 h was the hotspot limit, not a need. What Run G must show fits:
+- **Punches:** these are tried about 1, 2, 4, 8 and 16 minutes in, and every 30 minutes after that, so 25 minutes gets five tries and two hours would add only two.
+- **The absence:** riverboat must be away longer than the two-minute quick-retry window, to test the rejoin.
+- **What is given up:** some chaos samples. The thresholds are not Run G's question; Runs B–E measured them.
 
 | | from yoinkerz's start | |
 |---|---|---|
-| 1 | 0:00–0:45 | all three, chaos on all three |
-| 2 | 0:45–1:40 | riverboat leaves: chaos disarmed, node stopped |
-| 3 | 1:40–2:00 | riverboat returns, chaos off on it |
+| 1 | 0:00–0:25 | all three, chaos on all three |
+| 2 | 0:25–0:32 | riverboat leaves: chaos disarmed, node stopped |
+| 3 | 0:32–0:45 | riverboat returns, chaos off on it |
 
 **Predictions, fixed before the run:**
 
@@ -1726,13 +1729,13 @@ Same three parts as Run F, 2 h, the hotspot limit:
 | diamond and yoinkerz reachable | no: AutoNAT tests fail (`reachability-tested` ok=false) |
 | Introductions | both hold one on riverboat (`introducer-held`) |
 | **A direct diamond–yoinkerz link** | **not predicted.** Run F's packets were lost in both directions despite two hours of continuous sending. The rig found a mechanism that would explain that: an unsolicited packet arriving before a side has sent makes a Linux-style NAT give that side's packet a different port. DCUtR's sends are timed to avoid exactly that, so a punch could work. But the friend's router and the carrier may differ in ways the rig cannot model. If a punch works, it most likely works only after the blind dialling has backed off. |
-| Punch attempts | no more often than the circuit schedule: 60 s, then 120, 240 … to 1,800 s |
+| Punch attempts | no more often than the circuit schedule: 60 s, then 120, 240 … to 1,800 s, so about five in part 1 |
 | When riverboat leaves, without a working punch | the split recurs as in Run F |
 | When it returns | the split heals within seconds: riverboat dials where it last saw diamond and yoinkerz (the operator's option 2), through the doors their own once-a-minute dials hold open. The NAT rig rejoined in 1 s after 2.5 minutes away. |
-| yoinkerz's mesh bytes (nft, UDP 4001) | **20–35 MB**, against Run F's 65.4 MB, two-thirds of which was failed dialling |
+| yoinkerz's mesh bytes (nft, UDP 4001) | **8–14 MB for the 45 minutes** (Run F's rate scaled: 65.4 MB in 2.2 h, two-thirds of it failed dialling, so 20–35 MB in 2 h would have been the equivalent) |
 | The four counts, the thresholds | as in Run F: the hotspot's false alarms and the split are expected, and detection and resume p95 hold |
 
-**What would mean the punch is not worth keeping:** yoinkerz's bytes reaching Run F's 65.4 MB, because then the introductions and punches cost what the failed dialling did.
+**What would mean the punch is not worth keeping:** yoinkerz's bytes per hour reaching Run F's rate (about 30 MB/h), because then the introductions and punches cost what the failed dialling did.
 
 **Staged 2026-11-18:** the static build of `d941bec` (`mesh-node` sha256 `32941167…`), after the review's fixes and the operator's option 2 for rejoining, and the new `timed-run.sh` (`8730fc11…`) are in `~/rune` on riverboat, diamond (over LTE) and yoinkerz, checked against lightning's hashes, with each box's `SHA256SUMS` rewritten. The rest of `~/rune` is Run F's, unchanged.
 
@@ -1745,13 +1748,13 @@ Note the phone's hotspot counter, then move the laptop onto the hotspot. Then on
 ```
 cd ~/rune
 sudo nft -f rune_bytes.nft
-sudo ./timed-run.sh --label riverboat --mesh run-g --peer 127.0.0.1 --own --hours 2     # riverboat
-sudo ./timed-run.sh --label diamond   --mesh run-g --peer 204.210.210.200 --hours 2    # diamond
+sudo ./timed-run.sh --label riverboat --mesh run-g --peer 127.0.0.1 --own --hours 0.75  # riverboat
+sudo ./timed-run.sh --label diamond   --mesh run-g --peer 204.210.210.200 --hours 0.75 # diamond
 timedatectl | grep synchronized                                                        # yoinkerz: must say yes
-sudo ./timed-run.sh --label yoinkerz  --mesh run-g --peer 204.210.210.200 --hours 2    # yoinkerz
+sudo ./timed-run.sh --label yoinkerz  --mesh run-g --peer 204.210.210.200 --hours 0.75 # yoinkerz
 ```
-- **At 0:45, on riverboat:** `sudo mesh-chaos disarm && sudo systemctl stop mesh-node`.
-- **At 1:40:** `sudo systemctl start mesh-node`.
+- **At 0:25, on riverboat:** `sudo mesh-chaos disarm && sudo systemctl stop mesh-node`.
+- **At 0:32:** `sudo systemctl start mesh-node`.
 - **Afterwards:** on each box, `sudo nft list table inet rune_bytes && sudo nft delete table inet rune_bytes`. Then on yoinkerz, `sudo systemctl stop mesh-node` and `sudo snap refresh --unhold`, and read the phone's counter again.
 - **The analysis:** `takeover-summary.py` and `link-summary.py` over the three boxes' logs.
 
