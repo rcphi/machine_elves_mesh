@@ -1244,10 +1244,62 @@ fn unsolicited(remote: std::net::IpAddr, dialled: &HashMap<std::net::IpAddr, Ins
     dialled.get(&remote).is_none_or(|at| now.duration_since(*at) > UNSOLICITED_AFTER)
 }
 
+/// Whether a connection proves this node reachable: one that arrived, not
+/// through an introducer, from an address this node has had no contact with
+/// for `UNSOLICITED_AFTER`. Contact is any direct connection either way, not
+/// only a dial (review I1): a link that drops and is redialled from the far
+/// side comes in through the flow that link left open.
+fn proves_reachable(
+    endpoint: &libp2p::core::ConnectedPoint,
+    contacts: &HashMap<std::net::IpAddr, Instant>,
+    now: Instant,
+) -> bool {
+    match endpoint {
+        libp2p::core::ConnectedPoint::Listener { send_back_addr, .. } => {
+            !connection_relayed(endpoint) && ip_of(send_back_addr).is_some_and(|ip| unsolicited(ip, contacts, now))
+        }
+        libp2p::core::ConnectedPoint::Dialer { .. } => false,
+    }
+}
+
+/// Forgets a closed connection; true when it was the last direct one to
+/// `peer`. Review I3: only that is a loss worth hurrying a redial for — not
+/// an introduction ending at its limit, not silence through a forwarder.
+fn lost_last_direct(
+    direct: &mut HashMap<libp2p::swarm::ConnectionId, PeerId>,
+    closed: libp2p::swarm::ConnectionId,
+    peer: PeerId,
+) -> bool {
+    direct.remove(&closed).is_some() && !direct.values().any(|p| *p == peer)
+}
+
 /// Whether a member has confirmed it can reach this node, at any address.
 #[derive(Default)]
 struct Reachability {
     confirmed: std::collections::BTreeSet<Multiaddr>,
+    /// Withdrawn when the router stopped forwarding, kept to restore when it
+    /// forwards again. See [`Reachability::suspend`].
+    suspended: Vec<Multiaddr>,
+}
+
+/// Whether the internet routes to this IP. Review I2: a sibling on the same
+/// home network, or a hairpinned dial, reaches a private address, which says
+/// nothing about anyone else reaching it. Documentation ranges count, so the
+/// NAT rig's public side is public.
+fn is_global(ip: std::net::IpAddr) -> bool {
+    match ip {
+        std::net::IpAddr::V4(v4) => {
+            let o = v4.octets();
+            !(v4.is_private() || v4.is_loopback() || v4.is_link_local() || v4.is_unspecified()
+              || v4.is_broadcast() || v4.is_multicast()
+              || (o[0] == 100 && (o[1] & 0xc0) == 64))
+        }
+        std::net::IpAddr::V6(v6) => {
+            let first = v6.segments()[0];
+            !(v6.is_loopback() || v6.is_unspecified() || v6.is_multicast()
+              || (first & 0xfe00) == 0xfc00 || (first & 0xffc0) == 0xfe80)
+        }
+    }
 }
 
 impl Reachability {
@@ -1255,7 +1307,7 @@ impl Reachability {
     fn confirm(&mut self, addr: Multiaddr) -> bool {
         // An address through an introducer is someone else's door, not this
         // node's: holding one says nothing about being reachable directly.
-        if is_relayed(&addr) {
+        if is_relayed(&addr) || !ip_of(&addr).is_some_and(is_global) {
             return false;
         }
         let was = self.is_reachable();
@@ -1272,6 +1324,25 @@ impl Reachability {
 
     fn is_reachable(&self) -> bool {
         !self.confirmed.is_empty()
+    }
+
+    /// Withdraws every confirmed address, returning them: the router stopped
+    /// forwarding, so the door may be shut.
+    fn suspend(&mut self) -> Vec<Multiaddr> {
+        let withdrawn: Vec<Multiaddr> = std::mem::take(&mut self.confirmed).into_iter().collect();
+        self.suspended.extend(withdrawn.iter().cloned());
+        withdrawn
+    }
+
+    /// Restores what `suspend` withdrew, on the next grant; true when that
+    /// makes the node reachable again. Review M1: without this, one failed
+    /// renewal ended introductions for good.
+    fn restore(&mut self) -> bool {
+        let was = self.is_reachable();
+        for addr in std::mem::take(&mut self.suspended) {
+            self.confirmed.insert(addr);
+        }
+        !was && self.is_reachable()
     }
 }
 
@@ -1695,10 +1766,10 @@ async fn run(config: Config) -> Result<()> {
                 let tx = mapping_tx.clone();
                 tokio::spawn(async move {
                     // NAT-PMP first, then UPnP: whichever the router speaks.
-                    let answer = portmap::first_granted(
+                    let answer = portmap::within(portmap::MAPPING_TIMEOUT, portmap::first_granted(
                         async { portmap::request(port, portmap::LIFETIME_SECS).await.map_err(|e| e.to_string()) },
                         || upnp::request(port, portmap::LIFETIME_SECS),
-                    ).await;
+                    )).await;
                     // The receiver lives as long as the loop, and the loop
                     // outlives this task in every case that matters. If it has
                     // gone, the node is shutting down and the answer is moot.
@@ -1721,6 +1792,16 @@ async fn run(config: Config) -> Result<()> {
                             mapping = Some(now);
                             mapped_by = Some(method);
                         }
+                        // A grant after a failed renewal: what members proved
+                        // before holds again.
+                        if reachability.restore() {
+                            for addr in reachability.confirmed.clone() {
+                                swarm.add_external_address(addr.clone());
+                                emit(&config, "reachable",
+                                     &format!("the router forwards again, so {addr} is open again"),
+                                     &[("addr", &addr.to_string()), ("by", "mapping")]);
+                            }
+                        }
                     }
                     Err(error) => {
                         // Reported every time rather than once. If a router
@@ -1732,12 +1813,11 @@ async fn run(config: Config) -> Result<()> {
                         // The door this node held is closing: what members
                         // proved through it no longer holds.
                         if mapping.is_some() {
-                            for addr in reachability.confirmed.clone() {
-                                if reachability.expire(&addr) {
-                                    emit(&config, "unreachable",
-                                         &format!("the router stopped forwarding, so {addr} may be closed"),
-                                         &[("addr", &addr.to_string())]);
-                                }
+                            for addr in reachability.suspend() {
+                                swarm.remove_external_address(&addr);
+                                emit(&config, "unreachable",
+                                     &format!("the router stopped forwarding, so {addr} may be closed"),
+                                     &[("addr", &addr.to_string())]);
                             }
                         }
                         mapping = None;
@@ -1949,6 +2029,12 @@ async fn run(config: Config) -> Result<()> {
 
             _ = sweep.tick() => {
                 let now = Instant::now();
+                // Open direct connections are contact for as long as they last.
+                for addr in seen_at.values() {
+                    if let Some(ip) = ip_of(addr) {
+                        dialled_ips.insert(ip, now);
+                    }
+                }
                 // Introductions: held on up to MAX_INTRODUCERS reachable members
                 // this node is directly connected to, and none if it is
                 // reachable itself. Each rides on that direct connection.
@@ -2027,9 +2113,13 @@ async fn run(config: Config) -> Result<()> {
                         // hung. This is the case recovery has to be fast enough
                         // to survive, and the only one that costs a visible gap.
                         // Silence is the only warning a vanished machine gives,
-                        // so it has to be what starts the search for it again.
-                        redial_lost_peer(&config, &peer, &reached_by,
-                                         &mut dials, &mut dial_attempts);
+                        // so it has to be what starts the search for it again
+                        // — if it was directly connected. Silence through a
+                        // forwarder says nothing about a direct path.
+                        if direct.values().any(|p| *p == peer) {
+                            redial_lost_peer(&config, &peer, &reached_by,
+                                             &mut dials, &mut dial_attempts);
+                        }
 
                         if let Some(w) = work.as_mut() {
                             if w.owner == Some(peer) {
@@ -2146,7 +2236,9 @@ async fn run(config: Config) -> Result<()> {
                                                now, config.detect * 2) {
                     connected_at.remove(&peer);
                     let _ = swarm.disconnect_peer_id(peer);
-                    redial_lost_peer(&config, &peer, &reached_by, &mut dials, &mut dial_attempts);
+                    if direct.values().any(|p| *p == peer) {
+                        redial_lost_peer(&config, &peer, &reached_by, &mut dials, &mut dial_attempts);
+                    }
                     emit(&config, "silent-connection",
                          "connected to a former member that has said nothing — reconnecting",
                          &[("peer_id", &peer.to_string())]);
@@ -2161,9 +2253,13 @@ async fn run(config: Config) -> Result<()> {
                     // dialled: the door is open. See `unsolicited`.
                     // Which address it reached is what identify will say next:
                     // the listening address is only 0.0.0.0.
-                    if let libp2p::core::ConnectedPoint::Listener { send_back_addr, .. } = &endpoint {
-                        if !relayed && ip_of(send_back_addr).is_some_and(|ip| unsolicited(ip, &dialled_ips, Instant::now())) {
-                            proven_conns.insert(connection_id);
+                    if proves_reachable(&endpoint, &dialled_ips, Instant::now()) {
+                        proven_conns.insert(connection_id);
+                    }
+                    // Any direct connection, either way, is contact.
+                    if !relayed {
+                        if let Some(ip) = ip_of(endpoint.get_remote_address()) {
+                            dialled_ips.insert(ip, Instant::now());
                         }
                     }
                     if !relayed {
@@ -2662,11 +2758,17 @@ async fn run(config: Config) -> Result<()> {
                     }
                 }
 
-                SwarmEvent::ConnectionClosed { peer_id, connection_id, num_established, .. } => {
+                SwarmEvent::ConnectionClosed { peer_id, connection_id, num_established, endpoint, .. } => {
+                    if !connection_relayed(&endpoint) {
+                        if let Some(ip) = ip_of(endpoint.get_remote_address()) {
+                            dialled_ips.insert(ip, Instant::now());
+                        }
+                    }
                     // A direct link lost: if this peer can be reached through
                     // an introducer, one punch is tried at once (each address
                     // is new to the schedule) and the circuit backoff follows.
-                    if direct.remove(&connection_id).is_some() && !direct.values().any(|p| *p == peer_id) {
+                    let lost_direct = lost_last_direct(&mut direct, connection_id, peer_id);
+                    if lost_direct {
                         for addr in circuits_of.get(&peer_id).into_iter().flatten() {
                             dials.add(addr.clone(), dialing::Kind::Circuit, Some(peer_id), Instant::now());
                         }
@@ -2687,9 +2789,12 @@ async fn run(config: Config) -> Result<()> {
                         // ending is the ordinary case — a laptop sleeps, a
                         // hotspot cycles, a router reboots — and a mesh that
                         // treats it as final is a mesh that quietly shrinks by
-                        // one every time anything happens.
-                        redial_lost_peer(&config, &peer_id, &reached_by,
-                                         &mut dials, &mut dial_attempts);
+                        // one every time anything happens. Hurried only for a
+                        // direct link lost, not an introduction ending.
+                        if lost_direct {
+                            redial_lost_peer(&config, &peer_id, &reached_by,
+                                             &mut dials, &mut dial_attempts);
+                        }
                     }
                 }
 
@@ -2731,7 +2836,9 @@ async fn run(config: Config) -> Result<()> {
                     connection_id, info, ..
                 })) if proven_conns.remove(&connection_id) => {
                     let observed = info.observed_addr;
-                    swarm.add_external_address(observed.clone());
+                    if ip_of(&observed).is_some_and(is_global) {
+                        swarm.add_external_address(observed.clone());
+                    }
                     if reachability.confirm(observed.clone()) {
                         emit(&config, "reachable",
                              &format!("a member reached this node at {observed} unasked: it can introduce others"),
@@ -3465,6 +3572,71 @@ mod tests {
         dialled.insert(peer, t0);
         assert!(!unsolicited(peer, &dialled, t0 + Duration::from_secs(60)), "we sent to it a minute ago");
         assert!(unsolicited(peer, &dialled, t0 + UNSOLICITED_AFTER + Duration::from_secs(1)));
+    }
+
+    /// Review I1: a link older than ten minutes drops, the far side redials
+    /// through the NAT flow still open toward it, and the receiving side took
+    /// the arrival as proof it could be reached. Any recent contact with that
+    /// address, not only a dial, makes an arrival from it prove nothing.
+    #[test]
+    fn an_arrival_from_a_recent_contact_proves_nothing() {
+        use libp2p::core::{ConnectedPoint, Endpoint, transport::PortUse};
+        let t0 = Instant::now();
+        let mut contacts = HashMap::new();
+        let arrival = |from: &str| ConnectedPoint::Listener {
+            local_addr: "/ip4/0.0.0.0/udp/4001/quic-v1".parse().unwrap(),
+            send_back_addr: format!("/ip4/{from}/udp/4001/quic-v1").parse().unwrap(),
+        };
+        assert!(proves_reachable(&arrival("203.0.113.1"), &contacts, t0));
+        contacts.insert("203.0.113.1".parse().unwrap(), t0);
+        assert!(!proves_reachable(&arrival("203.0.113.1"), &contacts, t0 + Duration::from_secs(300)));
+        let dialled = ConnectedPoint::Dialer {
+            address: "/ip4/198.51.100.1/udp/4001/quic-v1".parse().unwrap(),
+            role_override: Endpoint::Dialer, port_use: PortUse::Reuse,
+        };
+        assert!(!proves_reachable(&dialled, &contacts, t0), "a connection this node opened proves nothing");
+    }
+
+    /// Review I2: a sibling on the same home network can always reach this
+    /// node, which says nothing about anyone else.
+    #[test]
+    fn only_an_address_the_internet_routes_makes_a_node_reachable() {
+        let mut r = Reachability::default();
+        for private in ["10.0.0.5", "192.168.1.125", "172.20.10.2", "100.84.179.154", "127.0.0.1", "169.254.1.1"] {
+            assert!(!r.confirm(format!("/ip4/{private}/udp/4001/quic-v1").parse().unwrap()), "{private}");
+        }
+        assert!(!r.confirm("/ip6/fe80::1/udp/4001/quic-v1".parse().unwrap()));
+        assert!(!r.confirm("/ip6/fd00::1/udp/4001/quic-v1".parse().unwrap()));
+        assert!(!r.is_reachable());
+        assert!(r.confirm("/ip4/192.0.2.10/udp/4001/quic-v1".parse().unwrap()), "the rig's public range counts");
+    }
+
+    /// Review M1: one failed renewal withdrew reachability, and the next grant
+    /// never restored it, so introductions stopped for good after one hiccup.
+    #[test]
+    fn reachability_withdrawn_with_a_lost_mapping_returns_with_the_next_grant() {
+        let a: Multiaddr = "/ip4/204.210.210.200/udp/4001/quic-v1".parse().unwrap();
+        let mut r = Reachability::default();
+        r.confirm(a.clone());
+        let withdrawn = r.suspend();
+        assert_eq!(withdrawn, vec![a.clone()]);
+        assert!(!r.is_reachable());
+        assert!(r.restore(), "the grant brings it back");
+        assert!(r.is_reachable());
+        assert!(!r.restore(), "and only once");
+    }
+
+    /// Review I3: only losing the last direct connection to a peer hurries
+    /// its redial — not an introduction ending, not silence through a forwarder.
+    #[test]
+    fn only_losing_the_last_direct_connection_counts_as_a_loss() {
+        use libp2p::swarm::ConnectionId;
+        let peer = PeerId::random();
+        let (c1, c2, relayed) = (ConnectionId::new_unchecked(1), ConnectionId::new_unchecked(2), ConnectionId::new_unchecked(3));
+        let mut direct = HashMap::from([(c1, peer), (c2, peer)]);
+        assert!(!lost_last_direct(&mut direct, c1, peer), "another direct one remains");
+        assert!(!lost_last_direct(&mut direct, relayed, peer), "an introduction ending is not a loss");
+        assert!(lost_last_direct(&mut direct, c2, peer));
     }
 
     #[test]

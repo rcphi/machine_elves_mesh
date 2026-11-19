@@ -93,6 +93,22 @@ where
     }
 }
 
+/// The longest one renewal may take, both protocols together. Review I4: a
+/// UPnP device that answers discovery and then never answers a request left
+/// the renewal task waiting for ever, and no renewal by either protocol ran
+/// again. NAT-PMP's worst case is 12 s; UPnP's searches 4 s.
+pub const MAPPING_TIMEOUT: Duration = Duration::from_secs(15);
+
+/// `fut`, or an error once `limit` has passed.
+pub async fn within<T>(
+    limit: Duration,
+    fut: impl std::future::Future<Output = Result<T, String>>,
+) -> Result<T, String> {
+    tokio::time::timeout(limit, fut)
+        .await
+        .unwrap_or_else(|_| Err(format!("the router did not finish answering within {limit:?}")))
+}
+
 /// Asks the router to forward `port`, returning what it agreed to.
 pub async fn request(port: u16, lifetime: u32) -> io::Result<Mapping> {
     let gateway = default_gateway()?;
@@ -226,6 +242,15 @@ mod order_tests {
         assert_eq!(answer, Ok((granted(4001), Method::Upnp)));
         assert_eq!(Method::Upnp.name(), "upnp");
         assert_eq!(Method::NatPmp.name(), "nat-pmp");
+    }
+
+    /// Review I4: a router that answers discovery and then never answers a
+    /// request held the renewal task forever, and no renewal ran again.
+    #[tokio::test(start_paused = true)]
+    async fn a_router_that_never_answers_cannot_hold_the_renewal() {
+        let answer = within(MAPPING_TIMEOUT, std::future::pending::<Result<(Mapping, Method), String>>()).await;
+        assert!(answer.unwrap_err().contains("did not finish"));
+        assert!(MAPPING_TIMEOUT <= Duration::from_secs(20));
     }
 
     #[tokio::test]
