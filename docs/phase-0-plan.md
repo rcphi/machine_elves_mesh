@@ -1693,6 +1693,68 @@ The takeover thresholds held, though on 9 unannounced losses rather than Run E's
 
 Logs: `provision/results/run-f/`, not committed, as for every run.
 
+## Run G: handover (2026-11-18) — Run F again, with relaying and coordinated punching
+
+**What changed since Run F** is the relaying design (`docs/superpowers/specs/2026-11-18-relaying-and-hole-punching-design.md`, built on branch `relaying-and-punching`, release `59450fb`):
+- **Dial backoff:** every address keeps its own schedule. Retries start at 2 s and stay there for two minutes after a lost connection, then double, to 60 s for configured addresses and 300 s for others.
+- **A peer book** on disk (`--peer-book`; `timed-run.sh` points it at `peers-<mesh>`).
+- **Reachability** is learned from members: by a connection that arrives unasked, or by AutoNAT's dial-back. Heartbeats carry it.
+- **Introductions:** an unreachable member holds them on up to three reachable ones. libp2p's relay, at its default limits, introduces two unreachable members so that **DCUtR** can time their punch. Punches are retried at 60 s, doubling to 30 minutes.
+- **UPnP** beside NAT-PMP, asking the gateway directly before multicast.
+
+**What the namespace rig showed first** (`node/nat-rig.sh`, all three scenarios passing, plus `rig.sh`, `migration-rig.sh` and `chaos-rig.sh 15`):
+- **Port-preserving NATs:** a direct link formed, and losing the reachable member split nothing.
+- **A NAT that randomises ports:** punches failed as they must. Dialling the unreachable address settled at about 0.3 MB/h, against Run F's 13 MB/h. The split recurred and healed on the reachable member's return.
+- **A fake UPnP gateway** gave a member a port, so it became a second reachable member, and the split did not happen.
+- **What the rig does not show is a coordinated punch succeeding.** With port-preserving NATs and 40 ms between them, the old simultaneous dial connected first. The rig also found five faults in the node before any box saw it; see the commit `59450fb`.
+
+**What Run G can and cannot show.** The friend's router answers neither NAT-PMP nor UPnP (checked 2026-11-18), so riverboat is still the only reachable member. Run G tests the one thing the rig could not: **whether DCUtR's coordinated punch connects diamond and yoinkerz on the real path where Run F's blind simultaneous dialling did not.** If it does not, losing riverboat still splits the mesh, and Run G measures the rest.
+
+Same three parts as Run F, 2 h, the hotspot limit:
+
+| | from yoinkerz's start | |
+|---|---|---|
+| 1 | 0:00–0:45 | all three, chaos on all three |
+| 2 | 0:45–1:40 | riverboat leaves: chaos disarmed, node stopped |
+| 3 | 1:40–2:00 | riverboat returns, chaos off on it |
+
+**Predictions, fixed before the run:**
+
+| Question | Prediction |
+|---|---|
+| riverboat reachable | yes, within a minute of the first member connecting (`reachable` with `by` connection) |
+| diamond and yoinkerz reachable | no: AutoNAT tests fail (`reachability-tested` ok=false) |
+| Introductions | both hold one on riverboat (`introducer-held`) |
+| **A direct diamond–yoinkerz link** | **not predicted.** Run F's packets were lost in both directions despite two hours of continuous sending. The rig found a mechanism that would explain that: an unsolicited packet arriving before a side has sent makes a Linux-style NAT give that side's packet a different port. DCUtR's sends are timed to avoid exactly that, so a punch could work. But the friend's router and the carrier may differ in ways the rig cannot model. If a punch works, it most likely works only after the blind dialling has backed off. |
+| Punch attempts | no more often than the circuit schedule: 60 s, then 120, 240 … to 1,800 s |
+| When riverboat leaves, without a working punch | the split recurs as in Run F |
+| When it returns | the split heals within about a minute (configured redials cap at 60 s after the first two minutes), not 1.3 s as in Run F |
+| yoinkerz's mesh bytes (nft, UDP 4001) | **20–35 MB**, against Run F's 65.4 MB, two-thirds of which was failed dialling |
+| The four counts, the thresholds | as in Run F: the hotspot's false alarms and the split are expected, and detection and resume p95 hold |
+
+**What would mean the punch is not worth keeping:** yoinkerz's bytes reaching Run F's 65.4 MB, because then the introductions and punches cost what the failed dialling did.
+
+**Staged 2026-11-18:** the static build of `59450fb` (`mesh-node` sha256 `5d7cc042…`) and the new `timed-run.sh` (`8730fc11…`) are in `~/rune` on riverboat, diamond (over LTE) and yoinkerz, checked against lightning's hashes, with each box's `SHA256SUMS` rewritten. The rest of `~/rune` is Run F's, unchanged.
+
+**Commands,** in Run F's order. First, on yoinkerz while still on home Wi-Fi:
+```
+sudo systemctl stop mesh-node
+sudo snap refresh --hold=4h
+```
+Note the phone's hotspot counter, then move the laptop onto the hotspot. Then on each box, riverboat first:
+```
+cd ~/rune
+sudo nft -f rune_bytes.nft
+sudo ./timed-run.sh --label riverboat --mesh run-g --peer 127.0.0.1 --own --hours 2     # riverboat
+sudo ./timed-run.sh --label diamond   --mesh run-g --peer 204.210.210.200 --hours 2    # diamond
+timedatectl | grep synchronized                                                        # yoinkerz: must say yes
+sudo ./timed-run.sh --label yoinkerz  --mesh run-g --peer 204.210.210.200 --hours 2    # yoinkerz
+```
+- **At 0:45, on riverboat:** `sudo mesh-chaos disarm && sudo systemctl stop mesh-node`.
+- **At 1:40:** `sudo systemctl start mesh-node`.
+- **Afterwards:** on each box, `sudo nft list table inet rune_bytes && sudo nft delete table inet rune_bytes`. Then on yoinkerz, `sudo systemctl stop mesh-node` and `sudo snap refresh --unhold`, and read the phone's counter again.
+- **The analysis:** `takeover-summary.py` and `link-summary.py` over the three boxes' logs.
+
 ## Open decisions
 
 - **The rendezvous fallback**, if no volunteer turns out to be directly reachable. Manual invite exchange covers address distribution but not simultaneous-transmission timing. **Run F (2026-11-18) made this concrete:** two unreachable members never connected to each other, even though both NATs are endpoint-independent and both dialled the right address for two hours. With no relay, losing the one reachable member split the mesh and ran the job twice for 57 minutes. A relay on a reachable member, with coordinated punching as the upgrade, is now a requirement rather than a fallback to decide on.
