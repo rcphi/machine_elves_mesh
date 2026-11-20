@@ -60,16 +60,16 @@ LTE back channel. Run E (2026-11-17) put it against riverboat at home, the
 first run across two households, and met every criterion fixed before it.
 Run F (2026-11-18) added the laptop on a hotspot: the two unreachable machines
 never connected to each other, so losing riverboat split the mesh and ran the
-job twice for 57 minutes. The relaying design followed (branch
-`relaying-and-punching`), and Run G (2026-11-19) repeated Run F on it: the pair
+job twice for 57 minutes. The relaying design followed (merged 2026-11-19 as
+PR #1), and Run G (2026-11-19) repeated Run F on it: the pair
 connected directly after 14 minutes — by the dial backoff, not by DCUtR's punch
 — and losing riverboat no longer split anything.
 An external review (`CODE_REVIEW_2026-11-07.md`) is being worked through; its
 completion record says what is fixed.
 
-Next: merge `relaying-and-punching`; then the design for jobs that must not
-run twice (a consensus library for §9.3's Strict tier — the starting point is
-recorded in the relaying design); then the Phase 0 decision record.
+Next: the design for jobs that must not run twice (a consensus library for
+§9.3's Strict tier — the starting point is recorded in the relaying design);
+then the Phase 0 decision record.
 `docs/phase-0-plan.md` is the record.
 
 Available: 3 home connections and one friend's. No VPSs, by decision.
