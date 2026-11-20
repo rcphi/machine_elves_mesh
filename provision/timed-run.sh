@@ -87,7 +87,7 @@ sed -i "s|^MESH=.*|MESH=$MESH|" "$CONFIG"
 sed -i "s|^PEERS=.*|PEERS=\"/ip4/$PEER/udp/$port/quic-v1\"|" "$CONFIG"
 sed -i "s|^OWN=.*|OWN=$OWN|" "$CONFIG"
 grep -q '^EXTRA=' "$CONFIG" || echo 'EXTRA=""' >> "$CONFIG"
-sed -i "s|^EXTRA=.*|EXTRA=\"--ledger /var/lib/mesh-node/ledger-$MESH\"|" "$CONFIG"
+sed -i "s|^EXTRA=.*|EXTRA=\"--ledger /var/lib/mesh-node/ledger-$MESH --peer-book /var/lib/mesh-node/peers-$MESH\"|" "$CONFIG"
 sed 's/^/    /' "$CONFIG"
 
 echo "== installing the node"

@@ -56,6 +56,7 @@ for i in 0 1; do
         --port "$port" --no-map-port --no-mdns \
         --peer "/ip4/127.0.0.1/udp/$other/quic-v1" \
         --identity "$OUT/$name.identity" --ledger "$OUT/$name.ledger" \
+        --peer-book "$OUT/$name.peers" \
         --job "$JOB" "${own[@]}"
 done
 

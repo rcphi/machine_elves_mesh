@@ -57,6 +57,58 @@ pub struct Mapping {
     pub lifetime: u32,
 }
 
+/// Which protocol a router granted a mapping by.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum Method {
+    NatPmp,
+    Upnp,
+}
+
+impl Method {
+    pub fn name(self) -> &'static str {
+        match self {
+            Method::NatPmp => "nat-pmp",
+            Method::Upnp => "upnp",
+        }
+    }
+}
+
+/// NAT-PMP first, and UPnP only if it refused: whichever the router speaks
+/// grants the mapping. UPnP is not asked at all after a NAT-PMP grant, so a
+/// router that speaks both is not given two mappings to keep. Both refusals
+/// are reported together, because "no NAT-PMP" alone says nothing about UPnP.
+pub async fn first_granted<A, B, FB>(nat_pmp: A, upnp: FB) -> Result<(Mapping, Method), String>
+where
+    A: std::future::Future<Output = Result<Mapping, String>>,
+    FB: FnOnce() -> B,
+    B: std::future::Future<Output = Result<Mapping, String>>,
+{
+    let refused = match nat_pmp.await {
+        Ok(mapping) => return Ok((mapping, Method::NatPmp)),
+        Err(error) => error,
+    };
+    match upnp().await {
+        Ok(mapping) => Ok((mapping, Method::Upnp)),
+        Err(error) => Err(format!("NAT-PMP: {refused}; UPnP: {error}")),
+    }
+}
+
+/// The longest one renewal may take, both protocols together. Review I4: a
+/// UPnP device that answers discovery and then never answers a request left
+/// the renewal task waiting for ever, and no renewal by either protocol ran
+/// again. NAT-PMP's worst case is 12 s; UPnP's searches 4 s.
+pub const MAPPING_TIMEOUT: Duration = Duration::from_secs(15);
+
+/// `fut`, or an error once `limit` has passed.
+pub async fn within<T>(
+    limit: Duration,
+    fut: impl std::future::Future<Output = Result<T, String>>,
+) -> Result<T, String> {
+    tokio::time::timeout(limit, fut)
+        .await
+        .unwrap_or_else(|_| Err(format!("the router did not finish answering within {limit:?}")))
+}
+
 /// Asks the router to forward `port`, returning what it agreed to.
 pub async fn request(port: u16, lifetime: u32) -> io::Result<Mapping> {
     let gateway = default_gateway()?;
@@ -131,7 +183,7 @@ async fn ask(
 }
 
 /// The router this machine sends through, from the kernel's routing table.
-fn default_gateway() -> io::Result<Ipv4Addr> {
+pub(crate) fn default_gateway() -> io::Result<Ipv4Addr> {
     let routes = std::fs::read_to_string("/proc/net/route")?;
     for line in routes.lines().skip(1) {
         let mut fields = line.split_whitespace();
@@ -165,5 +217,47 @@ mod tests {
         if let Ok(gateway) = default_gateway() {
             assert!(!gateway.is_unspecified(), "read a nonsense gateway");
         }
+    }
+}
+
+#[cfg(test)]
+mod order_tests {
+    use super::*;
+
+    fn granted(port: u16) -> Mapping {
+        Mapping { external_ip: Ipv4Addr::new(203, 0, 113, 1), external_port: port, lifetime: 3600 }
+    }
+
+    #[tokio::test]
+    async fn a_nat_pmp_grant_means_upnp_is_never_asked() {
+        let answer = first_granted(async { Ok(granted(4001)) },
+                                   || async { panic!("UPnP was asked after NAT-PMP granted") }).await;
+        assert_eq!(answer, Ok((granted(4001), Method::NatPmp)));
+    }
+
+    #[tokio::test]
+    async fn upnp_is_asked_when_nat_pmp_refuses() {
+        let answer = first_granted(async { Err("no NAT-PMP".to_string()) },
+                                   || async { Ok(granted(4001)) }).await;
+        assert_eq!(answer, Ok((granted(4001), Method::Upnp)));
+        assert_eq!(Method::Upnp.name(), "upnp");
+        assert_eq!(Method::NatPmp.name(), "nat-pmp");
+    }
+
+    /// Review I4: a router that answers discovery and then never answers a
+    /// request held the renewal task forever, and no renewal ran again.
+    #[tokio::test(start_paused = true)]
+    async fn a_router_that_never_answers_cannot_hold_the_renewal() {
+        let answer = within(MAPPING_TIMEOUT, std::future::pending::<Result<(Mapping, Method), String>>()).await;
+        assert!(answer.unwrap_err().contains("did not finish"));
+        assert!(MAPPING_TIMEOUT <= Duration::from_secs(20));
+    }
+
+    #[tokio::test]
+    async fn both_refusals_are_reported_together() {
+        let answer = first_granted(async { Err("no NAT-PMP".to_string()) },
+                                   || async { Err("no UPnP".to_string()) }).await;
+        let error = answer.unwrap_err();
+        assert!(error.contains("no NAT-PMP") && error.contains("no UPnP"), "{error}");
     }
 }

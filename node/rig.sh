@@ -47,6 +47,7 @@ for name in "${names[@]}"; do
     "$BIN" --label "$name" --detect-ms "$DETECT_MS" --json \
         --port "$port" --no-map-port \
         --identity "$OUT/$name.identity" --ledger "$OUT/$name.ledger" \
+        --peer-book "$OUT/$name.peers" \
         > "$OUT/$name.log" 2>&1 &
     pids+=($!)
     port=$((port + 1))

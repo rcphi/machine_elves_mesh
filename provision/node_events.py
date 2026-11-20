@@ -37,12 +37,18 @@ NOTABLE = {
     "returned": "{label} came back after {away_ms} ms (restarted: {restarted})",
     "restarted-unnoticed": "{label} restarted inside one detection window",
     "redialling": "lost a peer — trying its address again",
-    "connected": "connected to {addr}",
+    "connected": "connected to {addr} (relayed: {relayed})",
     "learned-peer": "heard about a peer at {addr}",
     "my-address": "learned its own address: {addr}",
     "silent-connection": "dropped a connection that never spoke",
     # Reachability.
-    "port-mapped": "the router opened {external}",
+    "introducer-held": "{label} will introduce this node to members it cannot reach",
+    "introducer-lost": "an introducer stopped: {error}",
+    "punch-succeeded": "PUNCHED THROUGH to {label}: a direct link, no longer through anyone",
+    "punch-failed": "could not punch through to {label}: {error}",
+    "reachable": "a member reached this node at {addr}: it can introduce others",
+    "unreachable": "no member can reach this node at {addr} any more",
+    "port-mapped": "the router opened {external} by {method}",
     "port-map-failed": "the router did not grant a mapping: {error}",
     "listen-failed": "could not listen on an address",
     "publish-failed": "could not send a {what}: {error}",
@@ -55,6 +61,9 @@ NOTABLE = {
     "ledger-saved-again": "wrote down {retried} items an earlier attempt could not",
     "ledger-comparing": "found {buckets} of 256 inventory buckets differing from {label}'s",
     "ledger-repairing": "sent {label} {items} items from {cells} differing cells of bucket {bucket}",
+    # Who it remembers.
+    "peer-book-loaded": "remembered {peers} peers ({skipped} unreadable lines skipped)",
+    "peer-book-not-saved": "could not write the peer book: {error}",
 }
 
 

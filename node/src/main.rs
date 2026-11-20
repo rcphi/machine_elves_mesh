@@ -10,18 +10,21 @@
 //! Membership came first, because everything else is built on knowing who is
 //! here; the rest is measured in `docs/phase-0-plan.md`.
 
+mod dialing;
 mod job;
 mod ledger;
+mod peerbook;
 mod portmap;
+mod upnp;
 
-use std::collections::{HashMap, HashSet};
+use std::collections::{BTreeSet, HashMap, HashSet};
 use std::time::{Duration, Instant, SystemTime};
 
 use anyhow::{Context, Result};
 use futures::StreamExt;
 use libp2p::swarm::behaviour::toggle::Toggle;
 use libp2p::swarm::SwarmEvent;
-use libp2p::{gossipsub, identify, mdns, noise, ping, tcp, yamux, Multiaddr, PeerId};
+use libp2p::{autonat, dcutr, gossipsub, identify, mdns, noise, ping, relay, tcp, yamux, Multiaddr, PeerId};
 
 /// The topic nodes of one mesh publish to, namespaced by the mesh's name.
 ///
@@ -229,9 +232,19 @@ const DEFAULT_PORT: u16 = 4001;
 /// starts second would fail permanently if the first had given up.
 const DIAL_RETRY: Duration = Duration::from_secs(2);
 
+/// How often, at most, the peer book is written. It changes when a peer is
+/// first dialled or named, which is rare once a mesh has settled.
+const BOOK_SAVE_EVERY: Duration = Duration::from_secs(10);
+
+/// How recently a peer must have been seen for a restarted node to dial
+/// where it last saw it. Generous, because what matters is whether the peer
+/// is still trying to reach this node, not how long this node was away:
+/// Run F's part 2 lasted 57 minutes.
+const RETURN_DIAL_WITHIN: Duration = Duration::from_secs(24 * 3600);
+
 /// The retry timer, built so that a quiet mesh does not store up work for it.
 ///
-/// Its arm in the event loop is guarded by `!pending.is_empty()`, so while
+/// Its arm in the event loop is guarded by `dials.len() > 0`, so while
 /// every peer is reachable the interval is never polled at all.
 fn dial_retry_interval() -> tokio::time::Interval {
     let mut retry = tokio::time::interval(DIAL_RETRY);
@@ -274,7 +287,7 @@ enum Message {
     /// peer that went silent and came back had restarted or had merely been
     /// unreachable — and those are different failures that must not be counted
     /// together.
-    Heartbeat { label: String, run: Option<u64>, holding: Holding },
+    Heartbeat { label: String, run: Option<u64>, holding: Holding, reachable: Option<bool> },
     Departing { label: String },
     Checkpoint { label: String, job: [u8; 32], tick: u64, state: Vec<u8> },
     Observed { label: String, peer: PeerId, addr: Multiaddr },
@@ -327,7 +340,7 @@ enum Holding {
     Job([u8; 32]),
 }
 
-fn encode_heartbeat(label: &str, counter: u64, run: u64, job: Option<&[u8; 32]>) -> Vec<u8> {
+fn encode_heartbeat(label: &str, counter: u64, run: u64, job: Option<&[u8; 32]>, reachable: bool) -> Vec<u8> {
     let mut out = vec![KIND_HEARTBEAT];
     put_str(&mut out, label);
     out.extend_from_slice(&counter.to_le_bytes());
@@ -340,7 +353,15 @@ fn encode_heartbeat(label: &str, counter: u64, run: u64, job: Option<&[u8; 32]>)
             out.extend_from_slice(id);
         }
     }
+    // Appended again: whether a member has confirmed it can reach this node,
+    // which is what makes it worth asking for introductions.
+    out.push(u8::from(reachable));
     out
+}
+
+/// Whether a heartbeat says its sender can be reached. Unsaid is no.
+fn member_reachable(message: &Message) -> bool {
+    matches!(message, Message::Heartbeat { reachable: Some(true), .. })
 }
 
 fn encode_departing(label: &str) -> Vec<u8> {
@@ -431,15 +452,22 @@ fn parse_message(bytes: &[u8]) -> Option<Message> {
             // optional, so a node built before runs existed is still heard as
             // alive rather than dropped as malformed.
             let run = take_u64(bytes, &mut at).and_then(|_| take_u64(bytes, &mut at));
-            let holding = match bytes.get(at) {
-                Some(0) => Holding::Nothing,
-                Some(1) => bytes
-                    .get(at + 1..at + 33)
-                    .map(|id| Holding::Job(id.try_into().expect("32 bytes")))
-                    .unwrap_or(Holding::Unknown),
-                _ => Holding::Unknown,
+            let (holding, after) = match bytes.get(at) {
+                Some(0) => (Holding::Nothing, Some(at + 1)),
+                Some(1) => match bytes.get(at + 1..at + 33) {
+                    Some(id) => (Holding::Job(id.try_into().expect("32 bytes")), Some(at + 33)),
+                    None => (Holding::Unknown, None),
+                },
+                _ => (Holding::Unknown, None),
             };
-            Some(Message::Heartbeat { label, run, holding })
+            // Absent from a node built before it was said: not reachable, so
+            // never asked to introduce anyone.
+            let reachable = after.and_then(|at| match bytes.get(at) {
+                Some(0) => Some(false),
+                Some(1) => Some(true),
+                _ => None,
+            });
+            Some(Message::Heartbeat { label, run, holding, reachable })
         }
         KIND_DEPARTING => Some(Message::Departing { label }),
         KIND_CHECKPOINT => {
@@ -504,6 +532,19 @@ const DEFAULT_DETECT_MS: u64 = 2_000;
 
 #[derive(libp2p::swarm::NetworkBehaviour)]
 struct MeshBehaviour {
+    /// Introduces two members that cannot reach each other, so that DCUtR can
+    /// time their punch. On every node, because behaviours are fixed when the
+    /// swarm is built and reachability changes while it runs; who is *asked*
+    /// to introduce is decided by the heartbeat's reachable flag. Default
+    /// limits: see [`relay_config`].
+    relay: relay::Behaviour,
+    relay_client: relay::client::Behaviour,
+    /// Coordinated hole punching over an introduction.
+    dcutr: dcutr::Behaviour,
+    /// Whether members can reach this node: a member dials back, and only a
+    /// connection that arrives counts. Members are the only servers asked.
+    autonat_client: autonat::v2::client::Behaviour,
+    autonat_server: autonat::v2::server::Behaviour,
     /// Carries heartbeats. Gossip rather than direct messaging, so that
     /// membership does not require every node to hold a connection to every
     /// other — §11.6 rules out a full mesh.
@@ -573,6 +614,8 @@ struct Config {
     /// memory, a ledger was a tally of the current session wearing the name of
     /// a permanent record.
     ledger: String,
+    /// Where remembered peers live between runs. See [`peerbook`].
+    peer_book: String,
     /// Whether to ask the router to forward this node's port.
     ///
     /// On by default. A mesh where nobody is reachable cannot admit anyone it
@@ -783,6 +826,9 @@ struct Member {
     run: Option<u64>,
     /// Which job it holds, once a heartbeat has said. See [`Holding`].
     holding: Holding,
+    /// Whether its heartbeat says a member has confirmed it can be reached.
+    /// False until said, and for a node built before it was said.
+    reachable: bool,
 }
 
 /// Peers declared gone, remembered so their return can be classified.
@@ -859,6 +905,15 @@ struct Speculating {
 }
 
 fn main() -> Result<()> {
+    // Off unless asked for: the event log on stdout is the record, and this is
+    // a diagnostic beside it, for what libp2p explains only in its own logs.
+    if let Ok(filter) = std::env::var("MESH_NODE_TRACE") {
+        let _ = tracing_subscriber::fmt()
+            .with_env_filter(tracing_subscriber::EnvFilter::new(filter))
+            .with_writer(std::io::stderr)
+            .with_ansi(false)
+            .try_init();
+    }
     // Running a job takes no network and no peers, so it is handled before the
     // swarm exists rather than as a mode of it.
     let args: Vec<String> = std::env::args().collect();
@@ -879,8 +934,9 @@ fn main() -> Result<()> {
     runtime.block_on(run(config))
 }
 
-fn parse_args() -> Result<Config> {
-    let mut config = Config {
+/// Every setting at its default, as a node started with no flags has them.
+fn default_config() -> Config {
+    Config {
         label: hostname(),
         listen: Vec::new(),
         dial: Vec::new(),
@@ -895,10 +951,15 @@ fn parse_args() -> Result<Config> {
         port: DEFAULT_PORT,
         identity: "/var/lib/mesh-node/identity".to_string(),
         ledger: "/var/lib/mesh-node/ledger".to_string(),
+        peer_book: "/var/lib/mesh-node/peers".to_string(),
         map_port: true,
         mdns: true,
         own: false,
-    };
+    }
+}
+
+fn parse_args() -> Result<Config> {
+    let mut config = default_config();
 
     let mut args = std::env::args().skip(1);
     while let Some(arg) = args.next() {
@@ -932,6 +993,7 @@ fn parse_args() -> Result<Config> {
             "--port" => config.port = args.next().context("--port needs a number")?.parse()?,
             "--identity" => config.identity = args.next().context("--identity needs a path")?,
             "--ledger" => config.ledger = args.next().context("--ledger needs a path")?,
+            "--peer-book" => config.peer_book = args.next().context("--peer-book needs a path")?,
             "--keepalive-ms" => {
                 config.keepalive = Duration::from_millis(
                     args.next().context("--keepalive-ms needs a number")?.parse()?,
@@ -1071,6 +1133,8 @@ fn print_usage() {
     println!("  --ledger <file>      where to keep what this node knows exists, so an");
     println!("                       inventory outlives the process that built it");
     println!("                       (default /var/lib/mesh-node/ledger)");
+    println!("  --peer-book <file>   where to remember peers, so a restarted node can find");
+    println!("                       its way back in (default /var/lib/mesh-node/peers)");
     println!("  --mesh <name>        which mesh to join (default \"default\"). Nodes in");
     println!("                       different meshes ignore each other entirely");
     println!("  --job <file.wasm>    hold this job, ready to run or to continue it");
@@ -1148,9 +1212,248 @@ fn load_or_create_identity(config: &Config) -> Result<libp2p::identity::Keypair>
     Ok(keypair)
 }
 
-async fn run(config: Config) -> Result<()> {
-    let keypair = load_or_create_identity(&config)?;
-    let mut swarm = libp2p::SwarmBuilder::with_existing_identity(keypair)
+/// The relay at libp2p's defaults: 2 minutes and 128 KiB per introduction.
+fn relay_config() -> relay::Config {
+    relay::Config::default()
+}
+
+/// How often AutoNAT asks a member to dial this node back. Its own default is
+/// every 5 s.
+const AUTONAT_PROBE_EVERY: Duration = Duration::from_secs(60);
+/// How many of this node's candidate addresses it tests.
+const AUTONAT_MAX_CANDIDATES: usize = 4;
+
+/// How long after dialling an address a connection from it still proves
+/// nothing about this node's reachability.
+const UNSOLICITED_AFTER: Duration = Duration::from_secs(600);
+
+/// The IP address an address names, if it names one.
+fn ip_of(addr: &Multiaddr) -> Option<std::net::IpAddr> {
+    addr.iter().find_map(|p| match p {
+        libp2p::multiaddr::Protocol::Ip4(ip) => Some(std::net::IpAddr::V4(ip)),
+        libp2p::multiaddr::Protocol::Ip6(ip) => Some(std::net::IpAddr::V6(ip)),
+        _ => None,
+    })
+}
+
+/// Whether a connection arriving from `remote` proves this node reachable:
+/// true unless this node dialled that address within `UNSOLICITED_AFTER`.
+///
+/// Found in the NAT rig, 2026-11-18: AutoNAT v2's server answers only on
+/// connections it received, so a node is only ever tested by peers it dialled.
+/// A reachable member is the one everybody dials and that dials nobody, so it
+/// was never tested and never introduced anyone. Routers that admit only
+/// replies — both of Run F's did — let in a connection from an address this
+/// node has not sent to only if its door is open, which is the operator's
+/// rule exactly: reachability confirmed by a successful connection.
+fn unsolicited(remote: std::net::IpAddr, dialled: &HashMap<std::net::IpAddr, Instant>, now: Instant) -> bool {
+    dialled.get(&remote).is_none_or(|at| now.duration_since(*at) > UNSOLICITED_AFTER)
+}
+
+/// Whether a connection proves this node reachable: one that arrived, not
+/// through an introducer, from an address this node has had no contact with
+/// for `UNSOLICITED_AFTER`. Contact is any direct connection either way, not
+/// only a dial (review I1): a link that drops and is redialled from the far
+/// side comes in through the flow that link left open.
+fn proves_reachable(
+    endpoint: &libp2p::core::ConnectedPoint,
+    contacts: &HashMap<std::net::IpAddr, Instant>,
+    now: Instant,
+) -> bool {
+    match endpoint {
+        libp2p::core::ConnectedPoint::Listener { send_back_addr, .. } => {
+            !connection_relayed(endpoint) && ip_of(send_back_addr).is_some_and(|ip| unsolicited(ip, contacts, now))
+        }
+        libp2p::core::ConnectedPoint::Dialer { .. } => false,
+    }
+}
+
+/// Forgets a closed connection; true when it was the last direct one to
+/// `peer`. Review I3: only that is a loss worth hurrying a redial for — not
+/// an introduction ending at its limit, not silence through a forwarder.
+fn lost_last_direct(
+    direct: &mut HashMap<libp2p::swarm::ConnectionId, PeerId>,
+    closed: libp2p::swarm::ConnectionId,
+    peer: PeerId,
+) -> bool {
+    direct.remove(&closed).is_some() && !direct.values().any(|p| *p == peer)
+}
+
+/// Whether a member has confirmed it can reach this node, at any address.
+#[derive(Default)]
+struct Reachability {
+    confirmed: std::collections::BTreeSet<Multiaddr>,
+    /// Withdrawn when the router stopped forwarding, kept to restore when it
+    /// forwards again. See [`Reachability::suspend`].
+    suspended: Vec<Multiaddr>,
+}
+
+/// Whether the internet routes to this IP. Review I2: a sibling on the same
+/// home network, or a hairpinned dial, reaches a private address, which says
+/// nothing about anyone else reaching it. Documentation ranges count, so the
+/// NAT rig's public side is public.
+fn is_global(ip: std::net::IpAddr) -> bool {
+    match ip {
+        std::net::IpAddr::V4(v4) => {
+            let o = v4.octets();
+            !(v4.is_private() || v4.is_loopback() || v4.is_link_local() || v4.is_unspecified()
+              || v4.is_broadcast() || v4.is_multicast()
+              || (o[0] == 100 && (o[1] & 0xc0) == 64))
+        }
+        std::net::IpAddr::V6(v6) => {
+            let first = v6.segments()[0];
+            !(v6.is_loopback() || v6.is_unspecified() || v6.is_multicast()
+              || (first & 0xfe00) == 0xfc00 || (first & 0xffc0) == 0xfe80)
+        }
+    }
+}
+
+impl Reachability {
+    /// Records a confirmed address; true when this makes the node reachable.
+    fn confirm(&mut self, addr: Multiaddr) -> bool {
+        // An address through an introducer is someone else's door, not this
+        // node's: holding one says nothing about being reachable directly.
+        if is_relayed(&addr) || !ip_of(&addr).is_some_and(is_global) {
+            return false;
+        }
+        let was = self.is_reachable();
+        self.confirmed.insert(addr);
+        !was
+    }
+
+    /// Forgets an address; true when the last one goes.
+    fn expire(&mut self, addr: &Multiaddr) -> bool {
+        let was = self.is_reachable();
+        self.confirmed.remove(addr);
+        was && !self.is_reachable()
+    }
+
+    fn is_reachable(&self) -> bool {
+        !self.confirmed.is_empty()
+    }
+
+    /// Withdraws every confirmed address, returning them: the router stopped
+    /// forwarding, so the door may be shut.
+    fn suspend(&mut self) -> Vec<Multiaddr> {
+        let withdrawn: Vec<Multiaddr> = std::mem::take(&mut self.confirmed).into_iter().collect();
+        self.suspended.extend(withdrawn.iter().cloned());
+        withdrawn
+    }
+
+    /// Restores what `suspend` withdrew, on the next grant; true when that
+    /// makes the node reachable again. Review M1: without this, one failed
+    /// renewal ended introductions for good.
+    fn restore(&mut self) -> bool {
+        let was = self.is_reachable();
+        for addr in std::mem::take(&mut self.suspended) {
+            self.confirmed.insert(addr);
+        }
+        !was && self.is_reachable()
+    }
+}
+
+/// How many reachable members an unreachable node keeps introductions on, so
+/// that no single one of them is critical. The operator's call, 2026-11-18.
+const MAX_INTRODUCERS: usize = 3;
+
+/// Which members this node should hold introductions on.
+///
+/// None if this node is reachable itself: others can simply dial it. Otherwise
+/// members whose heartbeat says they are reachable and which this node is
+/// directly connected to — an introduction rides on that connection. Those
+/// already held are kept while they still qualify, so the set does not churn;
+/// the lowest identifiers among the rest fill any places left.
+fn choose_introducers(
+    me_reachable: bool,
+    members: &HashMap<PeerId, Member>,
+    directly_connected: &HashSet<PeerId>,
+    held: &BTreeSet<PeerId>,
+    max: usize,
+) -> BTreeSet<PeerId> {
+    if me_reachable {
+        return BTreeSet::new();
+    }
+    let qualifies = |peer: &PeerId| {
+        directly_connected.contains(peer) && members.get(peer).is_some_and(|m| m.reachable)
+    };
+    let mut chosen: BTreeSet<PeerId> = held.iter().filter(|p| qualifies(p)).copied().take(max).collect();
+    let mut others: Vec<PeerId> = members.keys().filter(|p| qualifies(p) && !chosen.contains(p)).copied().collect();
+    others.sort();
+    for peer in others {
+        if chosen.len() >= max {
+            break;
+        }
+        chosen.insert(peer);
+    }
+    chosen
+}
+
+/// How long an introducer that refused, or whose introduction ended in an
+/// error, waits before it is asked again.
+const INTRODUCER_RETRY: Duration = Duration::from_secs(60);
+
+/// The directly connected members that may be asked to introduce now: all of
+/// them except those that refused within `INTRODUCER_RETRY`.
+fn eligible_introducers(
+    directly_connected: &HashSet<PeerId>,
+    refused_at: &HashMap<PeerId, Instant>,
+    now: Instant,
+) -> HashSet<PeerId> {
+    directly_connected
+        .iter()
+        .filter(|p| refused_at.get(p).is_none_or(|at| now.duration_since(*at) >= INTRODUCER_RETRY))
+        .copied()
+        .collect()
+}
+
+/// Whether an address goes through an introducer.
+fn is_relayed(addr: &Multiaddr) -> bool {
+    addr.iter().any(|p| matches!(p, libp2p::multiaddr::Protocol::P2pCircuit))
+}
+
+/// Whether a connection goes through an introducer, from either end: the
+/// dialling end sees the circuit in the remote address, the receiving end in
+/// its local one (its remote is only `/p2p/<peer>`).
+fn connection_relayed(endpoint: &libp2p::core::ConnectedPoint) -> bool {
+    match endpoint {
+        libp2p::core::ConnectedPoint::Dialer { address, .. } => is_relayed(address),
+        libp2p::core::ConnectedPoint::Listener { local_addr, send_back_addr } => {
+            is_relayed(local_addr) || is_relayed(send_back_addr)
+        }
+    }
+}
+
+/// The address to listen on for introductions through `relay`, reached at
+/// `relay_addr`: `relay_addr/p2p/<relay>/p2p-circuit`, naming the relay once.
+fn circuit_listen_addr(relay_addr: &Multiaddr, relay: PeerId) -> Multiaddr {
+    use libp2p::multiaddr::Protocol;
+    let mut addr = relay_addr.clone();
+    if !matches!(addr.iter().last(), Some(Protocol::P2p(p)) if p == relay) {
+        addr.push(Protocol::P2p(relay));
+    }
+    addr.with(Protocol::P2pCircuit)
+}
+
+/// The peer an address names last, if it names one.
+fn last_peer(addr: &Multiaddr) -> Option<PeerId> {
+    match addr.iter().last() {
+        Some(libp2p::multiaddr::Protocol::P2p(peer)) => Some(peer),
+        _ => None,
+    }
+}
+
+/// `addr` ending in `/p2p/<peer>`, which dialling through a circuit needs.
+fn dialable(addr: &Multiaddr, peer: PeerId) -> Multiaddr {
+    use libp2p::multiaddr::Protocol;
+    if matches!(addr.iter().last(), Some(Protocol::P2p(p)) if p == peer) {
+        addr.clone()
+    } else {
+        addr.clone().with(Protocol::P2p(peer))
+    }
+}
+
+fn build_swarm(config: &Config, keypair: libp2p::identity::Keypair) -> Result<libp2p::Swarm<MeshBehaviour>> {
+    let swarm = libp2p::SwarmBuilder::with_existing_identity(keypair)
         .with_tokio()
         .with_tcp(
             tcp::Config::default(),
@@ -1158,7 +1461,9 @@ async fn run(config: Config) -> Result<()> {
             yamux::Config::default,
         )?
         .with_quic()
-        .with_behaviour(|key| {
+        .with_relay_client(noise::Config::new, yamux::Config::default)?
+        .with_behaviour(|key, relay_client| {
+            let me = key.public().to_peer_id();
             let keepalive = config.keepalive;
             let use_mdns = config.mdns;
             let gossipsub = gossipsub::Behaviour::new(
@@ -1184,12 +1489,47 @@ async fn run(config: Config) -> Result<()> {
                 // them open, rather than because gossip happens to be chatty
                 // enough this week.
                 ping: ping::Behaviour::new(ping::Config::new().with_interval(keepalive)),
+                relay: relay::Behaviour::new(me, relay_config()),
+                relay_client,
+                dcutr: dcutr::Behaviour::new(me),
+                autonat_client: autonat::v2::client::Behaviour::new(
+                    rand_core::OsRng,
+                    autonat::v2::client::Config::default()
+                        .with_probe_interval(AUTONAT_PROBE_EVERY)
+                        .with_max_candidates(AUTONAT_MAX_CANDIDATES),
+                ),
+                autonat_server: autonat::v2::server::Behaviour::default(),
             })
         })?
         // Comfortably longer than the keepalive, or a connection would be
         // dropped for idleness between the very pokes meant to preserve it.
         .with_swarm_config(|c| c.with_idle_connection_timeout(config.keepalive * 3))
         .build();
+    Ok(swarm)
+}
+
+async fn run(config: Config) -> Result<()> {
+    let keypair = load_or_create_identity(&config)?;
+    let mut swarm = build_swarm(&config, keypair)?;
+    let mut reachability = Reachability::default();
+    // When this node last dialled each IP, so that a connection back from one
+    // it dialled is not taken as proof that it can be reached.
+    let mut dialled_ips: HashMap<std::net::IpAddr, Instant> = HashMap::new();
+    // Connections that arrived unasked, waiting for identify to say which
+    // address the member reached this node at.
+    let mut proven_conns: HashSet<libp2p::swarm::ConnectionId> = HashSet::new();
+    // When each introducer last refused, so it is not asked twice a second.
+    let mut introducer_refused: HashMap<PeerId, Instant> = HashMap::new();
+    // Introducers this node holds, by the listener each one's circuit is on.
+    let mut introducers: HashMap<PeerId, libp2p::core::transport::ListenerId> = HashMap::new();
+    // This node's addresses through its introducers, announced like any other.
+    let mut circuit_addrs: BTreeSet<Multiaddr> = BTreeSet::new();
+    // Other members' addresses through their introducers, kept so that losing
+    // a direct link to one of them can try a punch again.
+    let mut circuits_of: HashMap<PeerId, Vec<Multiaddr>> = HashMap::new();
+    // Connections that do not go through anyone, by connection, so that an
+    // introduction is only ever made over a direct one.
+    let mut direct: HashMap<libp2p::swarm::ConnectionId, PeerId> = HashMap::new();
 
     let topic = gossipsub::IdentTopic::new(heartbeat_topic(&config.mesh));
     swarm.behaviour_mut().gossipsub.subscribe(&topic)?;
@@ -1201,7 +1541,43 @@ async fn run(config: Config) -> Result<()> {
     // dialled once and forgotten, because a single attempt only succeeds if the
     // other side happened to already be listening — and neither side can be
     // listening in any useful sense while behind address translation.
-    let mut pending: Vec<Multiaddr> = config.dial.clone();
+    //
+    // Each address keeps its own backoff (see `dialing`): Run F spent about
+    // 13 MB/h on every address that never answered, dialled every 2 s.
+    let mut dials = dialing::Schedule::new();
+    for addr in &config.dial {
+        dials.add(addr.clone(), dialing::Kind::Configured, None, Instant::now());
+    }
+    // Remembered peers that were reachable are dialled as well, so that a node
+    // whose configured peer has gone can still find its way back in.
+    let book_path = std::path::PathBuf::from(&config.peer_book);
+    let mut book = match peerbook::PeerBook::load(&book_path) {
+        Ok((book, skipped)) => {
+            emit(&config, "peer-book-loaded",
+                 &format!("remembered {} peers ({skipped} unreadable lines skipped)", book.len()),
+                 &[("peers", &book.len().to_string()), ("skipped", &skipped.to_string())]);
+            book
+        }
+        Err(error) => {
+            emit(&config, "peer-book-loaded",
+                 &format!("could not read {}: {error}; remembering nobody", config.peer_book),
+                 &[("peers", "0"), ("skipped", "0"), ("error", &error.to_string())]);
+            peerbook::PeerBook::default()
+        }
+    };
+    for addr in book.addresses_to_dial() {
+        dials.add(addr, dialing::Kind::Remembered, None, Instant::now());
+    }
+    // And, briefly, where peers that cannot be dialled were last seen: they
+    // have been dialling this node while it was away, which holds their
+    // routers open toward it, so this gets through at once instead of waiting
+    // up to a minute for their next try. The operator's option 2, 2026-11-18.
+    for (peer, addr) in book.seen_recently(now_millis() as u64, RETURN_DIAL_WITHIN.as_millis() as u64) {
+        dials.add_briefly(addr, Some(peer), Instant::now(), dialing::FAST_AFTER_LOSS);
+    }
+    // Written at most every BOOK_SAVE_EVERY, and only when something changed.
+    let mut book_dirty = false;
+    let mut book_saved_at: Option<Instant> = None;
     // Which address reached which peer, so that losing the peer puts the
     // address back on the list. Without this a node dials until it succeeds
     // once and then never again: the first disconnection is permanent, and no
@@ -1221,6 +1597,8 @@ async fn run(config: Config) -> Result<()> {
     let mut since_summary: HashMap<String, u64> = HashMap::new();
     let mut ticks_since_summary: u64 = 0;
     let mut mapping: Option<portmap::Mapping> = None;
+    // Which protocol granted it, so the goodbye withdraws it the same way.
+    let mut mapped_by: Option<portmap::Method> = None;
     // The renewal's answer, carried back from a task rather than awaited here.
     //
     // A router that does not speak NAT-PMP never replies, and asking costs the
@@ -1234,7 +1612,7 @@ async fn run(config: Config) -> Result<()> {
     // So the ask happens elsewhere and the answer arrives as a message. The
     // loop keeps turning while the router is being waited on.
     let (mapping_tx, mut mapping_rx) =
-        tokio::sync::mpsc::channel::<std::result::Result<portmap::Mapping, String>>(1);
+        tokio::sync::mpsc::channel::<std::result::Result<(portmap::Mapping, portmap::Method), String>>(1);
     // One outstanding request at a time. The renewal interval is fifteen
     // minutes and a request gives up after six seconds, so this should never
     // engage — but if a router ever holds the socket open longer than the
@@ -1349,7 +1727,7 @@ async fn run(config: Config) -> Result<()> {
 
     loop {
         tokio::select! {
-            _ = dial_retry.tick(), if !pending.is_empty() => {
+            _ = dial_retry.tick(), if dials.len() > 0 => {
                 dial_attempts += 1;
                 // Anything already reaching a live peer is skipped. A retry
                 // loop that keeps dialling a connected peer opens a new
@@ -1359,19 +1737,30 @@ async fn run(config: Config) -> Result<()> {
                     .filter(|(peer, _)| swarm.is_connected(peer))
                     .flat_map(|(_, addrs)| addrs.iter().cloned())
                     .collect();
-                pending.retain(|addr| !live.contains(addr));
+                for addr in &live {
+                    dials.remove(addr);
+                }
 
-                for addr in &pending {
+                for addr in &dials.due(Instant::now()) {
+                    // A punch to a peer already connected — through an
+                    // introduction that is still open — would only open a
+                    // second one. The attempt is spent; the backoff goes on.
+                    if is_relayed(addr) && last_peer(addr).is_some_and(|p| swarm.is_connected(&p)) {
+                        continue;
+                    }
                     // Failures are expected and frequent: until the other side
                     // is also sending, there is nothing at the far end willing
                     // to answer. The attempt is worth making anyway, because
                     // the outgoing packet is what opens this side's path.
+                    if let Some(ip) = ip_of(addr) {
+                        dialled_ips.insert(ip, Instant::now());
+                    }
                     let _ = swarm.dial(addr.clone());
                 }
                 if dial_attempts == 1 || dial_attempts % 15 == 0 {
                     emit(&config, "dialling",
-                         &format!("still trying {} peer(s), attempt {dial_attempts}", pending.len()),
-                         &[("peers", &pending.len().to_string()),
+                         &format!("still trying {} peer(s), attempt {dial_attempts}", dials.len()),
+                         &[("peers", &dials.len().to_string()),
                            ("attempts", &dial_attempts.to_string())]);
                 }
             }
@@ -1389,9 +1778,11 @@ async fn run(config: Config) -> Result<()> {
                 let port = config.port;
                 let tx = mapping_tx.clone();
                 tokio::spawn(async move {
-                    let answer = portmap::request(port, portmap::LIFETIME_SECS)
-                        .await
-                        .map_err(|error| error.to_string());
+                    // NAT-PMP first, then UPnP: whichever the router speaks.
+                    let answer = portmap::within(portmap::MAPPING_TIMEOUT, portmap::first_granted(
+                        async { portmap::request(port, portmap::LIFETIME_SECS).await.map_err(|e| e.to_string()) },
+                        || upnp::request(port, portmap::LIFETIME_SECS),
+                    )).await;
                     // The receiver lives as long as the loop, and the loop
                     // outlives this task in every case that matters. If it has
                     // gone, the node is shutting down and the answer is moot.
@@ -1402,15 +1793,27 @@ async fn run(config: Config) -> Result<()> {
             Some(answer) = mapping_rx.recv() => {
                 renewing = false;
                 match answer {
-                    Ok(now) => {
-                        if mapping != Some(now) {
+                    Ok((now, method)) => {
+                        if mapping != Some(now) || mapped_by != Some(method) {
                             emit(&config, "port-mapped",
-                                 &format!("the router forwards {}:{} to this node for {}s",
-                                          now.external_ip, now.external_port, now.lifetime),
+                                 &format!("the router forwards {}:{} to this node for {}s, by {}",
+                                          now.external_ip, now.external_port, now.lifetime, method.name()),
                                  &[("external", &format!("{}:{}", now.external_ip, now.external_port)),
+                                   ("method", method.name()),
                                    ("lifetime", &now.lifetime.to_string()),
                                    ("as_asked", if now.external_port == config.port { "true" } else { "false" })]);
                             mapping = Some(now);
+                            mapped_by = Some(method);
+                        }
+                        // A grant after a failed renewal: what members proved
+                        // before holds again.
+                        if reachability.restore() {
+                            for addr in reachability.confirmed.clone() {
+                                swarm.add_external_address(addr.clone());
+                                emit(&config, "reachable",
+                                     &format!("the router forwards again, so {addr} is open again"),
+                                     &[("addr", &addr.to_string()), ("by", "mapping")]);
+                            }
                         }
                     }
                     Err(error) => {
@@ -1420,6 +1823,16 @@ async fn run(config: Config) -> Result<()> {
                         emit(&config, "port-map-failed", &error,
                              &[("error", &error),
                                ("was_mapped", if mapping.is_some() { "true" } else { "false" })]);
+                        // The door this node held is closing: what members
+                        // proved through it no longer holds.
+                        if mapping.is_some() {
+                            for addr in reachability.suspend() {
+                                swarm.remove_external_address(&addr);
+                                emit(&config, "unreachable",
+                                     &format!("the router stopped forwarding, so {addr} may be closed"),
+                                     &[("addr", &addr.to_string())]);
+                            }
+                        }
                         mapping = None;
                     }
                 }
@@ -1475,6 +1888,13 @@ async fn run(config: Config) -> Result<()> {
                     let _ = swarm.behaviour_mut().gossipsub
                         .publish(topic.clone(), encode_observed(&config.label, peer, addr));
                 }
+                // Where this node can be reached through its introducers. A
+                // member that cannot reach it directly dials one of these, and
+                // the introduction is what lets DCUtR time their punch.
+                for addr in &circuit_addrs {
+                    let _ = swarm.behaviour_mut().gossipsub
+                        .publish(topic.clone(), encode_observed(&config.label, &me, addr));
+                }
             }
 
             _ = heartbeat.tick() => {
@@ -1483,7 +1903,7 @@ async fn run(config: Config) -> Result<()> {
                 // is the only one subscribed to the topic; `published` says so
                 // only for the failures that are not that.
                 published(&config, &mut quiet, "heartbeat", swarm.behaviour_mut().gossipsub
-                    .publish(topic.clone(), encode_heartbeat(&config.label, counter, run, my_job.as_ref())));
+                    .publish(topic.clone(), encode_heartbeat(&config.label, counter, run, my_job.as_ref(), reachability.is_reachable())));
             }
 
             _ = job_tick.tick() => {
@@ -1617,11 +2037,62 @@ async fn run(config: Config) -> Result<()> {
             // Announce the departure rather than simply exiting, so peers learn
             // immediately instead of waiting out the detection window. This is
             // the whole difference between a planned handoff and a hole.
-            _ = terminate.recv() => { return depart(&mut swarm, &topic, &config).await; }
-            _ = interrupt.recv() => { return depart(&mut swarm, &topic, &config).await; }
+            _ = terminate.recv() => { return depart(&mut swarm, &topic, &config, mapped_by).await; }
+            _ = interrupt.recv() => { return depart(&mut swarm, &topic, &config, mapped_by).await; }
 
             _ = sweep.tick() => {
                 let now = Instant::now();
+                // Open direct connections are contact for as long as they last.
+                for addr in seen_at.values() {
+                    if let Some(ip) = ip_of(addr) {
+                        dialled_ips.insert(ip, now);
+                    }
+                }
+                // Introductions: held on up to MAX_INTRODUCERS reachable members
+                // this node is directly connected to, and none if it is
+                // reachable itself. Each rides on that direct connection.
+                {
+                    let direct_peers = eligible_introducers(&direct.values().copied().collect(),
+                                                            &introducer_refused, now);
+                    let held: BTreeSet<PeerId> = introducers.keys().copied().collect();
+                    let chosen = choose_introducers(reachability.is_reachable(), &members,
+                                                    &direct_peers, &held, MAX_INTRODUCERS);
+                    for peer in held.difference(&chosen) {
+                        if let Some(id) = introducers.remove(peer) {
+                            swarm.remove_listener(id);
+                        }
+                    }
+                    for peer in chosen.difference(&held) {
+                        let Some(addr) = seen_at.get(peer).filter(|a| !is_relayed(a)).cloned() else { continue };
+                        match swarm.listen_on(circuit_listen_addr(&addr, *peer)) {
+                            Ok(id) => {
+                                introducers.insert(*peer, id);
+                            }
+                            Err(error) => {
+                                introducer_refused.insert(*peer, now);
+                                if let Some(repeats) = quiet.say("introducer", now) {
+                                    emit(&config, "introducer-lost",
+                                         &format!("could not ask for an introduction: {error}"),
+                                         &[("peer_id", &peer.to_string()), ("error", &error.to_string()),
+                                           ("repeats", &repeats.to_string())]);
+                                }
+                            }
+                        }
+                    }
+                }
+                if book_dirty && book_saved_at.is_none_or(|at| now.duration_since(at) >= BOOK_SAVE_EVERY) {
+                    book_saved_at = Some(now);
+                    match book.save(&book_path) {
+                        Ok(()) => book_dirty = false,
+                        Err(error) => {
+                            if let Some(repeats) = quiet.say("peer-book", now) {
+                                emit(&config, "peer-book-not-saved",
+                                     &format!("could not write the peer book: {error}"),
+                                     &[("error", &error.to_string()), ("repeats", &repeats.to_string())]);
+                            }
+                        }
+                    }
+                }
                 let gone: Vec<PeerId> = members
                     .iter()
                     .filter(|(_, m)| now.duration_since(m.last_heard) > config.detect)
@@ -1655,9 +2126,13 @@ async fn run(config: Config) -> Result<()> {
                         // hung. This is the case recovery has to be fast enough
                         // to survive, and the only one that costs a visible gap.
                         // Silence is the only warning a vanished machine gives,
-                        // so it has to be what starts the search for it again.
-                        redial_lost_peer(&config, &peer, &reached_by,
-                                         &mut pending, &mut dial_attempts);
+                        // so it has to be what starts the search for it again
+                        // — if it was directly connected. Silence through a
+                        // forwarder says nothing about a direct path.
+                        if direct.values().any(|p| *p == peer) {
+                            redial_lost_peer(&config, &peer, &reached_by,
+                                             &mut dials, &mut dial_attempts);
+                        }
 
                         if let Some(w) = work.as_mut() {
                             if w.owner == Some(peer) {
@@ -1774,7 +2249,9 @@ async fn run(config: Config) -> Result<()> {
                                                now, config.detect * 2) {
                     connected_at.remove(&peer);
                     let _ = swarm.disconnect_peer_id(peer);
-                    redial_lost_peer(&config, &peer, &reached_by, &mut pending, &mut dial_attempts);
+                    if direct.values().any(|p| *p == peer) {
+                        redial_lost_peer(&config, &peer, &reached_by, &mut dials, &mut dial_attempts);
+                    }
                     emit(&config, "silent-connection",
                          "connected to a former member that has said nothing — reconnecting",
                          &[("peer_id", &peer.to_string())]);
@@ -1782,8 +2259,34 @@ async fn run(config: Config) -> Result<()> {
             }
 
             event = swarm.select_next_some() => match event {
-                SwarmEvent::ConnectionEstablished { peer_id, endpoint, .. } => {
+                SwarmEvent::ConnectionEstablished { peer_id, connection_id, endpoint, .. } => {
                     connected_at.entry(peer_id).or_insert_with(Instant::now);
+                    let relayed = connection_relayed(&endpoint);
+                    // A member reached this node from an address it had not
+                    // dialled: the door is open. See `unsolicited`.
+                    // Which address it reached is what identify will say next:
+                    // the listening address is only 0.0.0.0.
+                    if proves_reachable(&endpoint, &dialled_ips, Instant::now()) {
+                        proven_conns.insert(connection_id);
+                    }
+                    // Any direct connection, either way, is contact, and is
+                    // where to look for this peer after a long absence.
+                    if !relayed {
+                        if let Some(ip) = ip_of(endpoint.get_remote_address()) {
+                            dialled_ips.insert(ip, Instant::now());
+                        }
+                        if book.seen(peer_id, endpoint.get_remote_address(), now_millis() as u64) {
+                            book_dirty = true;
+                        }
+                    }
+                    if !relayed {
+                        // Every address tagged with this peer stops being
+                        // dialled, whichever side opened the connection. Not
+                        // for an introduction: that closes at its limit, and
+                        // the punch it was for must be tried again later.
+                        dials.forget_peer(&peer_id);
+                        direct.insert(connection_id, peer_id);
+                    }
                     // Stop dialling this one. The address matched must be the
                     // address *we asked for*, not the one the connection ended
                     // up on: a peer dialled at one address commonly answers
@@ -1792,15 +2295,17 @@ async fn run(config: Config) -> Result<()> {
                     // that leaves the peer on the list forever, quietly dialled
                     // for the rest of the run.
                     let reached = endpoint.get_remote_address().clone();
-                    let before = pending.len();
-                    if let libp2p::core::ConnectedPoint::Dialer { address, .. } = &endpoint {
-                        pending.retain(|addr| addr != address);
+                    let before = dials.len();
+                    if let (false, libp2p::core::ConnectedPoint::Dialer { address, .. }) = (relayed, &endpoint) {
+                        dials.remove(address);
                         // Every address known to reach this peer comes off the
                         // list, not only the one that happened to succeed.
                         // Otherwise the others keep being dialled at a peer
                         // already sitting on the other end of a connection.
                         if let Some(known) = reached_by.get(&peer_id) {
-                            pending.retain(|addr| !known.contains(addr));
+                            for addr in known {
+                                dials.remove(addr);
+                            }
                         }
                         // Remembered so it can be dialled again later. A peer
                         // reached once is a peer worth trying to reach again,
@@ -1811,14 +2316,18 @@ async fn run(config: Config) -> Result<()> {
                         if !known.contains(address) {
                             known.push(address.clone());
                         }
+                        if book.dialled(peer_id, address, now_millis() as u64) {
+                            book_dirty = true;
+                        }
                     }
                     emit(&config, "connected",
                          &format!("reached {peer_id} at {reached}"),
                          &[("peer_id", &peer_id.to_string()),
                            ("addr", &reached.to_string()),
+                           ("relayed", if relayed { "true" } else { "false" }),
                            ("after_attempts", &dial_attempts.to_string()),
-                           ("still_pending", &pending.len().to_string())]);
-                    if before > 0 && pending.is_empty() {
+                           ("still_pending", &dials.len().to_string())]);
+                    if before > 0 && dials.len() == 0 {
                         emit(&config, "all-reached", "every peer given on the command line answered", &[]);
                     }
 
@@ -1827,8 +2336,12 @@ async fn run(config: Config) -> Result<()> {
                     // announcement, an announcement prompts everyone to dial,
                     // and each dial makes another connection. Two nodes
                     // produced dozens within a second, all to each other.
-                    let is_news = seen_at.get(&peer_id) != Some(&reached);
-                    seen_at.insert(peer_id, reached.clone());
+                    // Only direct addresses: where a member sees a peer, not
+                    // which introducer carried a punch to it.
+                    let is_news = !relayed && seen_at.get(&peer_id) != Some(&reached);
+                    if !relayed {
+                        seen_at.insert(peer_id, reached.clone());
+                    }
                     if is_news {
                         // A newcomer is dialled by the whole mesh in the same
                         // moment, while it dials back — which is the only way
@@ -1865,6 +2378,9 @@ async fn run(config: Config) -> Result<()> {
                 }
 
                 SwarmEvent::NewListenAddr { address, .. } => {
+                    if is_relayed(&address) {
+                        circuit_addrs.insert(address.clone());
+                    }
                     emit(&config, "listening", &format!("listening on {address}"),
                          &[("addr", &address.to_string())]);
                 }
@@ -1890,6 +2406,9 @@ async fn run(config: Config) -> Result<()> {
                         // node that sees itself can never continue a job.
                         if peer == me { continue }
                         swarm.behaviour_mut().gossipsub.add_explicit_peer(&peer);
+                        if let Some(ip) = ip_of(&addr) {
+                            dialled_ips.insert(ip, Instant::now());
+                        }
                         let _ = swarm.dial(addr);
                     }
                 }
@@ -1924,8 +2443,12 @@ async fn run(config: Config) -> Result<()> {
                             disconnected: false,
                             run: None,
                             holding: Holding::Unknown,
+                            reachable: false,
                         });
                         once_members.insert(source);
+                        if book.named(source, &label) {
+                            book_dirty = true;
+                        }
                         emit(&config, "joined", &format!("{label} joined"),
                              &[("peer_id", &source.to_string()), ("label", &label)]);
                         // Answer immediately rather than waiting for the next
@@ -1935,7 +2458,7 @@ async fn run(config: Config) -> Result<()> {
                         // else is also continuing.
                         counter += 1;
                         let _ = swarm.behaviour_mut().gossipsub
-                            .publish(topic.clone(), encode_heartbeat(&config.label, counter, run, my_job.as_ref()));
+                            .publish(topic.clone(), encode_heartbeat(&config.label, counter, run, my_job.as_ref(), reachability.is_reachable()));
                         // And say what we hold, for the same reason. A node
                         // that has just arrived has missed everything made
                         // before it did, and waiting for the periodic digest
@@ -1958,6 +2481,10 @@ async fn run(config: Config) -> Result<()> {
                     if let Message::Heartbeat { holding, .. } = &parsed {
                         if let Some(member) = members.get_mut(&source) {
                             member.holding = *holding;
+                            member.reachable = member_reachable(&parsed);
+                            if book.set_reachable(source, member.reachable) {
+                                book_dirty = true;
+                            }
                         }
                     }
 
@@ -2112,13 +2639,25 @@ async fn run(config: Config) -> Result<()> {
                                 }
                                 continue;
                             }
+                            // An address through an introducer is dialled as
+                            // a punch: named with its peer, on the circuit
+                            // schedule, and remembered so that losing a direct
+                            // link to this peer can try again.
+                            let relayed = is_relayed(&addr);
+                            let addr = if relayed { dialable(&addr, peer) } else { addr };
+                            if relayed {
+                                let known = circuits_of.entry(peer).or_default();
+                                if !known.contains(&addr) {
+                                    known.push(addr.clone());
+                                }
+                            }
                             // Already connected, already trying, or already
                             // known to reach a peer we have — each is a reason
                             // not to dial again, and the last one matters most
                             // during a burst, when is_connected can still be
                             // false for a connection halfway through opening.
                             if swarm.is_connected(&peer)
-                                || pending.contains(&addr)
+                                || dials.contains(&addr)
                                 || reached_by.values().any(|known| known.contains(&addr))
                             {
                                 continue;
@@ -2130,8 +2669,13 @@ async fn run(config: Config) -> Result<()> {
                             // Dial immediately as well as adding to the retry
                             // list. Everyone who heard this is dialling now,
                             // and arriving together is the entire point.
-                            let _ = swarm.dial(addr.clone());
-                            pending.push(addr);
+                            let kind = if relayed { dialing::Kind::Circuit } else { dialing::Kind::Observed };
+                            if dials.add(addr.clone(), kind, Some(peer), Instant::now()) {
+                                if let Some(ip) = ip_of(&addr) {
+                                    dialled_ips.insert(ip, Instant::now());
+                                }
+                                let _ = swarm.dial(addr);
+                            }
                         }
 
                         Message::Checkpoint { job, tick, state, .. } => {
@@ -2231,7 +2775,21 @@ async fn run(config: Config) -> Result<()> {
                     }
                 }
 
-                SwarmEvent::ConnectionClosed { peer_id, num_established, .. } => {
+                SwarmEvent::ConnectionClosed { peer_id, connection_id, num_established, endpoint, .. } => {
+                    if !connection_relayed(&endpoint) {
+                        if let Some(ip) = ip_of(endpoint.get_remote_address()) {
+                            dialled_ips.insert(ip, Instant::now());
+                        }
+                    }
+                    // A direct link lost: if this peer can be reached through
+                    // an introducer, one punch is tried at once (each address
+                    // is new to the schedule) and the circuit backoff follows.
+                    let lost_direct = lost_last_direct(&mut direct, connection_id, peer_id);
+                    if lost_direct {
+                        for addr in circuits_of.get(&peer_id).into_iter().flatten() {
+                            dials.add(addr.clone(), dialing::Kind::Circuit, Some(peer_id), Instant::now());
+                        }
+                    }
                     // Only the last connection closing means the transport is
                     // fully gone; a node may hold several at once, commonly one
                     // over QUIC and one over TCP.
@@ -2248,9 +2806,86 @@ async fn run(config: Config) -> Result<()> {
                         // ending is the ordinary case — a laptop sleeps, a
                         // hotspot cycles, a router reboots — and a mesh that
                         // treats it as final is a mesh that quietly shrinks by
-                        // one every time anything happens.
-                        redial_lost_peer(&config, &peer_id, &reached_by,
-                                         &mut pending, &mut dial_attempts);
+                        // one every time anything happens. Hurried only for a
+                        // direct link lost, not an introduction ending.
+                        if lost_direct {
+                            redial_lost_peer(&config, &peer_id, &reached_by,
+                                             &mut dials, &mut dial_attempts);
+                        }
+                    }
+                }
+
+                SwarmEvent::ExpiredListenAddr { address, .. } => {
+                    circuit_addrs.remove(&address);
+                }
+
+                SwarmEvent::ListenerClosed { listener_id, reason, addresses, .. } => {
+                    for address in &addresses {
+                        circuit_addrs.remove(address);
+                    }
+                    if let Some(peer) = introducers.iter().find(|(_, id)| **id == listener_id).map(|(p, _)| *p) {
+                        introducers.remove(&peer);
+                        if reason.is_err() {
+                            introducer_refused.insert(peer, Instant::now());
+                        }
+                        let error = match reason { Ok(()) => "closed".to_string(), Err(e) => e.to_string() };
+                        emit(&config, "introducer-lost", &format!("an introducer stopped: {error}"),
+                             &[("peer_id", &peer.to_string()),
+                               ("label", &members.get(&peer).map(|m| m.label.clone()).unwrap_or_default()),
+                               ("error", &error)]);
+                    }
+                }
+
+                SwarmEvent::Behaviour(MeshBehaviourEvent::RelayClient(
+                    relay::client::Event::ReservationReqAccepted { relay_peer_id, renewal: false, .. },
+                )) => {
+                    let label = members.get(&relay_peer_id).map(|m| m.label.clone()).unwrap_or_default();
+                    emit(&config, "introducer-held",
+                         &format!("{label} will introduce this node to members it cannot reach"),
+                         &[("peer_id", &relay_peer_id.to_string()), ("label", &label)]);
+                }
+
+                // A member that reached this node unasked says where it found
+                // it. That address is this node's own, as far as introducing
+                // goes: the relay grants nothing until it knows one, because
+                // it has to tell the other side where to reach it.
+                SwarmEvent::Behaviour(MeshBehaviourEvent::Identify(identify::Event::Received {
+                    connection_id, info, ..
+                })) if proven_conns.remove(&connection_id) => {
+                    let observed = info.observed_addr;
+                    if ip_of(&observed).is_some_and(is_global) {
+                        swarm.add_external_address(observed.clone());
+                    }
+                    if reachability.confirm(observed.clone()) {
+                        emit(&config, "reachable",
+                             &format!("a member reached this node at {observed} unasked: it can introduce others"),
+                             &[("addr", &observed.to_string()), ("by", "connection")]);
+                    }
+                }
+
+                // Every reachability test, whatever its outcome: a node that is
+                // never confirmed reachable is otherwise silent about why.
+                SwarmEvent::Behaviour(MeshBehaviourEvent::AutonatClient(autonat::v2::client::Event {
+                    tested_addr, server, result, ..
+                })) => {
+                    let label = members.get(&server).map(|m| m.label.clone()).unwrap_or_default();
+                    let outcome = match &result { Ok(()) => "reached".to_string(), Err(e) => e.to_string() };
+                    emit(&config, "reachability-tested",
+                         &format!("{label} tried to reach this node at {tested_addr}: {outcome}"),
+                         &[("addr", &tested_addr.to_string()), ("label", &label),
+                           ("ok", if result.is_ok() { "true" } else { "false" }), ("outcome", &outcome)]);
+                }
+
+                SwarmEvent::Behaviour(MeshBehaviourEvent::Dcutr(dcutr::Event { remote_peer_id, result })) => {
+                    let label = members.get(&remote_peer_id).map(|m| m.label.clone()).unwrap_or_default();
+                    match result {
+                        Ok(_) => emit(&config, "punch-succeeded",
+                                      &format!("punched through to {label}: a direct link, no longer through anyone"),
+                                      &[("peer_id", &remote_peer_id.to_string()), ("label", &label)]),
+                        Err(error) => emit(&config, "punch-failed",
+                                           &format!("could not punch through to {label}: {error}"),
+                                           &[("peer_id", &remote_peer_id.to_string()), ("label", &label),
+                                             ("error", &error.to_string())]),
                     }
                 }
 
@@ -2262,6 +2897,22 @@ async fn run(config: Config) -> Result<()> {
                            ("rtt_ms", &rtt.as_millis().to_string())]);
                 }
 
+                // A member reached this node at an address it announced, on a
+                // connection of its own: that, and nothing less, is reachable.
+                SwarmEvent::ExternalAddrConfirmed { address } => {
+                    if reachability.confirm(address.clone()) {
+                        emit(&config, "reachable",
+                             &format!("a member reached this node at {address}: it can introduce others"),
+                             &[("addr", &address.to_string()), ("by", "autonat")]);
+                    }
+                }
+                SwarmEvent::ExternalAddrExpired { address } => {
+                    if reachability.expire(&address) {
+                        emit(&config, "unreachable",
+                             &format!("no member can reach this node at {address} any more"),
+                             &[("addr", &address.to_string())]);
+                    }
+                }
                 _ => {}
             }
         }
@@ -2489,16 +3140,19 @@ fn redial_lost_peer(
     config: &Config,
     peer: &PeerId,
     reached_by: &HashMap<PeerId, Vec<Multiaddr>>,
-    pending: &mut Vec<Multiaddr>,
+    dials: &mut dialing::Schedule,
     attempts: &mut u32,
 ) {
     let Some(addresses) = reached_by.get(peer) else { return };
     let mut resumed = 0;
+    let now = Instant::now();
     for addr in addresses {
-        if !pending.contains(addr) {
-            pending.push(addr.clone());
-            resumed += 1;
-        }
+        // The one event that brings an address forward: a direct connection
+        // to its peer was lost, so the peer may be back within seconds.
+        let kind = if config.dial.contains(addr) { dialing::Kind::Configured } else { dialing::Kind::Observed };
+        dials.add(addr.clone(), kind, Some(*peer), now);
+        dials.reset(addr, now);
+        resumed += 1;
     }
     if resumed > 0 {
         *attempts = 0;
@@ -2653,6 +3307,7 @@ async fn depart(
     swarm: &mut libp2p::Swarm<MeshBehaviour>,
     topic: &gossipsub::IdentTopic,
     config: &Config,
+    mapped_by: Option<portmap::Method>,
 ) -> Result<()> {
     let published = swarm
         .behaviour_mut()
@@ -2680,7 +3335,14 @@ async fn depart(
     // function exists to deliver, and every restart along with it. The mapping
     // expires by itself within the hour, so the courtesy is not worth waiting on.
     if config.map_port {
-        let _ = tokio::time::timeout(Duration::from_secs(1), portmap::release(config.port)).await;
+        match mapped_by {
+            Some(portmap::Method::Upnp) => {
+                let _ = tokio::time::timeout(Duration::from_secs(1), upnp::release(config.port)).await;
+            }
+            _ => {
+                let _ = tokio::time::timeout(Duration::from_secs(1), portmap::release(config.port)).await;
+            }
+        }
     }
 
     let deadline = tokio::time::Instant::now() + Duration::from_millis(500);
@@ -2774,6 +3436,269 @@ mod tests {
     /// runs full of disruptions, with backlogs seconds deep rather than days.
     /// `--no-mdns` must mean no mDNS behaviour, not an idle one: the idle one
     /// still joined 224.0.0.251 on every interface, LTE included.
+    fn reachable_member(reachable: bool) -> Member {
+        Member { label: "peer".into(), joined: Instant::now(), last_heard: Instant::now(),
+                 disconnected: false, run: Some(1), holding: Holding::Job(TEST_JOB), reachable }
+    }
+
+    /// Peers in ascending order, so "the lowest" is checkable.
+    fn sorted_peers(n: usize) -> Vec<PeerId> {
+        let mut peers: Vec<PeerId> = (0..n).map(|_| PeerId::random()).collect();
+        peers.sort();
+        peers
+    }
+
+    /// Found in the NAT rig: a refused introduction was asked for again at
+    /// every sweep, twice a second, for as long as the refusal lasted.
+    #[test]
+    fn an_introducer_that_refused_waits_a_minute_before_it_is_asked_again() {
+        let t0 = Instant::now();
+        let p = sorted_peers(2);
+        let direct = HashSet::from([p[0], p[1]]);
+        let refused = HashMap::from([(p[0], t0)]);
+        assert_eq!(eligible_introducers(&direct, &refused, t0 + Duration::from_secs(1)), HashSet::from([p[1]]));
+        assert_eq!(eligible_introducers(&direct, &refused, t0 + INTRODUCER_RETRY), direct);
+        assert_eq!(INTRODUCER_RETRY, Duration::from_secs(60));
+    }
+
+    #[test]
+    fn a_reachable_node_holds_no_introducers() {
+        let p = sorted_peers(1);
+        let members = HashMap::from([(p[0], reachable_member(true))]);
+        let connected = HashSet::from([p[0]]);
+        assert!(choose_introducers(true, &members, &connected, &BTreeSet::new(), MAX_INTRODUCERS).is_empty());
+    }
+
+    #[test]
+    fn introducers_are_reachable_members_this_node_is_directly_connected_to() {
+        let p = sorted_peers(3);
+        let members = HashMap::from([
+            (p[0], reachable_member(true)),  // reachable, but not connected
+            (p[1], reachable_member(false)), // connected, but not reachable
+            (p[2], reachable_member(true)),  // both
+        ]);
+        let connected = HashSet::from([p[1], p[2]]);
+        assert_eq!(choose_introducers(false, &members, &connected, &BTreeSet::new(), MAX_INTRODUCERS),
+                   BTreeSet::from([p[2]]));
+    }
+
+    #[test]
+    fn at_most_three_introducers_and_the_ones_already_held_are_kept() {
+        assert_eq!(MAX_INTRODUCERS, 3);
+        let p = sorted_peers(5);
+        let members: HashMap<PeerId, Member> = p.iter().map(|&q| (q, reachable_member(true))).collect();
+        let connected: HashSet<PeerId> = p.iter().copied().collect();
+        let held = BTreeSet::from([p[4]]);
+        assert_eq!(choose_introducers(false, &members, &connected, &held, MAX_INTRODUCERS),
+                   BTreeSet::from([p[0], p[1], p[4]]),
+                   "the one held stays, and the lowest of the rest fill the other places");
+    }
+
+    #[test]
+    fn an_introducer_that_stops_being_reachable_is_dropped() {
+        let p = sorted_peers(2);
+        let members = HashMap::from([(p[0], reachable_member(false)), (p[1], reachable_member(true))]);
+        let connected = HashSet::from([p[0], p[1]]);
+        let held = BTreeSet::from([p[0]]);
+        assert_eq!(choose_introducers(false, &members, &connected, &held, MAX_INTRODUCERS),
+                   BTreeSet::from([p[1]]));
+    }
+
+    #[test]
+    fn a_circuit_address_is_recognised_and_a_direct_one_is_not() {
+        let relay = PeerId::random();
+        let direct: Multiaddr = "/ip4/204.210.210.200/udp/4001/quic-v1".parse().unwrap();
+        assert!(!is_relayed(&direct));
+        assert!(is_relayed(&circuit_listen_addr(&direct, relay)));
+    }
+
+    /// Found in the NAT rig: the receiving end of an introduction sees only
+    /// `/p2p/<peer>` as the remote address. The circuit is in its local one, so
+    /// a check of the remote alone counted the introduction as a direct link.
+    #[test]
+    fn a_connection_through_an_introducer_is_relayed_from_both_ends() {
+        use libp2p::core::{ConnectedPoint, Endpoint, transport::PortUse};
+        let relay = PeerId::random();
+        let peer = PeerId::random();
+        let circuit = circuit_listen_addr(&"/ip4/192.0.2.10/udp/4001/quic-v1".parse().unwrap(), relay);
+        let receiving = ConnectedPoint::Listener {
+            local_addr: circuit.clone(),
+            send_back_addr: Multiaddr::empty().with(libp2p::multiaddr::Protocol::P2p(peer)),
+        };
+        let dialling = ConnectedPoint::Dialer {
+            address: dialable(&circuit, peer),
+            role_override: Endpoint::Dialer,
+            port_use: PortUse::Reuse,
+        };
+        let direct = ConnectedPoint::Dialer {
+            address: "/ip4/198.51.100.1/udp/4001/quic-v1".parse().unwrap(),
+            role_override: Endpoint::Dialer,
+            port_use: PortUse::Reuse,
+        };
+        assert!(connection_relayed(&receiving));
+        assert!(connection_relayed(&dialling));
+        assert!(!connection_relayed(&direct));
+    }
+
+    #[test]
+    fn a_circuit_listen_address_names_the_relay_once() {
+        let relay = PeerId::random();
+        let bare: Multiaddr = "/ip4/204.210.210.200/udp/4001/quic-v1".parse().unwrap();
+        let named = bare.clone().with(libp2p::multiaddr::Protocol::P2p(relay));
+        let want: Multiaddr = format!("{bare}/p2p/{relay}/p2p-circuit").parse().unwrap();
+        assert_eq!(circuit_listen_addr(&bare, relay), want);
+        assert_eq!(circuit_listen_addr(&named, relay), want);
+    }
+
+    #[test]
+    fn a_dialable_address_names_its_peer_once() {
+        let (relay, peer) = (PeerId::random(), PeerId::random());
+        let circuit = circuit_listen_addr(&"/ip4/192.0.2.10/udp/4001/quic-v1".parse().unwrap(), relay);
+        let want: Multiaddr = format!("{circuit}/p2p/{peer}").parse().unwrap();
+        assert_eq!(dialable(&circuit, peer), want);
+        assert_eq!(dialable(&want, peer), want);
+    }
+
+    #[tokio::test]
+    async fn the_swarm_builds_with_relaying_and_punching() {
+        let mut config = default_config();
+        config.mdns = false;
+        assert!(build_swarm(&config, libp2p::identity::Keypair::generate_ed25519()).is_ok());
+    }
+
+    /// The relay is used only to introduce two members for a punch. Its
+    /// default limits are the point: long enough to arrange the meeting, too
+    /// short to become a path the mesh's traffic quietly depends on.
+    #[test]
+    fn introductions_keep_the_relays_default_limits() {
+        let c = relay_config();
+        assert_eq!(c.max_circuit_duration, Duration::from_secs(120));
+        assert_eq!(c.max_circuit_bytes, 131_072);
+    }
+
+    /// Both of Run F's routers admit only replies, so a connection arriving
+    /// from an address this node has not sent to proves the door is open. One
+    /// from an address it just dialled proves nothing: that is a punch, or a
+    /// blind dial met halfway.
+    #[test]
+    fn only_a_connection_from_an_address_not_dialled_recently_proves_reachability() {
+        let t0 = Instant::now();
+        let peer: std::net::IpAddr = "203.0.113.1".parse().unwrap();
+        let mut dialled = HashMap::new();
+        assert!(unsolicited(peer, &dialled, t0), "never dialled: it found us");
+        dialled.insert(peer, t0);
+        assert!(!unsolicited(peer, &dialled, t0 + Duration::from_secs(60)), "we sent to it a minute ago");
+        assert!(unsolicited(peer, &dialled, t0 + UNSOLICITED_AFTER + Duration::from_secs(1)));
+    }
+
+    /// Review I1: a link older than ten minutes drops, the far side redials
+    /// through the NAT flow still open toward it, and the receiving side took
+    /// the arrival as proof it could be reached. Any recent contact with that
+    /// address, not only a dial, makes an arrival from it prove nothing.
+    #[test]
+    fn an_arrival_from_a_recent_contact_proves_nothing() {
+        use libp2p::core::{ConnectedPoint, Endpoint, transport::PortUse};
+        let t0 = Instant::now();
+        let mut contacts = HashMap::new();
+        let arrival = |from: &str| ConnectedPoint::Listener {
+            local_addr: "/ip4/0.0.0.0/udp/4001/quic-v1".parse().unwrap(),
+            send_back_addr: format!("/ip4/{from}/udp/4001/quic-v1").parse().unwrap(),
+        };
+        assert!(proves_reachable(&arrival("203.0.113.1"), &contacts, t0));
+        contacts.insert("203.0.113.1".parse().unwrap(), t0);
+        assert!(!proves_reachable(&arrival("203.0.113.1"), &contacts, t0 + Duration::from_secs(300)));
+        let dialled = ConnectedPoint::Dialer {
+            address: "/ip4/198.51.100.1/udp/4001/quic-v1".parse().unwrap(),
+            role_override: Endpoint::Dialer, port_use: PortUse::Reuse,
+        };
+        assert!(!proves_reachable(&dialled, &contacts, t0), "a connection this node opened proves nothing");
+    }
+
+    /// Review I2: a sibling on the same home network can always reach this
+    /// node, which says nothing about anyone else.
+    #[test]
+    fn only_an_address_the_internet_routes_makes_a_node_reachable() {
+        let mut r = Reachability::default();
+        for private in ["10.0.0.5", "192.168.1.125", "172.20.10.2", "100.84.179.154", "127.0.0.1", "169.254.1.1"] {
+            assert!(!r.confirm(format!("/ip4/{private}/udp/4001/quic-v1").parse().unwrap()), "{private}");
+        }
+        assert!(!r.confirm("/ip6/fe80::1/udp/4001/quic-v1".parse().unwrap()));
+        assert!(!r.confirm("/ip6/fd00::1/udp/4001/quic-v1".parse().unwrap()));
+        assert!(!r.is_reachable());
+        assert!(r.confirm("/ip4/192.0.2.10/udp/4001/quic-v1".parse().unwrap()), "the rig's public range counts");
+    }
+
+    /// Review M1: one failed renewal withdrew reachability, and the next grant
+    /// never restored it, so introductions stopped for good after one hiccup.
+    #[test]
+    fn reachability_withdrawn_with_a_lost_mapping_returns_with_the_next_grant() {
+        let a: Multiaddr = "/ip4/204.210.210.200/udp/4001/quic-v1".parse().unwrap();
+        let mut r = Reachability::default();
+        r.confirm(a.clone());
+        let withdrawn = r.suspend();
+        assert_eq!(withdrawn, vec![a.clone()]);
+        assert!(!r.is_reachable());
+        assert!(r.restore(), "the grant brings it back");
+        assert!(r.is_reachable());
+        assert!(!r.restore(), "and only once");
+    }
+
+    /// Review I3: only losing the last direct connection to a peer hurries
+    /// its redial — not an introduction ending, not silence through a forwarder.
+    #[test]
+    fn only_losing_the_last_direct_connection_counts_as_a_loss() {
+        use libp2p::swarm::ConnectionId;
+        let peer = PeerId::random();
+        let (c1, c2, relayed) = (ConnectionId::new_unchecked(1), ConnectionId::new_unchecked(2), ConnectionId::new_unchecked(3));
+        let mut direct = HashMap::from([(c1, peer), (c2, peer)]);
+        assert!(!lost_last_direct(&mut direct, c1, peer), "another direct one remains");
+        assert!(!lost_last_direct(&mut direct, relayed, peer), "an introduction ending is not a loss");
+        assert!(lost_last_direct(&mut direct, c2, peer));
+    }
+
+    #[test]
+    fn an_address_names_its_ip() {
+        let quic: Multiaddr = "/ip4/192.0.2.10/udp/4001/quic-v1".parse().unwrap();
+        assert_eq!(ip_of(&quic), Some("192.0.2.10".parse().unwrap()));
+        let none: Multiaddr = "/dns4/example.org/udp/4001/quic-v1".parse().unwrap();
+        assert_eq!(ip_of(&none), None);
+    }
+
+    /// Found in the NAT rig: holding an introduction makes libp2p confirm the
+    /// relayed address as this node's own, and a node that took that as
+    /// reachable dropped the very introductions that gave it the address.
+    #[test]
+    fn an_address_through_an_introducer_never_makes_a_node_reachable() {
+        let relay = PeerId::random();
+        let circuit = circuit_listen_addr(&"/ip4/192.0.2.10/udp/4001/quic-v1".parse().unwrap(), relay)
+            .with(libp2p::multiaddr::Protocol::P2p(PeerId::random()));
+        let mut r = Reachability::default();
+        assert!(!r.confirm(circuit));
+        assert!(!r.is_reachable());
+    }
+
+    #[test]
+    fn reachable_once_any_address_is_confirmed_and_until_the_last_expires() {
+        let a: Multiaddr = "/ip4/204.210.210.200/udp/4001/quic-v1".parse().unwrap();
+        let b: Multiaddr = "/ip4/204.210.210.200/tcp/4001".parse().unwrap();
+        let mut r = Reachability::default();
+        assert!(!r.is_reachable());
+        assert!(r.confirm(a.clone()), "the first confirmation makes it reachable");
+        assert!(!r.confirm(b.clone()), "a second changes nothing that is said");
+        assert!(!r.expire(&a), "still reachable at b");
+        assert!(r.is_reachable());
+        assert!(r.expire(&b), "the last one going is the change");
+        assert!(!r.is_reachable());
+    }
+
+    /// AutoNAT's own default is every 5 s, which on a hotspot is data spent
+    /// asking a question whose answer changes rarely.
+    #[test]
+    fn autonat_probes_no_more_than_once_a_minute() {
+        assert!(AUTONAT_PROBE_EVERY >= Duration::from_secs(60));
+        assert!(AUTONAT_MAX_CANDIDATES <= 4);
+    }
+
     #[tokio::test]
     async fn no_mdns_builds_no_mdns_behaviour() {
         let me = libp2p::identity::Keypair::generate_ed25519().public().to_peer_id();
@@ -2846,12 +3771,12 @@ mod tests {
     #[test]
     fn messages_survive_a_round_trip() {
         assert_eq!(
-            parse_message(&encode_heartbeat("diamond", 42, 9, Some(&TEST_JOB))),
-            Some(Message::Heartbeat { label: "diamond".into(), run: Some(9), holding: Holding::Job(TEST_JOB) })
+            parse_message(&encode_heartbeat("diamond", 42, 9, Some(&TEST_JOB), false)),
+            Some(Message::Heartbeat { label: "diamond".into(), run: Some(9), holding: Holding::Job(TEST_JOB), reachable: Some(false) })
         );
         assert_eq!(
-            parse_message(&encode_heartbeat("diamond", 42, 9, None)),
-            Some(Message::Heartbeat { label: "diamond".into(), run: Some(9), holding: Holding::Nothing })
+            parse_message(&encode_heartbeat("diamond", 42, 9, None, false)),
+            Some(Message::Heartbeat { label: "diamond".into(), run: Some(9), holding: Holding::Nothing, reachable: Some(false) })
         );
         assert_eq!(
             parse_message(&encode_departing("diamond")),
@@ -2886,7 +3811,7 @@ mod tests {
         let mut members = HashMap::new();
         members.insert(present, Member {
             label: "present".into(), joined: long_ago, last_heard: now,
-            disconnected: false, run: None, holding: Holding::Job(TEST_JOB),
+            disconnected: false, run: None, holding: Holding::Job(TEST_JOB), reachable: false,
         });
 
         // A connection just made has not had time to speak; one to a node of
@@ -2903,7 +3828,7 @@ mod tests {
         old.extend_from_slice(&42u64.to_le_bytes());
         assert_eq!(
             parse_message(&old),
-            Some(Message::Heartbeat { label: "diamond".into(), run: None, holding: Holding::Unknown })
+            Some(Message::Heartbeat { label: "diamond".into(), run: None, holding: Holding::Unknown, reachable: None })
         );
     }
 
@@ -2917,8 +3842,39 @@ mod tests {
         old.extend_from_slice(&9u64.to_le_bytes());
         assert_eq!(
             parse_message(&old),
-            Some(Message::Heartbeat { label: "diamond".into(), run: Some(9), holding: Holding::Unknown })
+            Some(Message::Heartbeat { label: "diamond".into(), run: Some(9), holding: Holding::Unknown, reachable: None })
         );
+    }
+
+    #[test]
+    fn reachability_survives_a_round_trip() {
+        for (job, holding) in [(Some(&TEST_JOB), Holding::Job(TEST_JOB)), (None, Holding::Nothing)] {
+            for reachable in [true, false] {
+                assert_eq!(
+                    parse_message(&encode_heartbeat("riverboat", 1, 2, job, reachable)),
+                    Some(Message::Heartbeat { label: "riverboat".into(), run: Some(2), holding, reachable: Some(reachable) })
+                );
+            }
+        }
+    }
+
+    /// A node built before heartbeats said whether they could be reached is
+    /// never asked to introduce anyone: assuming it could would send others to
+    /// reserve introductions on a machine that may not be able to make them.
+    #[test]
+    fn a_heartbeat_from_before_reachability_was_said_is_unreachable() {
+        let mut old = vec![KIND_HEARTBEAT];
+        put_str(&mut old, "riverboat");
+        old.extend_from_slice(&1u64.to_le_bytes());
+        old.extend_from_slice(&2u64.to_le_bytes());
+        old.push(1);
+        old.extend_from_slice(&TEST_JOB);
+        let parsed = parse_message(&old);
+        assert_eq!(
+            parsed,
+            Some(Message::Heartbeat { label: "riverboat".into(), run: Some(2), holding: Holding::Job(TEST_JOB), reachable: None })
+        );
+        assert!(!member_reachable(&parsed.unwrap()));
     }
 
     /// The old checkpoint kind carried no job, so it cannot be checked, and
@@ -2935,7 +3891,7 @@ mod tests {
 
     fn holding(h: Holding) -> Member {
         Member { label: "peer".into(), joined: Instant::now(), last_heard: Instant::now(),
-                 disconnected: false, run: Some(1), holding: h }
+                 disconnected: false, run: Some(1), holding: h, reachable: false }
     }
 
     /// Finding 5's first case: the lowest identifier in the mesh holds no job.
@@ -3370,6 +4326,7 @@ mod tests {
             disconnected: false,
             run: None,
             holding: Holding::Job(TEST_JOB),
+            reachable: false,
         };
 
         let mut winners = 0;
@@ -3423,6 +4380,7 @@ mod tests {
             disconnected: false,
             run: None,
             holding: Holding::Job(TEST_JOB),
+            reachable: false,
         });
         assert!(Work::should_take_over(&me, &members, &TEST_JOB));
     }
@@ -3464,7 +4422,7 @@ mod tests {
     }
 
     fn member_last_heard(at: Instant) -> Member {
-        Member { label: "peer".into(), joined: at, last_heard: at, disconnected: false, run: Some(1), holding: Holding::Job(TEST_JOB) }
+        Member { label: "peer".into(), joined: at, last_heard: at, disconnected: false, run: Some(1), holding: Holding::Job(TEST_JOB), reachable: false }
     }
 
     #[test]
